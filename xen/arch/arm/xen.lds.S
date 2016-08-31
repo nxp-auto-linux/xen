@@ -5,6 +5,7 @@
 #include <xen/cache.h>
 #include <asm/page.h>
 #include <asm/percpu.h>
+#include <asm/arm64/image.h>
 #undef ENTRY
 #undef ALIGN
 
@@ -65,6 +66,13 @@ SECTIONS
        __param_start = .;
        *(.data.param)
        __param_end = .;
+
+#if defined(CONFIG_HAS_VPCI) && defined(CONFIG_LATE_HWDOM)
+       . = ALIGN(POINTER_ALIGN);
+       __start_vpci_array = .;
+       *(SORT(.data.vpci.*))
+       __end_vpci_array = .;
+#endif
   } :text
 
 #if defined(BUILD_ID)
@@ -126,6 +134,13 @@ SECTIONS
       _aedevice = .;
   } :text
 
+  . = ALIGN(8);
+  .teemediator.info : {
+      _steemediator = .;
+      *(.teemediator.info)
+      _eteemediator = .;
+  } :text
+
   . = ALIGN(PAGE_SIZE);             /* Init code and data */
   __init_begin = .;
   .init.text : {
@@ -154,14 +169,12 @@ SECTIONS
        *(.initcall1.init)
        __initcall_end = .;
 
-#ifdef CONFIG_HAS_ALTERNATIVE
        . = ALIGN(4);
        __alt_instructions = .;
        *(.altinstructions)
        __alt_instructions_end = .;
        . = ALIGN(4);
        *(.altinstr_replacement)
-#endif
 
        *(.init.data)
        *(.init.data.rel)
@@ -173,6 +186,13 @@ SECTIONS
        *(.init_array)
        *(SORT(.init_array.*))
        __ctors_end = .;
+
+#if defined(CONFIG_HAS_VPCI) && !defined(CONFIG_LATE_HWDOM)
+       . = ALIGN(POINTER_ALIGN);
+       __start_vpci_array = .;
+       *(SORT(.data.vpci.*))
+       __end_vpci_array = .;
+#endif
   } :text
   __init_end_efi = .;
   . = ALIGN(STACK_SIZE);
@@ -199,6 +219,10 @@ SECTIONS
   /* Section for the device tree blob (if any). */
   _sdtb = .;
   .dtb : { *(.dtb) } :text
+#endif
+
+#if defined(__aarch64__)
+  HEAD_SYMBOLS
 #endif
 
   /* Sections to be discarded */

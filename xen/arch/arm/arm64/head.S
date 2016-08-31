@@ -20,6 +20,7 @@
  * GNU General Public License for more details.
  */
 
+#include <asm/macros.h>
 #include <asm/page.h>
 #include <asm/asm_defns.h>
 #include <asm/early_printk.h>
@@ -113,9 +114,9 @@ efi_head:
          */
         add     x13, x18, #0x16
         b       real_start           /* branch to kernel start */
-        .quad   0                    /* Image load offset from start of RAM */
-        .quad   0                    /* reserved */
-        .quad   0                    /* reserved */
+        le64sym _xen_offset_le       /* Image load offset from start of RAM, little-endian */
+        le64sym _xen_size_le         /* Effective size of kernel image, little-endian */
+        le64sym _xen_flags_le        /* Informative flags, little-endian */
         .quad   0                    /* reserved */
         .quad   0                    /* reserved */
         .quad   0                    /* reserved */
