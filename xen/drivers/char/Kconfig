@@ -52,6 +52,14 @@ config HAS_OMAP
 	  This selects the Texas Instruments OMAP UART. If you have a Texas
 	  Instruments based CPU, say Y.
 
+config HAS_LINFLEX
+	bool "NXP S32 Linflex UART driver"
+	default y
+	depends on ARM_64
+	help
+	  This selects the NXP Linflex UART. If you have a NXP S32 based
+	  board, say Y.
+
 config HAS_SCIF
 	bool "SuperH SCI(F) UART driver"
 	default y
