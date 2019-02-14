@@ -4,6 +4,7 @@ obj-$(CONFIG_HAS_CADENCE_UART) += cadence-uart.o
 obj-$(CONFIG_HAS_PL011) += pl011.o
 obj-$(CONFIG_HAS_EXYNOS4210) += exynos4210-uart.o
 obj-$(CONFIG_HAS_OMAP) += omap-uart.o
+obj-$(CONFIG_HAS_LINFLEX) += s32linflex-uart.o
 obj-$(CONFIG_HAS_SCIF) += scif-uart.o
 obj-$(CONFIG_HAS_EHCI) += ehci-dbgp.o
 obj-$(CONFIG_ARM) += arm-uart.o
