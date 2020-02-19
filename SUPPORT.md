@@ -9,12 +9,21 @@ for the definitions of the support status levels etc.
 
 # Release Support
 
-    Xen-Version: 4.10
-    Initial-Release: 2017-12-13
-    Supported-Until: 2019-06-13
-    Security-Support-Until: 2020-12-13
+    Xen-Version: 4.12
+    Initial-Release: 2019-04-02
+    Supported-Until: 2020-10-02
+    Security-Support-Until: 2022-04-02
+
+Release Notes
+: <a href="https://wiki.xenproject.org/wiki/Xen_Project_X.YY_Release_Notes">RN</a>
 
 # Feature Support
+
+## Kconfig
+
+EXPERT and DEBUG Kconfig options are not security supported. Other
+Kconfig options are supported, if the related features are marked as
+supported in this document.
 
 ## Host Architecture
 
@@ -86,9 +95,12 @@ PVH is a next-generation paravirtualized mode
 designed to take advantage of hardware virtualization support when possible.
 During development this was sometimes called HVMLite or PVHv2.
 
-Requires hardware virtualisation support (Intel VMX / AMD SVM)
+Requires hardware virtualisation support (Intel VMX / AMD SVM).
+
+Dom0 support requires an IOMMU (Intel VT-d / AMD IOMMU).
 
     Status, domU: Supported
+    Status, dom0: Experimental
 
 ### ARM
 
@@ -236,7 +248,7 @@ can allow more efficient aggregate use of memory across VMs.
 
 ### Alternative p2m
 
-Allows external monitoring of hypervisor memory
+Alternative p2m (altp2m) allows external monitoring of guest memory
 by maintaining multiple physical to machine (p2m) memory mappings.
 
     Status, x86 HVM: Tech Preview
@@ -516,6 +528,26 @@ Vulnerabilities of a device model stub domain
 to a hostile driver domain (either compromised or untrusted)
 are excluded from security support.
 
+### Device Model Deprivileging
+
+    Status, Linux dom0: Tech Preview, with limited support
+
+This means adding extra restrictions to a device model in order to
+prevent a compromised device model from attacking the rest of the
+domain it's running in (normally dom0).
+
+"Tech preview with limited support" means we will not issue XSAs for
+the _additional_ functionality provided by the feature; but we will
+issue XSAs in the event that enabling this feature opens up a security
+hole that would not be present without the feature disabled.
+
+For example, while this is classified as tech preview, a bug in libxl
+which failed to change the user ID of QEMU would not receive an XSA,
+since without this feature the user ID wouldn't be changed. But a
+change which made it possible for a compromised guest to read
+arbitrary files on the host filesystem without compromising QEMU would
+be issued an XSA, since that does weaken security.
+
 ### KCONFIG Expert
 
     Status: Experimental
@@ -585,6 +617,10 @@ Virtual Performance Management Unit for HVM guests
 Disabled by default (enable with hypervisor command line option).
 This feature is not security supported: see http://xenbits.xen.org/xsa/advisory-163.html
 
+### Argo: Inter-domain message delivery by hypercall
+
+    Status: Experimental
+
 ### x86/PCI Device Passthrough
 
     Status, x86 PV: Supported, with caveats
@@ -602,6 +638,16 @@ to expose a physical device to completely untrusted guests.
 However, this feature can still confer significant security benefit
 when used to remove drivers and backends from domain 0
 (i.e., Driver Domains).
+
+### x86/Multiple IOREQ servers
+
+An IOREQ server provides emulated devices to HVM and PVH guests.
+QEMU is normally the only IOREQ server,
+but Xen has support for multiple IOREQ servers.
+This allows for custom or proprietary device emulators
+to be used in addition to QEMU.
+
+	Status: Experimental
 
 ### ARM/Non-PCI device passthrough
 
@@ -647,7 +693,7 @@ Note that other devices are available but not security supported.
 
     Status, piix3 ide: Supported
     Status, ahci: Supported
-	
+
 See the section **Blkback** for image formats supported by QEMU.
 
 ### x86/Emulated graphics (QEMU):

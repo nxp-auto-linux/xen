@@ -20,6 +20,11 @@
 #include <xen/softirq.h>
 #include <xsm/xsm.h>
 
+#include <asm/hvm/io.h>
+#include <asm/setup.h>
+
+struct iommu_ops iommu_ops;
+
 void iommu_update_ire_from_apic(
     unsigned int apic, unsigned int reg, unsigned int value)
 {
@@ -41,13 +46,9 @@ int __init iommu_setup_hpet_msi(struct msi_desc *msi)
 
 int arch_iommu_populate_page_table(struct domain *d)
 {
-    const struct domain_iommu *hd = dom_iommu(d);
     struct page_info *page;
     int rc = 0, n = 0;
 
-    d->need_iommu = -1;
-
-    this_cpu(iommu_dont_flush_iotlb) = 1;
     spin_lock(&d->page_alloc_lock);
 
     if ( unlikely(d->is_dying) )
@@ -58,16 +59,38 @@ int arch_iommu_populate_page_table(struct domain *d)
         if ( is_hvm_domain(d) ||
             (page->u.inuse.type_info & PGT_type_mask) == PGT_writable_page )
         {
-            unsigned long mfn = page_to_mfn(page);
+            unsigned long mfn = mfn_x(page_to_mfn(page));
             unsigned long gfn = mfn_to_gmfn(d, mfn);
+            unsigned int flush_flags = 0;
 
             if ( gfn != gfn_x(INVALID_GFN) )
             {
                 ASSERT(!(gfn >> DEFAULT_DOMAIN_ADDRESS_WIDTH));
                 BUG_ON(SHARED_M2P(gfn));
-                rc = hd->platform_ops->map_page(d, gfn, mfn,
-                                                IOMMUF_readable |
-                                                IOMMUF_writable);
+                rc = iommu_map(d, _dfn(gfn), _mfn(mfn), PAGE_ORDER_4K,
+                               IOMMUF_readable | IOMMUF_writable,
+                               &flush_flags);
+
+                /*
+                 * We may be working behind the back of a running guest, which
+                 * may change the type of a page at any time.  We can't prevent
+                 * this (for instance, by bumping the type count while mapping
+                 * the page) without causing legitimate guest type-change
+                 * operations to fail.  So after adding the page to the IOMMU,
+                 * check again to make sure this is still valid.  NB that the
+                 * writable entry in the iommu is harmless until later, when
+                 * the actual device gets assigned.
+                 */
+                if ( !rc && !is_hvm_domain(d) &&
+                     ((page->u.inuse.type_info & PGT_type_mask) !=
+                      PGT_writable_page) )
+                {
+                    rc = iommu_unmap(d, _dfn(gfn), PAGE_ORDER_4K, &flush_flags);
+                    /* If the type changed yet again, simply force a retry. */
+                    if ( !rc && ((page->u.inuse.type_info & PGT_type_mask) ==
+                                 PGT_writable_page) )
+                        rc = -ERESTART;
+                }
             }
             if ( rc )
             {
@@ -101,10 +124,14 @@ int arch_iommu_populate_page_table(struct domain *d)
     }
 
     spin_unlock(&d->page_alloc_lock);
-    this_cpu(iommu_dont_flush_iotlb) = 0;
 
     if ( !rc )
-        rc = iommu_iotlb_flush_all(d);
+        /*
+         * flush_flags are not tracked across hypercall pre-emption so
+         * assume a full flush is necessary.
+         */
+        rc = iommu_iotlb_flush_all(
+            d, IOMMU_FLUSHF_added | IOMMU_FLUSHF_modified);
 
     if ( rc && rc != -ERESTART )
         iommu_teardown(d);
@@ -130,6 +157,127 @@ int arch_iommu_domain_init(struct domain *d)
 
 void arch_iommu_domain_destroy(struct domain *d)
 {
+}
+
+static bool __hwdom_init hwdom_iommu_map(const struct domain *d,
+                                         unsigned long pfn,
+                                         unsigned long max_pfn)
+{
+    mfn_t mfn = _mfn(pfn);
+    unsigned int i, type;
+
+    /*
+     * Set up 1:1 mapping for dom0. Default to include only conventional RAM
+     * areas and let RMRRs include needed reserved regions. When set, the
+     * inclusive mapping additionally maps in every pfn up to 4GB except those
+     * that fall in unusable ranges for PV Dom0.
+     */
+    if ( (pfn > max_pfn && !mfn_valid(mfn)) || xen_in_range(pfn) )
+        return false;
+
+    switch ( type = page_get_ram_type(mfn) )
+    {
+    case RAM_TYPE_UNUSABLE:
+        return false;
+
+    case RAM_TYPE_CONVENTIONAL:
+        if ( iommu_hwdom_strict )
+            return false;
+        break;
+
+    default:
+        if ( type & RAM_TYPE_RESERVED )
+        {
+            if ( !iommu_hwdom_inclusive && !iommu_hwdom_reserved )
+                return false;
+        }
+        else if ( is_hvm_domain(d) || !iommu_hwdom_inclusive || pfn > max_pfn )
+            return false;
+    }
+
+    /*
+     * Check that it doesn't overlap with the LAPIC
+     * TODO: if the guest relocates the MMIO area of the LAPIC Xen should make
+     * sure there's nothing in the new address that would prevent trapping.
+     */
+    if ( has_vlapic(d) )
+    {
+        const struct vcpu *v;
+
+        for_each_vcpu(d, v)
+            if ( pfn == PFN_DOWN(vlapic_base_address(vcpu_vlapic(v))) )
+                return false;
+    }
+    /* ... or the IO-APIC */
+    for ( i = 0; has_vioapic(d) && i < d->arch.hvm.nr_vioapics; i++ )
+        if ( pfn == PFN_DOWN(domain_vioapic(d, i)->base_address) )
+            return false;
+    /*
+     * ... or the PCIe MCFG regions.
+     * TODO: runtime added MMCFG regions are not checked to make sure they
+     * don't overlap with already mapped regions, thus preventing trapping.
+     */
+    if ( has_vpci(d) && vpci_is_mmcfg_address(d, pfn_to_paddr(pfn)) )
+        return false;
+
+    return true;
+}
+
+void __hwdom_init arch_iommu_hwdom_init(struct domain *d)
+{
+    unsigned long i, top, max_pfn;
+    unsigned int flush_flags = 0;
+
+    BUG_ON(!is_hardware_domain(d));
+
+    /* Reserved IOMMU mappings are enabled by default. */
+    if ( iommu_hwdom_reserved == -1 )
+        iommu_hwdom_reserved = 1;
+
+    if ( iommu_hwdom_inclusive )
+    {
+        printk(XENLOG_WARNING
+               "IOMMU inclusive mappings are deprecated and will be removed in future versions\n");
+
+        if ( !is_pv_domain(d) )
+        {
+            printk(XENLOG_WARNING
+                   "IOMMU inclusive mappings are only supported on PV Dom0\n");
+            iommu_hwdom_inclusive = false;
+        }
+    }
+
+    if ( iommu_hwdom_passthrough )
+        return;
+
+    max_pfn = (GB(4) >> PAGE_SHIFT) - 1;
+    top = max(max_pdx, pfn_to_pdx(max_pfn) + 1);
+
+    for ( i = 0; i < top; i++ )
+    {
+        unsigned long pfn = pdx_to_pfn(i);
+        int rc;
+
+        if ( !hwdom_iommu_map(d, pfn, max_pfn) )
+            continue;
+
+        if ( paging_mode_translate(d) )
+            rc = set_identity_p2m_entry(d, pfn, p2m_access_rw, 0);
+        else
+            rc = iommu_map(d, _dfn(pfn), _mfn(pfn), PAGE_ORDER_4K,
+                           IOMMUF_readable | IOMMUF_writable, &flush_flags);
+
+        if ( rc )
+            printk(XENLOG_WARNING " d%d: IOMMU mapping failed: %d\n",
+                   d->domain_id, rc);
+
+        if (!(i & 0xfffff))
+            process_pending_softirqs();
+    }
+
+    /* Use if to avoid compiler warning */
+    if ( iommu_iotlb_flush_all(d, flush_flags) )
+        return;
 }
 
 /*

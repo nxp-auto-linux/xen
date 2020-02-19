@@ -34,7 +34,6 @@
 #include <xsm/xsm.h>
 
 static DEFINE_SPINLOCK(domctl_lock);
-DEFINE_SPINLOCK(vcpu_alloc_lock);
 
 static int bitmap_to_xenctl_bitmap(struct xenctl_bitmap *xenctl_bitmap,
                                    const unsigned long *bitmap,
@@ -498,16 +497,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
     {
         domid_t        dom;
         static domid_t rover = 0;
-        unsigned int domcr_flags;
-
-        ret = -EINVAL;
-        if ( (op->u.createdomain.flags &
-             ~(XEN_DOMCTL_CDF_hvm_guest
-               | XEN_DOMCTL_CDF_hap
-               | XEN_DOMCTL_CDF_s3_integrity
-               | XEN_DOMCTL_CDF_oos_off
-               | XEN_DOMCTL_CDF_xs_domain)) )
-            break;
 
         dom = op->domain;
         if ( (dom > 0) && (dom < DOMID_FIRST_RESERVED) )
@@ -533,20 +522,7 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
             rover = dom;
         }
 
-        domcr_flags = 0;
-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_hvm_guest )
-            domcr_flags |= DOMCRF_hvm;
-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_hap )
-            domcr_flags |= DOMCRF_hap;
-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_s3_integrity )
-            domcr_flags |= DOMCRF_s3_integrity;
-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_oos_off )
-            domcr_flags |= DOMCRF_oos_off;
-        if ( op->u.createdomain.flags & XEN_DOMCTL_CDF_xs_domain )
-            domcr_flags |= DOMCRF_xs_domain;
-
-        d = domain_create(dom, domcr_flags, op->u.createdomain.ssidref,
-                          &op->u.createdomain.config);
+        d = domain_create(dom, &op->u.createdomain, false);
         if ( IS_ERR(d) )
         {
             ret = PTR_ERR(d);
@@ -555,10 +531,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
         }
 
         ret = 0;
-
-        memcpy(d->handle, op->u.createdomain.handle,
-               sizeof(xen_domain_handle_t));
-
         op->domain = d->domain_id;
         copyback = 1;
         d = NULL;
@@ -572,65 +544,14 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
 
         ret = -EINVAL;
         if ( (d == current->domain) || /* no domain_pause() */
-             (max > domain_max_vcpus(d)) )
+             (max != d->max_vcpus) )   /* max_vcpus set up in createdomain */
             break;
-
-        /* Until Xenoprof can dynamically grow its vcpu-s array... */
-        if ( d->xenoprof )
-        {
-            ret = -EAGAIN;
-            break;
-        }
 
         /* Needed, for example, to ensure writable p.t. state is synced. */
         domain_pause(d);
 
-        /*
-         * Certain operations (e.g. CPU microcode updates) modify data which is
-         * used during VCPU allocation/initialization
-         */
-        while ( !spin_trylock(&vcpu_alloc_lock) )
-        {
-            if ( hypercall_preempt_check() )
-            {
-                ret =  hypercall_create_continuation(
-                    __HYPERVISOR_domctl, "h", u_domctl);
-                goto maxvcpu_out_novcpulock;
-            }
-        }
-
-        /* We cannot reduce maximum VCPUs. */
-        ret = -EINVAL;
-        if ( (max < d->max_vcpus) && (d->vcpu[max] != NULL) )
-            goto maxvcpu_out;
-
-        /*
-         * For now don't allow increasing the vcpu count from a non-zero
-         * value: This code and all readers of d->vcpu would otherwise need
-         * to be converted to use RCU, but at present there's no tools side
-         * code path that would issue such a request.
-         */
-        ret = -EBUSY;
-        if ( (d->max_vcpus > 0) && (max > d->max_vcpus) )
-            goto maxvcpu_out;
-
         ret = -ENOMEM;
         online = cpupool_domain_cpumask(d);
-        if ( max > d->max_vcpus )
-        {
-            struct vcpu **vcpus;
-
-            BUG_ON(d->vcpu != NULL);
-            BUG_ON(d->max_vcpus != 0);
-
-            if ( (vcpus = xzalloc_array(struct vcpu *, max)) == NULL )
-                goto maxvcpu_out;
-
-            /* Install vcpu array /then/ update max_vcpus. */
-            d->vcpu = vcpus;
-            smp_wmb();
-            d->max_vcpus = max;
-        }
 
         for ( i = 0; i < max; i++ )
         {
@@ -641,16 +562,14 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
                 cpumask_any(online) :
                 cpumask_cycle(d->vcpu[i-1]->processor, online);
 
-            if ( alloc_vcpu(d, i, cpu) == NULL )
+            if ( vcpu_create(d, i, cpu) == NULL )
                 goto maxvcpu_out;
         }
 
+        domain_update_node_affinity(d);
         ret = 0;
 
     maxvcpu_out:
-        spin_unlock(&vcpu_alloc_lock);
-
-    maxvcpu_out_novcpulock:
         domain_unpause(d);
         break;
     }
@@ -665,11 +584,14 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
         break;
 
     case XEN_DOMCTL_destroydomain:
+        domctl_lock_release();
+        domain_lock(d);
         ret = domain_kill(d);
+        domain_unlock(d);
         if ( ret == -ERESTART )
             ret = hypercall_create_continuation(
                 __HYPERVISOR_domctl, "h", u_domctl);
-        break;
+        goto domctl_out_unlock_domonly;
 
     case XEN_DOMCTL_setnodeaffinity:
     {
@@ -1100,15 +1022,15 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
         copyback = 1;
         break;
 
-#ifdef CONFIG_HAS_MEM_ACCESS
+#ifdef CONFIG_MEM_ACCESS
     case XEN_DOMCTL_set_access_required:
         if ( unlikely(current->domain == d) ) /* no domain_pause() */
             ret = -EPERM;
         else
         {
             domain_pause(d);
-            p2m_get_hostp2m(d)->access_required =
-                op->u.access_required.access_required;
+            arch_p2m_set_access_required(d,
+                op->u.access_required.access_required);
             domain_unpause(d);
         }
         break;
@@ -1116,12 +1038,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
 
     case XEN_DOMCTL_set_virq_handler:
         ret = set_global_virq_handler(d, op->u.set_virq_handler.virq);
-        break;
-
-    case XEN_DOMCTL_set_max_evtchn:
-        d->max_evtchn_port = min_t(unsigned int,
-                                   op->u.set_max_evtchn.max_port,
-                                   INT_MAX);
         break;
 
     case XEN_DOMCTL_setvnumainfo:
@@ -1148,11 +1064,6 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
         ret = monitor_domctl(d, &op->u.monitor_op);
         if ( !ret )
             copyback = 1;
-        break;
-
-    case XEN_DOMCTL_set_gnttab_limits:
-        ret = grant_table_set_limits(d, op->u.set_gnttab_limits.grant_frames,
-                                     op->u.set_gnttab_limits.maptrack_frames);
         break;
 
     default:

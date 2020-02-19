@@ -584,8 +584,7 @@ static int __must_check iommu_flush_all(void)
     return rc;
 }
 
-static int __must_check iommu_flush_iotlb(struct domain *d,
-                                          unsigned long gfn,
+static int __must_check iommu_flush_iotlb(struct domain *d, dfn_t dfn,
                                           bool_t dma_old_pte_present,
                                           unsigned int page_count)
 {
@@ -612,12 +611,12 @@ static int __must_check iommu_flush_iotlb(struct domain *d,
         if ( iommu_domid == -1 )
             continue;
 
-        if ( page_count != 1 || gfn == gfn_x(INVALID_GFN) )
+        if ( page_count != 1 || dfn_eq(dfn, INVALID_DFN) )
             rc = iommu_flush_iotlb_dsi(iommu, iommu_domid,
                                        0, flush_dev_iotlb);
         else
             rc = iommu_flush_iotlb_psi(iommu, iommu_domid,
-                                       (paddr_t)gfn << PAGE_SHIFT_4K,
+                                       dfn_to_daddr(dfn),
                                        PAGE_ORDER_4K,
                                        !dma_old_pte_present,
                                        flush_dev_iotlb);
@@ -633,19 +632,25 @@ static int __must_check iommu_flush_iotlb(struct domain *d,
 }
 
 static int __must_check iommu_flush_iotlb_pages(struct domain *d,
-                                                unsigned long gfn,
-                                                unsigned int page_count)
+                                                dfn_t dfn,
+                                                unsigned int page_count,
+                                                unsigned int flush_flags)
 {
-    return iommu_flush_iotlb(d, gfn, 1, page_count);
+    ASSERT(page_count && !dfn_eq(dfn, INVALID_DFN));
+    ASSERT(flush_flags);
+
+    return iommu_flush_iotlb(d, dfn, flush_flags & IOMMU_FLUSHF_modified,
+                             page_count);
 }
 
 static int __must_check iommu_flush_iotlb_all(struct domain *d)
 {
-    return iommu_flush_iotlb(d, gfn_x(INVALID_GFN), 0, 0);
+    return iommu_flush_iotlb(d, INVALID_DFN, 0, 0);
 }
 
 /* clear one page's page table */
-static int __must_check dma_pte_clear_one(struct domain *domain, u64 addr)
+static int __must_check dma_pte_clear_one(struct domain *domain, u64 addr,
+                                          unsigned int *flush_flags)
 {
     struct domain_iommu *hd = dom_iommu(domain);
     struct dma_pte *page = NULL, *pte = NULL;
@@ -672,11 +677,10 @@ static int __must_check dma_pte_clear_one(struct domain *domain, u64 addr)
     }
 
     dma_clear_pte(*pte);
+    *flush_flags |= IOMMU_FLUSHF_modified;
+
     spin_unlock(&hd->arch.mapping_lock);
     iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
-
-    if ( !this_cpu(iommu_dont_flush_iotlb) )
-        rc = iommu_flush_iotlb_pages(domain, addr >> PAGE_SHIFT_4K, 1);
 
     unmap_vtd_domain_page(page);
 
@@ -759,7 +763,7 @@ static void iommu_enable_translation(struct acpi_drhd_unit *drhd)
         if ( !is_igd_vt_enabled_quirk() )
         {
             if ( force_iommu )
-                panic("BIOS did not enable IGD for VT properly, crash Xen for security purpose");
+                panic("BIOS did not enable IGD for VT properly, crash Xen for security purpose\n");
 
             printk(XENLOG_WARNING VTDPREFIX
                    "BIOS did not enable IGD for VT properly.  Disabling IGD VT-d engine.\n");
@@ -1105,7 +1109,13 @@ static void dma_msi_set_affinity(struct irq_desc *desc, const cpumask_t *mask)
 
     spin_lock_irqsave(&iommu->register_lock, flags);
     dmar_writel(iommu->reg, DMAR_FEDATA_REG, msg.data);
-    dmar_writeq(iommu->reg, DMAR_FEADDR_REG, msg.address);
+    dmar_writel(iommu->reg, DMAR_FEADDR_REG, msg.address_lo);
+    /*
+     * When x2APIC is not enabled, DMAR_FEUADDR_REG is reserved and
+     * it's not necessary to update it.
+     */
+    if ( x2apic_enabled )
+        dmar_writel(iommu->reg, DMAR_FEUADDR_REG, msg.address_hi);
     spin_unlock_irqrestore(&iommu->register_lock, flags);
 }
 
@@ -1298,14 +1308,10 @@ static void __hwdom_init intel_iommu_hwdom_init(struct domain *d)
 {
     struct acpi_drhd_unit *drhd;
 
-    if ( !iommu_passthrough && !need_iommu(d) )
-    {
-        /* Set up 1:1 page table for hardware domain. */
-        vtd_set_hwdom_mapping(d);
-    }
-
     setup_hwdom_pci_devices(d, setup_hwdom_device);
     setup_hwdom_rmrr(d);
+    /* Make sure workarounds are applied before enabling the IOMMU(s). */
+    arch_iommu_hwdom_init(d);
 
     if ( iommu_flush_all() )
         printk(XENLOG_WARNING VTDPREFIX
@@ -1385,7 +1391,7 @@ int domain_context_mapping_one(
         return res;
     }
 
-    if ( iommu_passthrough && is_hardware_domain(domain) )
+    if ( iommu_hwdom_passthrough && is_hardware_domain(domain) )
     {
         context_set_translation_type(*context, CONTEXT_TT_PASS_THRU);
         agaw = level_to_agaw(iommu->nr_pt_levels);
@@ -1751,7 +1757,17 @@ static void iommu_domain_teardown(struct domain *d)
         xfree(mrmrr);
     }
 
-    if ( iommu_use_hap_pt(d) )
+    ASSERT(iommu_enabled);
+
+    /*
+     * We can't use iommu_use_hap_pt here because either IOMMU state
+     * is already changed to IOMMU_STATUS_disabled at this point or
+     * has always been IOMMU_STATUS_disabled.
+     *
+     * We also need to test if HAP is enabled because PV guests can
+     * enter this path too.
+     */
+    if ( hap_enabled(d) && iommu_hap_pt_share )
         return;
 
     spin_lock(&hd->arch.mapping_lock);
@@ -1760,13 +1776,12 @@ static void iommu_domain_teardown(struct domain *d)
     spin_unlock(&hd->arch.mapping_lock);
 }
 
-static int __must_check intel_iommu_map_page(struct domain *d,
-                                             unsigned long gfn,
-                                             unsigned long mfn,
-                                             unsigned int flags)
+static int __must_check intel_iommu_map_page(struct domain *d, dfn_t dfn,
+                                             mfn_t mfn, unsigned int flags,
+                                             unsigned int *flush_flags)
 {
     struct domain_iommu *hd = dom_iommu(d);
-    struct dma_pte *page = NULL, *pte = NULL, old, new = { 0 };
+    struct dma_pte *page, *pte, old, new = {};
     u64 pg_maddr;
     int rc = 0;
 
@@ -1775,21 +1790,23 @@ static int __must_check intel_iommu_map_page(struct domain *d,
         return 0;
 
     /* Do nothing if hardware domain and iommu supports pass thru. */
-    if ( iommu_passthrough && is_hardware_domain(d) )
+    if ( iommu_hwdom_passthrough && is_hardware_domain(d) )
         return 0;
 
     spin_lock(&hd->arch.mapping_lock);
 
-    pg_maddr = addr_to_dma_page_maddr(d, (paddr_t)gfn << PAGE_SHIFT_4K, 1);
-    if ( pg_maddr == 0 )
+    pg_maddr = addr_to_dma_page_maddr(d, dfn_to_daddr(dfn), 1);
+    if ( !pg_maddr )
     {
         spin_unlock(&hd->arch.mapping_lock);
         return -ENOMEM;
     }
+
     page = (struct dma_pte *)map_vtd_domain_page(pg_maddr);
-    pte = page + (gfn & LEVEL_MASK);
+    pte = &page[dfn_x(dfn) & LEVEL_MASK];
     old = *pte;
-    dma_set_pte_addr(new, (paddr_t)mfn << PAGE_SHIFT_4K);
+
+    dma_set_pte_addr(new, mfn_to_maddr(mfn));
     dma_set_pte_prot(new,
                      ((flags & IOMMUF_readable) ? DMA_PTE_READ  : 0) |
                      ((flags & IOMMUF_writable) ? DMA_PTE_WRITE : 0));
@@ -1804,29 +1821,75 @@ static int __must_check intel_iommu_map_page(struct domain *d,
         unmap_vtd_domain_page(page);
         return 0;
     }
+
     *pte = new;
 
     iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
     spin_unlock(&hd->arch.mapping_lock);
     unmap_vtd_domain_page(page);
 
-    if ( !this_cpu(iommu_dont_flush_iotlb) )
-        rc = iommu_flush_iotlb(d, gfn, dma_pte_present(old), 1);
+    *flush_flags |= IOMMU_FLUSHF_added;
+    if ( dma_pte_present(old) )
+        *flush_flags |= IOMMU_FLUSHF_modified;
 
     return rc;
 }
 
-static int __must_check intel_iommu_unmap_page(struct domain *d,
-                                               unsigned long gfn)
+static int __must_check intel_iommu_unmap_page(struct domain *d, dfn_t dfn,
+                                               unsigned int *flush_flags)
 {
-    /* Do nothing if hardware domain and iommu supports pass thru. */
-    if ( iommu_passthrough && is_hardware_domain(d) )
+    /* Do nothing if VT-d shares EPT page table */
+    if ( iommu_use_hap_pt(d) )
         return 0;
 
-    return dma_pte_clear_one(d, (paddr_t)gfn << PAGE_SHIFT_4K);
+    /* Do nothing if hardware domain and iommu supports pass thru. */
+    if ( iommu_hwdom_passthrough && is_hardware_domain(d) )
+        return 0;
+
+    return dma_pte_clear_one(d, dfn_to_daddr(dfn), flush_flags);
 }
 
-int iommu_pte_flush(struct domain *d, u64 gfn, u64 *pte,
+static int intel_iommu_lookup_page(struct domain *d, dfn_t dfn, mfn_t *mfn,
+                                   unsigned int *flags)
+{
+    struct domain_iommu *hd = dom_iommu(d);
+    struct dma_pte *page, val;
+    u64 pg_maddr;
+
+    /*
+     * If VT-d shares EPT page table or if the domain is the hardware
+     * domain and iommu_passthrough is set then pass back the dfn.
+     */
+    if ( iommu_use_hap_pt(d) ||
+         (iommu_hwdom_passthrough && is_hardware_domain(d)) )
+        return -EOPNOTSUPP;
+
+    spin_lock(&hd->arch.mapping_lock);
+
+    pg_maddr = addr_to_dma_page_maddr(d, dfn_to_daddr(dfn), 0);
+    if ( !pg_maddr )
+    {
+        spin_unlock(&hd->arch.mapping_lock);
+        return -ENOMEM;
+    }
+
+    page = map_vtd_domain_page(pg_maddr);
+    val = page[dfn_x(dfn) & LEVEL_MASK];
+
+    unmap_vtd_domain_page(page);
+    spin_unlock(&hd->arch.mapping_lock);
+
+    if ( !dma_pte_present(val) )
+        return -ENOENT;
+
+    *mfn = maddr_to_mfn(dma_pte_addr(val));
+    *flags = dma_pte_read(val) ? IOMMUF_readable : 0;
+    *flags |= dma_pte_write(val) ? IOMMUF_writable : 0;
+
+    return 0;
+}
+
+int iommu_pte_flush(struct domain *d, uint64_t dfn, uint64_t *pte,
                     int order, int present)
 {
     struct acpi_drhd_unit *drhd;
@@ -1850,7 +1913,7 @@ int iommu_pte_flush(struct domain *d, u64 gfn, u64 *pte,
             continue;
 
         rc = iommu_flush_iotlb_psi(iommu, iommu_domid,
-                                   (paddr_t)gfn << PAGE_SHIFT_4K,
+                                   __dfn_to_daddr(dfn),
                                    order, !present, flush_dev_iotlb);
         if ( rc > 0 )
         {
@@ -2242,6 +2305,8 @@ int __init intel_vtd_setup(void)
         goto error;
     }
 
+    iommu_ops = intel_iommu_ops;
+
     /* We enable the following features only if they are supported by all VT-d
      * engines: Snoop Control, DMA passthrough, Queued Invalidation, Interrupt
      * Remapping, and Posted Interrupt
@@ -2263,8 +2328,8 @@ int __init intel_vtd_setup(void)
         if ( iommu_snoop && !ecap_snp_ctl(iommu->ecap) )
             iommu_snoop = 0;
 
-        if ( iommu_passthrough && !ecap_pass_thru(iommu->ecap) )
-            iommu_passthrough = 0;
+        if ( iommu_hwdom_passthrough && !ecap_pass_thru(iommu->ecap) )
+            iommu_hwdom_passthrough = false;
 
         if ( iommu_qinval && !ecap_queued_inval(iommu->ecap) )
             iommu_qinval = 0;
@@ -2302,7 +2367,7 @@ int __init intel_vtd_setup(void)
 
 #define P(p,s) printk("Intel VT-d %s %senabled.\n", s, (p)? "" : "not ")
     P(iommu_snoop, "Snoop Control");
-    P(iommu_passthrough, "Dom0 DMA Passthrough");
+    P(iommu_hwdom_passthrough, "Dom0 DMA Passthrough");
     P(iommu_qinval, "Queued Invalidation");
     P(iommu_intremap, "Interrupt Remapping");
     P(iommu_intpost, "Posted Interrupt");
@@ -2324,7 +2389,7 @@ int __init intel_vtd_setup(void)
  error:
     iommu_enabled = 0;
     iommu_snoop = 0;
-    iommu_passthrough = 0;
+    iommu_hwdom_passthrough = false;
     iommu_qinval = 0;
     iommu_intremap = 0;
     iommu_intpost = 0;
@@ -2565,7 +2630,7 @@ static void vtd_resume(void)
         return;
 
     if ( init_vtd_hw() != 0  && force_iommu )
-         panic("IOMMU setup failed, crash Xen for security purpose");
+         panic("IOMMU setup failed, crash Xen for security purpose\n");
 
     for_each_drhd_unit ( drhd )
     {
@@ -2620,7 +2685,7 @@ static void vtd_dump_p2m_table_level(paddr_t pt_maddr, int level, paddr_t gpa,
             vtd_dump_p2m_table_level(dma_pte_addr(*pte), next_level, 
                                      address, indent + 1);
         else
-            printk("%*sgfn: %08lx mfn: %08lx\n",
+            printk("%*sdfn: %08lx mfn: %08lx\n",
                    indent, "",
                    (unsigned long)(address >> PAGE_SHIFT_4K),
                    (unsigned long)(dma_pte_addr(*pte) >> PAGE_SHIFT_4K));
@@ -2641,7 +2706,7 @@ static void vtd_dump_p2m_table(struct domain *d)
     vtd_dump_p2m_table_level(hd->arch.pgd_maddr, agaw_to_level(hd->arch.agaw), 0, 0);
 }
 
-const struct iommu_ops intel_iommu_ops = {
+const struct iommu_ops __initconstrel intel_iommu_ops = {
     .init = intel_iommu_domain_init,
     .hwdom_init = intel_iommu_hwdom_init,
     .add_device = intel_iommu_add_device,
@@ -2651,6 +2716,7 @@ const struct iommu_ops intel_iommu_ops = {
     .teardown = iommu_domain_teardown,
     .map_page = intel_iommu_map_page,
     .unmap_page = intel_iommu_unmap_page,
+    .lookup_page = intel_iommu_lookup_page,
     .free_page_table = iommu_free_page_table,
     .reassign_device = reassign_device_ownership,
     .get_device_group_id = intel_iommu_group_id,

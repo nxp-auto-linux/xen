@@ -66,6 +66,7 @@ SECTIONS
         _stext = .;            /* Text and read-only data */
        *(.text)
        *(.text.__x86_indirect_thunk_*)
+       *(.text.page_aligned)
 
        . = ALIGN(PAGE_SIZE);
        _stextentry = .;
@@ -73,7 +74,6 @@ SECTIONS
        . = ALIGN(PAGE_SIZE);
        _etextentry = .;
 
-       *(.text.page_aligned)
        *(.text.cold)
        *(.text.unlikely)
        *(.fixup)
@@ -135,6 +135,13 @@ SECTIONS
        __param_start = .;
        *(.data.param)
        __param_end = .;
+
+#if defined(CONFIG_HAS_VPCI) && defined(CONFIG_LATE_HWDOM)
+       . = ALIGN(POINTER_ALIGN);
+       __start_vpci_array = .;
+       *(SORT(.data.vpci.*))
+       __end_vpci_array = .;
+#endif
   } :text
 
 #if defined(CONFIG_PVH_GUEST) && !defined(EFI)
@@ -172,7 +179,11 @@ SECTIONS
   __2M_init_start = .;         /* Start of 2M superpages, mapped RWX (boot only). */
   . = ALIGN(PAGE_SIZE);             /* Init code and data */
   __init_begin = .;
+#ifdef EFI /* EFI wants to merge all of .init.*  ELF doesn't. */
   DECL_SECTION(.init) {
+#else
+  DECL_SECTION(.init.text) {
+#endif
        _sinittext = .;
        *(.init.text)
        /*
@@ -183,7 +194,12 @@ SECTIONS
        *(.altinstr_replacement)
        _einittext = .;
 
+#ifdef EFI /* EFI wants to merge all of .init.*  ELF doesn't. */
        . = ALIGN(SMP_CACHE_BYTES);
+#else
+  } :text
+  DECL_SECTION(.init.data) {
+#endif
 
        *(.init.rodata)
        *(.init.rodata.rel)
@@ -226,6 +242,13 @@ SECTIONS
        *(.init_array)
        *(SORT(.init_array.*))
        __ctors_end = .;
+
+#if defined(CONFIG_HAS_VPCI) && !defined(CONFIG_LATE_HWDOM)
+       . = ALIGN(POINTER_ALIGN);
+       __start_vpci_array = .;
+       *(SORT(.data.vpci.*))
+       __end_vpci_array = .;
+#endif
   } :text
 
   . = ALIGN(SECTION_ALIGN);
@@ -281,7 +304,9 @@ SECTIONS
   } :text
 #endif
 
-  efi = DEFINED(efi) ? efi : .;
+#ifndef XEN_BUILD_EFI
+  efi = .;
+#endif
 
   /* Sections to be discarded */
   /DISCARD/ : {
@@ -308,7 +333,7 @@ SECTIONS
   .comment 0 : { *(.comment) }
 }
 
-ASSERT(__image_base__ > XEN_VIRT_START ||
+ASSERT(__image_base__ > XEN_VIRT_START |
        __2M_rwdata_end <= XEN_VIRT_END - NR_CPUS * PAGE_SIZE,
        "Xen image overlaps stubs area")
 

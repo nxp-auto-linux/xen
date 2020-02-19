@@ -53,6 +53,24 @@ int osdep_xenforeignmemory_open(xenforeignmemory_handle *fmem)
         return -1;
     }
 
+    /*
+     * Older versions of privcmd return -EINVAL for unimplemented ioctls
+     * so we need to probe for the errno to use rather than just using
+     * the conventional ENOTTY.
+     */
+    if ( ioctl(fd, IOCTL_PRIVCMD_UNIMPLEMENTED, NULL) >= 0 )
+    {
+        xtl_log(fmem->logger, XTL_ERROR, -1, "xenforeignmemory",
+                "privcmd ioctl should not be implemented");
+        close(fd);
+        return -1;
+    }
+    else
+    {
+        fmem->unimpl_errno = errno;
+        errno = 0;
+    }
+
     fmem->fd = fd;
     return 0;
 }
@@ -275,6 +293,51 @@ int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem,
                                     domid_t domid)
 {
     return ioctl(fmem->fd, IOCTL_PRIVCMD_RESTRICT, &domid);
+}
+
+int osdep_xenforeignmemory_unmap_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres)
+{
+    return fres ? munmap(fres->addr, fres->nr_frames << PAGE_SHIFT) : 0;
+}
+
+int osdep_xenforeignmemory_map_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres)
+{
+    privcmd_mmap_resource_t mr = {
+        .dom = fres->domid,
+        .type = fres->type,
+        .id = fres->id,
+        .idx = fres->frame,
+        .num = fres->nr_frames,
+    };
+    int rc;
+
+    fres->addr = mmap(fres->addr, fres->nr_frames << PAGE_SHIFT,
+                      fres->prot, fres->flags | MAP_SHARED, fmem->fd, 0);
+    if ( fres->addr == MAP_FAILED )
+        return -1;
+
+    mr.addr = (uintptr_t)fres->addr;
+
+    rc = ioctl(fmem->fd, IOCTL_PRIVCMD_MMAP_RESOURCE, &mr);
+    if ( rc )
+    {
+        int saved_errno;
+
+        if ( errno != fmem->unimpl_errno && errno != EOPNOTSUPP )
+            PERROR("ioctl failed");
+        else
+            errno = EOPNOTSUPP;
+
+        saved_errno = errno;
+        (void)osdep_xenforeignmemory_unmap_resource(fmem, fres);
+        errno = saved_errno;
+
+        return -1;
+    }
+
+    return 0;
 }
 
 /*

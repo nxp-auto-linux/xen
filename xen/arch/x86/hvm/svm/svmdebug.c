@@ -55,6 +55,8 @@ void svm_vmcb_dump(const char *from, const struct vmcb_struct *vmcb)
            vmcb->exitinfo1, vmcb->exitinfo2);
     printk("np_enable = %#"PRIx64" guest_asid = %#x\n",
            vmcb_get_np_enable(vmcb), vmcb_get_guest_asid(vmcb));
+    printk("virtual vmload/vmsave = %d, virt_ext = %#"PRIx64"\n",
+           vmcb->virt_ext.fields.vloadsave_enable, vmcb->virt_ext.bytes);
     printk("cpl = %d efer = %#"PRIx64" star = %#"PRIx64" lstar = %#"PRIx64"\n",
            vmcb_get_cpl(vmcb), vmcb_get_efer(vmcb), vmcb->star, vmcb->lstar);
     printk("CR0 = 0x%016"PRIx64" CR2 = 0x%016"PRIx64"\n",
@@ -119,9 +121,9 @@ bool svm_vmcb_isvalid(const char *from, const struct vmcb_struct *vmcb,
            (cr3 >> v->domain->arch.cpuid->extd.maxphysaddr))) )
         PRINTF("CR3: MBZ bits are set (%#"PRIx64")\n", cr3);
 
-    if ( cr4 & ~hvm_cr4_guest_valid_bits(v, false) )
+    if ( cr4 & ~hvm_cr4_guest_valid_bits(v->domain, false) )
         PRINTF("CR4: invalid bits are set (%#"PRIx64", valid: %#"PRIx64")\n",
-               cr4, hvm_cr4_guest_valid_bits(v, false));
+               cr4, hvm_cr4_guest_valid_bits(v->domain, false));
 
     if ( vmcb_get_dr6(vmcb) >> 32 )
         PRINTF("DR6: bits [63:32] are not zero (%#"PRIx64")\n",
@@ -131,9 +133,8 @@ bool svm_vmcb_isvalid(const char *from, const struct vmcb_struct *vmcb,
         PRINTF("DR7: bits [63:32] are not zero (%#"PRIx64")\n",
                vmcb_get_dr7(vmcb));
 
-    if ( efer & ~(EFER_SCE | EFER_LME | EFER_LMA | EFER_NX | EFER_SVME |
-                  EFER_LMSLE | EFER_FFXSE) )
-        PRINTF("EFER: undefined bits are not zero (%#"PRIx64")\n", efer);
+    if ( efer & ~EFER_KNOWN_MASK )
+        PRINTF("EFER: unknown bits are not zero (%#"PRIx64")\n", efer);
 
     if ( hvm_efer_valid(v, efer, -1) )
         PRINTF("EFER: %s (%"PRIx64")\n", hvm_efer_valid(v, efer, -1), efer);

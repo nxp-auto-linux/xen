@@ -38,8 +38,17 @@ ENTRY(vmx_asm_vmexit_handler)
         movb $1,VCPU_vmx_launched(%rbx)
         mov  %rax,VCPU_hvm_guest_cr2(%rbx)
 
-        SPEC_CTRL_ENTRY_FROM_VMEXIT /* Req: b=curr %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_HVM    /* Req: b=curr %rsp=regs/cpuinfo, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
+
+        /* Hardware clears MSR_DEBUGCTL on VMExit.  Reinstate it if debugging Xen. */
+        .macro restore_lbr
+            mov $IA32_DEBUGCTLMSR_LBR, %eax
+            mov $MSR_IA32_DEBUGCTLMSR, %ecx
+            xor %edx, %edx
+            wrmsr
+        .endm
+        ALTERNATIVE "", restore_lbr, X86_FEATURE_XEN_LBR
 
         mov  %rsp,%rdi
         call vmx_vmexit_handler
@@ -72,11 +81,11 @@ UNLIKELY_END(realmode)
         test %al, %al
         jz .Lvmx_vmentry_restart
 
-        mov VCPU_arch_msr(%rbx), %rax
+        mov VCPU_arch_msrs(%rbx), %rax
         mov VCPUMSR_spec_ctrl_raw(%rax), %eax
 
         /* WARNING! `ret`, `call *`, `jmp *` not safe beyond this point. */
-        SPEC_CTRL_EXIT_TO_GUEST /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
+        SPEC_CTRL_EXIT_TO_HVM   /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
 
         mov  VCPU_hvm_guest_cr2(%rbx),%rax
 
@@ -119,7 +128,7 @@ UNLIKELY_END(realmode)
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         call vmx_vmentry_failure
-        BUG  /* vmx_vmentry_failure() shouldn't return. */
+        jmp  .Lvmx_process_softirqs
 
 ENTRY(vmx_asm_do_vmentry)
         GET_CURRENT(bx)

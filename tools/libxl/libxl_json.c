@@ -23,7 +23,7 @@
 
 /* #define DEBUG_ANSWER */
 
-struct libxl__yajl_ctx {
+typedef struct libxl__yajl_ctx {
     libxl__gc *gc;
     yajl_handle hand;
     libxl__json_object *head;
@@ -31,7 +31,7 @@ struct libxl__yajl_ctx {
 #ifdef DEBUG_ANSWER
     yajl_gen g;
 #endif
-};
+} libxl__yajl_ctx;
 
 #ifdef DEBUG_ANSWER
 #if YAJL_VERSION < 20000
@@ -59,8 +59,8 @@ struct libxl__yajl_ctx {
         const unsigned char *buf = NULL; \
         size_t len = 0; \
         yajl_gen_get_buf((yajl_ctx)->g, &buf, &len); \
-        LIBXL__LOG(libxl__gc_owner((yajl_ctx)->gc), LIBXL__LOG_DEBUG,
-		   "response:\n", buf); \
+        LIBXL__LOG(libxl__gc_owner((yajl_ctx)->gc), XTL_DEBUG, \
+		   "response: %s\n", buf); \
         yajl_gen_free((yajl_ctx)->g); \
         (yajl_ctx)->g = NULL; \
     } while (0)
@@ -463,8 +463,9 @@ libxl__json_object *libxl__json_object_alloc(libxl__gc *gc,
     return obj;
 }
 
-int libxl__json_object_append_to(libxl__gc *gc, libxl__json_object *obj,
-                                 libxl__yajl_ctx *ctx)
+static int libxl__json_object_append_to(libxl__gc *gc,
+                                        libxl__json_object *obj,
+                                        libxl__yajl_ctx *ctx)
 {
     libxl__json_object *dst = ctx->current;
 
@@ -612,7 +613,7 @@ const libxl__json_object *libxl__json_map_get(const char *key,
 
 yajl_status libxl__json_object_to_yajl_gen(libxl__gc *gc,
                                            yajl_gen hand,
-                                           libxl__json_object *obj)
+                                           const libxl__json_object *obj)
 {
     int idx = 0;
     yajl_status rc;
@@ -1014,6 +1015,38 @@ out:
                    type);
     }
 
+    return ret;
+}
+
+char *libxl__json_object_to_json(libxl__gc *gc,
+                                 const libxl__json_object *args)
+{
+    const unsigned char *buf;
+    libxl_yajl_length len;
+    yajl_gen_status s;
+    yajl_gen hand;
+    char *ret = NULL;
+    int rc;
+
+    if (!args)
+        return NULL;
+
+    hand = libxl_yajl_gen_alloc(NULL);
+    if (!hand)
+        return NULL;
+
+    rc = libxl__json_object_to_yajl_gen(gc, hand, args);
+    if (rc)
+        goto out;
+
+    s = yajl_gen_get_buf(hand, &buf, &len);
+    if (s)
+        goto out;
+
+    ret = libxl__strndup(gc, (const char *)buf, len);
+
+out:
+    yajl_gen_free(hand);
     return ret;
 }
 

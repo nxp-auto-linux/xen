@@ -28,6 +28,9 @@
 #include <libxl_utils.h>
 #include <libxlutil.h>
 #include "xl.h"
+#include "xl_parse.h"
+
+#include "xl_utils.h"
 
 xentoollog_logger_stdiostream *logger;
 int dryrun_only;
@@ -42,6 +45,9 @@ char *default_gatewaydev = NULL;
 char *default_vifbackend = NULL;
 char *default_remus_netbufscript = NULL;
 char *default_colo_proxy_script = NULL;
+libxl_bitmap global_vm_affinity_mask;
+libxl_bitmap global_hvm_affinity_mask;
+libxl_bitmap global_pv_affinity_mask;
 enum output_format default_output_format = OUTPUT_FORMAT_JSON;
 int claim_mode = 1;
 bool progress_use_cr = 0;
@@ -203,6 +209,23 @@ static void parse_global_config(const char *configfile,
     if (!xlu_cfg_get_long (config, "max_maptrack_frames", &l, 0))
         max_maptrack_frames = l;
 
+    libxl_cpu_bitmap_alloc(ctx, &global_vm_affinity_mask, 0);
+    libxl_cpu_bitmap_alloc(ctx, &global_hvm_affinity_mask, 0);
+    libxl_cpu_bitmap_alloc(ctx, &global_pv_affinity_mask, 0);
+
+    if (!xlu_cfg_get_string (config, "vm.cpumask", &buf, 0))
+        parse_cpurange(buf, &global_vm_affinity_mask);
+    else
+        libxl_bitmap_set_any(&global_vm_affinity_mask);
+    if (!xlu_cfg_get_string (config, "vm.hvm.cpumask", &buf, 0))
+        parse_cpurange(buf, &global_hvm_affinity_mask);
+    else
+       libxl_bitmap_set_any(&global_hvm_affinity_mask);
+    if (!xlu_cfg_get_string (config, "vm.pv.cpumask", &buf, 0))
+        parse_cpurange(buf, &global_pv_affinity_mask);
+    else
+        libxl_bitmap_set_any(&global_pv_affinity_mask);
+
     xlu_cfg_destroy(config);
 }
 
@@ -297,11 +320,17 @@ void xl_ctx_alloc(void) {
         exit(1);
     }
 
+    libxl_bitmap_init(&global_vm_affinity_mask);
+    libxl_bitmap_init(&global_hvm_affinity_mask);
+    libxl_bitmap_init(&global_pv_affinity_mask);
     libxl_childproc_setmode(ctx, &childproc_hooks, 0);
 }
 
 static void xl_ctx_free(void)
 {
+    libxl_bitmap_dispose(&global_pv_affinity_mask);
+    libxl_bitmap_dispose(&global_hvm_affinity_mask);
+    libxl_bitmap_dispose(&global_vm_affinity_mask);
     if (ctx) {
         libxl_ctx_free(ctx);
         ctx = NULL;
@@ -357,9 +386,9 @@ int main(int argc, char **argv)
         (progress_use_cr ? XTL_STDIOSTREAM_PROGRESS_USE_CR : 0));
     if (!logger) exit(EXIT_FAILURE);
 
-    atexit(xl_ctx_free);
-
     xl_ctx_alloc();
+
+    atexit(xl_ctx_free);
 
     ret = libxl_read_file_contents(ctx, XL_GLOBAL_CONFIG,
             &config_data, &config_len);

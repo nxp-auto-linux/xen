@@ -1,7 +1,6 @@
 #ifndef __ASM_ARM_PLATFORM_H
 #define __ASM_ARM_PLATFORM_H
 
-#include <xen/init.h>
 #include <xen/sched.h>
 #include <xen/mm.h>
 #include <xen/device_tree.h>
@@ -26,6 +25,8 @@ struct platform_desc {
     void (*reset)(void);
     /* Platform power-off */
     void (*poweroff)(void);
+    /* Platform specific SMC handler */
+    bool (*smc)(struct cpu_user_regs *regs);
     /*
      * Platform quirks
      * Defined has a function because a platform can support multiple
@@ -46,15 +47,16 @@ struct platform_desc {
  */
 #define PLATFORM_QUIRK_GIC_64K_STRIDE (1 << 0)
 
-void __init platform_init(void);
-int __init platform_init_time(void);
-int __init platform_specific_mapping(struct domain *d);
+void platform_init(void);
+int platform_init_time(void);
+int platform_specific_mapping(struct domain *d);
 #ifdef CONFIG_ARM_32
 int platform_smp_init(void);
 int platform_cpu_up(int cpu);
 #endif
 void platform_reset(void);
 void platform_poweroff(void);
+bool platform_smc(struct cpu_user_regs *regs);
 bool platform_has_quirk(uint32_t quirk);
 bool platform_device_is_blacklisted(const struct dt_device_node *node);
 

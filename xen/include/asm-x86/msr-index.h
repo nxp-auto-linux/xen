@@ -20,7 +20,6 @@
 #define _EFER_LMA		10 /* Long mode active (read-only) */
 #define _EFER_NX		11 /* No execute enable */
 #define _EFER_SVME		12 /* AMD: SVM enable */
-#define _EFER_LMSLE		13 /* AMD: Long-mode segment limit enable */
 #define _EFER_FFXSE		14 /* AMD: Fast FXSAVE/FXRSTOR enable */
 
 #define EFER_SCE		(1<<_EFER_SCE)
@@ -28,13 +27,16 @@
 #define EFER_LMA		(1<<_EFER_LMA)
 #define EFER_NX			(1<<_EFER_NX)
 #define EFER_SVME		(1<<_EFER_SVME)
-#define EFER_LMSLE		(1<<_EFER_LMSLE)
 #define EFER_FFXSE		(1<<_EFER_FFXSE)
+
+#define EFER_KNOWN_MASK		(EFER_SCE | EFER_LME | EFER_LMA | EFER_NX | \
+				 EFER_SVME | EFER_FFXSE)
 
 /* Speculation Controls. */
 #define MSR_SPEC_CTRL			0x00000048
 #define SPEC_CTRL_IBRS			(_AC(1, ULL) << 0)
 #define SPEC_CTRL_STIBP			(_AC(1, ULL) << 1)
+#define SPEC_CTRL_SSBD			(_AC(1, ULL) << 2)
 
 #define MSR_PRED_CMD			0x00000049
 #define PRED_CMD_IBPB			(_AC(1, ULL) << 0)
@@ -42,6 +44,12 @@
 #define MSR_ARCH_CAPABILITIES		0x0000010a
 #define ARCH_CAPABILITIES_RDCL_NO	(_AC(1, ULL) << 0)
 #define ARCH_CAPABILITIES_IBRS_ALL	(_AC(1, ULL) << 1)
+#define ARCH_CAPS_RSBA			(_AC(1, ULL) << 2)
+#define ARCH_CAPS_SKIP_L1DFL		(_AC(1, ULL) << 3)
+#define ARCH_CAPS_SSB_NO		(_AC(1, ULL) << 4)
+
+#define MSR_FLUSH_CMD			0x0000010b
+#define FLUSH_CMD_L1D			(_AC(1, ULL) << 0)
 
 /* Intel MSRs. Some also available on other CPUs */
 #define MSR_IA32_PERFCTR0		0x000000c1
@@ -54,6 +62,8 @@
 #define ATM_LNC_C6_AUTO_DEMOTE		(1UL << 25)
 
 #define MSR_MTRRcap			0x000000fe
+#define MTRRcap_VCNT			0x000000ff
+
 #define MSR_IA32_BBL_CR_CTL		0x00000119
 
 #define MSR_IA32_SYSENTER_CS		0x00000174
@@ -90,6 +100,8 @@
 #define MSR_MTRRfix4K_F0000		0x0000026e
 #define MSR_MTRRfix4K_F8000		0x0000026f
 #define MSR_MTRRdefType			0x000002ff
+#define MTRRdefType_FE			(1u << 10)
+#define MTRRdefType_E			(1u << 11)
 
 #define MSR_IA32_DEBUGCTLMSR		0x000001d9
 #define IA32_DEBUGCTLMSR_LBR		(1<<0) /* Last Branch Record */
@@ -314,18 +326,21 @@
 
 #define MSR_IA32_TSC_ADJUST		0x0000003b
 
-#define MSR_IA32_APICBASE		0x0000001b
-#define MSR_IA32_APICBASE_BSP		(1<<8)
-#define MSR_IA32_APICBASE_EXTD		(1<<10)
-#define MSR_IA32_APICBASE_ENABLE	(1<<11)
-#define MSR_IA32_APICBASE_BASE		0x000ffffffffff000ul
-#define MSR_IA32_APICBASE_MSR           0x800
-#define MSR_IA32_APICTPR_MSR            0x808
-#define MSR_IA32_APICPPR_MSR            0x80a
-#define MSR_IA32_APICEOI_MSR            0x80b
-#define MSR_IA32_APICTMICT_MSR          0x838
-#define MSR_IA32_APICTMCCT_MSR          0x839
-#define MSR_IA32_APICSELF_MSR           0x83f
+#define MSR_APIC_BASE                   0x0000001b
+#define  APIC_BASE_BSP                  (1<<8)
+#define  APIC_BASE_EXTD                 (1<<10)
+#define  APIC_BASE_ENABLE               (1<<11)
+#define  APIC_BASE_ADDR_MASK            0x000ffffffffff000ul
+
+#define MSR_X2APIC_FIRST                0x00000800
+#define MSR_X2APIC_LAST                 0x00000bff
+
+#define MSR_X2APIC_TPR                  0x00000808
+#define MSR_X2APIC_PPR                  0x0000080a
+#define MSR_X2APIC_EOI                  0x0000080b
+#define MSR_X2APIC_TMICT                0x00000838
+#define MSR_X2APIC_TMCCT                0x00000839
+#define MSR_X2APIC_SELF                 0x0000083f
 
 #define MSR_IA32_UCODE_WRITE		0x00000079
 #define MSR_IA32_UCODE_REV		0x0000008b
@@ -361,6 +376,7 @@
 #define MSR_IA32_PSR_L3_MASK_CODE(n)	(0x00000c90 + (n) * 2 + 1)
 #define MSR_IA32_PSR_L3_MASK_DATA(n)	(0x00000c90 + (n) * 2)
 #define MSR_IA32_PSR_L2_MASK(n)		(0x00000d10 + (n))
+#define MSR_IA32_PSR_MBA_MASK(n)	(0x00000d50 + (n))
 
 /* Intel Model 6 */
 #define MSR_P6_PERFCTR(n)		(0x000000c1 + (n))

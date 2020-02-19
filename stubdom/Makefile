@@ -87,6 +87,7 @@ newlib-$(NEWLIB_VERSION): newlib-$(NEWLIB_VERSION).tar.gz
 	patch -d $@ -p0 < newlib.patch
 	patch -d $@ -p0 < newlib-chk.patch
 	patch -d $@ -p1 < newlib-stdint-size_max-fix-from-1.17.0.patch
+	patch -d $@ -p1 < newlib-disable-texinfo.patch
 	find $@ -type f | xargs perl -i.bak \
 		-pe 's/\b_(tzname|daylight|timezone)\b/$$1/g'
 	touch $@
@@ -229,6 +230,7 @@ tpm_emulator-$(XEN_TARGET_ARCH): tpm_emulator-$(TPMEMU_VERSION).tar.gz
 	patch -d $@ -p1 < vtpm-deepquote-anyloc.patch
 	patch -d $@ -p1 < vtpm-cmake-Wextra.patch
 	patch -d $@ -p1 < vtpm-implicit-fallthrough.patch
+	patch -d $@ -p1 < vtpm_TPM_ChangeAuthAsymFinish.patch
 	mkdir $@/build
 	cd $@/build; CC=${CC} $(CMAKE) .. -DCMAKE_C_FLAGS:STRING="-std=c99 -DTPM_NO_EXTERN $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -Wno-declaration-after-statement"
 	touch $@
@@ -612,11 +614,11 @@ install-xenstore: xenstore-stubdom
 
 install-vtpm: vtpm-stubdom
 	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
-	$(INSTALL_PROG) mini-os-$(XEN_TARGET_ARCH)-vtpm/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpm-stubdom.gz"
+	$(INSTALL_DATA) mini-os-$(XEN_TARGET_ARCH)-vtpm/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpm-stubdom.gz"
 
 install-vtpmmgr: vtpmmgr-stubdom
 	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
-	$(INSTALL_PROG) mini-os-$(XEN_TARGET_ARCH)-vtpmmgr/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpmmgr-stubdom.gz"
+	$(INSTALL_DATA) mini-os-$(XEN_TARGET_ARCH)-vtpmmgr/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpmmgr-stubdom.gz"
 
 ###########
 # uninstall

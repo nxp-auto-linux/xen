@@ -45,6 +45,7 @@
 #include <asm/gic_v3_its.h>
 #include <asm/vgic.h>
 #include <asm/vgic-emul.h>
+#include <asm/vreg.h>
 
 /*
  * Data structure to describe a virtual ITS.
@@ -381,7 +382,7 @@ static int its_handle_clear(struct virt_its *its, uint64_t *cmdptr)
      * have no active state, we don't need to care about this here.
      */
     if ( !test_bit(GIC_IRQ_GUEST_VISIBLE, &p->status) )
-        gic_remove_irq_from_queues(vcpu, p);
+        vgic_remove_irq_from_queues(vcpu, p);
 
     spin_unlock_irqrestore(&vcpu->arch.vgic.lock, flags);
     ret = 0;
@@ -619,7 +620,7 @@ static int its_discard_event(struct virt_its *its,
     }
 
     /* Cleanup the pending_irq and disconnect it from the LPI. */
-    gic_remove_irq_from_queues(vcpu, p);
+    vgic_remove_irq_from_queues(vcpu, p);
     vgic_init_pending_irq(p, INVALID_LPI);
 
     spin_unlock_irqrestore(&vcpu->arch.vgic.lock, flags);
@@ -1136,7 +1137,6 @@ read_reserved:
 bad_width:
     printk(XENLOG_G_ERR "vGITS: bad read width %d r%d offset %#04lx\n",
            info->dabt.size, info->dabt.reg, (unsigned long)info->gpa & 0xffff);
-    domain_crash_synchronous();
 
     return 0;
 }
@@ -1446,8 +1446,6 @@ bad_width:
     printk(XENLOG_G_ERR "vGITS: bad write width %d r%d offset %#08lx\n",
            info->dabt.size, info->dabt.reg, (unsigned long)info->gpa & 0xffff);
 
-    domain_crash_synchronous();
-
     return 0;
 }
 
@@ -1550,6 +1548,10 @@ int vgic_v3_its_init_domain(struct domain *d)
 void vgic_v3_its_free_domain(struct domain *d)
 {
     struct virt_its *pos, *temp;
+
+    /* Cope with unitialized vITS */
+    if ( list_head_is_null(&d->arch.vgic.vits_list) )
+        return;
 
     list_for_each_entry_safe( pos, temp, &d->arch.vgic.vits_list, vits_list )
     {

@@ -264,6 +264,134 @@ static char *string(char *str, char *end, const char *s,
     return str;
 }
 
+/* Print a bitmap as '0-3,6-15' */
+static char *print_bitmap_list(
+    char *str, char *end, const unsigned long *bitmap, unsigned int nr_bits)
+{
+    /* current bit is 'cur', most recently seen range is [rbot, rtop] */
+    unsigned int cur, rbot, rtop;
+    bool first = true;
+
+    rbot = cur = find_first_bit(bitmap, nr_bits);
+    while ( cur < nr_bits )
+    {
+        rtop = cur;
+        cur = find_next_bit(bitmap, nr_bits, cur + 1);
+
+        if ( cur < nr_bits && cur <= rtop + 1 )
+            continue;
+
+        if ( !first )
+        {
+            if ( str < end )
+                *str = ',';
+            str++;
+        }
+        first = false;
+
+        str = number(str, end, rbot, 10, -1, -1, 0);
+        if ( rbot < rtop )
+        {
+            if ( str < end )
+                *str = '-';
+            str++;
+
+            str = number(str, end, rtop, 10, -1, -1, 0);
+        }
+
+        rbot = cur;
+    }
+
+    return str;
+}
+
+/* Print a bitmap as a comma separated hex string. */
+static char *print_bitmap_string(
+    char *str, char *end, const unsigned long *bitmap, unsigned int nr_bits)
+{
+    const unsigned int CHUNKSZ = 32;
+    unsigned int chunksz;
+    int i;
+    bool first = true;
+
+    chunksz = nr_bits & (CHUNKSZ - 1);
+    if ( chunksz == 0 )
+        chunksz = CHUNKSZ;
+
+    /*
+     * First iteration copes with the trailing partial word if nr_bits isn't a
+     * round multiple of CHUNKSZ.  All subsequent iterations work on a
+     * complete CHUNKSZ block.
+     */
+    for ( i = ROUNDUP(nr_bits, CHUNKSZ) - CHUNKSZ; i >= 0; i -= CHUNKSZ )
+    {
+        unsigned int chunkmask = (1ull << chunksz) - 1;
+        unsigned int word      = i / BITS_PER_LONG;
+        unsigned int offset    = i % BITS_PER_LONG;
+        unsigned long val      = (bitmap[word] >> offset) & chunkmask;
+
+        if ( !first )
+        {
+            if ( str < end )
+                *str = ',';
+            str++;
+        }
+        first = false;
+
+        str = number(str, end, val, 16, DIV_ROUND_UP(chunksz, 4), -1, ZEROPAD);
+
+        chunksz = CHUNKSZ;
+    }
+
+    return str;
+}
+
+/* Print a domain id, using names for system domains.  (e.g. d0 or d[IDLE]) */
+static char *print_domain(char *str, char *end, const struct domain *d)
+{
+    const char *name = NULL;
+
+    /* Some debugging may have an optionally-NULL pointer. */
+    if ( unlikely(!d) )
+        return string(str, end, "NULL", -1, -1, 0);
+
+    switch ( d->domain_id )
+    {
+    case DOMID_IO:   name = "[IO]";   break;
+    case DOMID_XEN:  name = "[XEN]";  break;
+    case DOMID_COW:  name = "[COW]";  break;
+    case DOMID_IDLE: name = "[IDLE]"; break;
+        /*
+         * In principle, we could ASSERT_UNREACHABLE() in the default case.
+         * However, this path is used to print out crash information, which
+         * risks recursing infinitely and not printing any useful information.
+         */
+    }
+
+    if ( str < end )
+        *str = 'd';
+
+    if ( name )
+        return string(str + 1, end, name, -1, -1, 0);
+    else
+        return number(str + 1, end, d->domain_id, 10, -1, -1, 0);
+}
+
+/* Print a vcpu id.  (e.g. d0v1 or d[IDLE]v0) */
+static char *print_vcpu(char *str, char *end, const struct vcpu *v)
+{
+    /* Some debugging may have an optionally-NULL pointer. */
+    if ( unlikely(!v) )
+        return string(str, end, "NULL", -1, -1, 0);
+
+    str = print_domain(str, end, v->domain);
+
+    if ( str < end )
+        *str = 'v';
+
+    return number(str + 1, end, v->vcpu_id, 10, -1, -1, 0);
+}
+
 static char *pointer(char *str, char *end, const char **fmt_ptr,
                      const void *arg, int field_width, int precision,
                      int flags)
@@ -273,6 +401,25 @@ static char *pointer(char *str, char *end, const char **fmt_ptr,
     /* Custom %p suffixes. See XEN_ROOT/docs/misc/printk-formats.txt */
     switch ( fmt[1] )
     {
+    case 'b': /* Bitmap as hex, or list */
+        ++*fmt_ptr;
+
+        if ( field_width < 0 )
+            return str;
+
+        if ( fmt[2] == 'l' )
+        {
+            ++*fmt_ptr;
+
+            return print_bitmap_list(str, end, arg, field_width);
+        }
+
+        return print_bitmap_string(str, end, arg, field_width);
+
+    case 'd': /* Domain ID from a struct domain *. */
+        ++*fmt_ptr;
+        return print_domain(str, end, arg);
+
     case 'h': /* Raw buffer as hex string. */
     {
         const uint8_t *hex_buffer = arg;
@@ -370,22 +517,8 @@ static char *pointer(char *str, char *end, const char **fmt_ptr,
     }
 
     case 'v': /* d<domain-id>v<vcpu-id> from a struct vcpu */
-    {
-        const struct vcpu *v = arg;
-
         ++*fmt_ptr;
-        if ( unlikely(v->domain->domain_id == DOMID_IDLE) )
-            str = string(str, end, "IDLE", -1, -1, 0);
-        else
-        {
-            if ( str < end )
-                *str = 'd';
-            str = number(str + 1, end, v->domain->domain_id, 10, -1, -1, 0);
-        }
-        if ( str < end )
-            *str = 'v';
-        return number(str + 1, end, v->vcpu_id, 10, -1, -1, 0);
-    }
+        return print_vcpu(str, end, arg);
     }
 
     if ( field_width == -1 )

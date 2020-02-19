@@ -1,2 +1,2 @@
 obj-y += iommu.o
-obj-y += smmu.o
+obj-$(CONFIG_ARM_SMMU) += smmu.o

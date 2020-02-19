@@ -31,6 +31,7 @@
 #include <asm/platform.h>
 #include <asm/vgic.h>
 #include <asm/vgic-emul.h>
+#include <asm/vreg.h>
 
 static struct {
     bool enabled;
@@ -348,7 +349,6 @@ static int vgic_v2_distr_mmio_read(struct vcpu *v, mmio_info_t *info,
 bad_width:
     printk(XENLOG_G_ERR "%pv: vGICD: bad read width %d r%d offset %#08x\n",
            v, dabt.size, dabt.reg, gicd_reg);
-    domain_crash_synchronous();
     return 0;
 
 read_as_zero_32:
@@ -380,6 +380,7 @@ static bool vgic_v2_to_sgi(struct vcpu *v, register_t sgir)
     enum gic_sgi_mode sgi_mode;
     struct sgi_target target;
 
+    sgi_target_init(&target);
     irqmode = (sgir & GICD_SGI_TARGET_LIST_MASK) >> GICD_SGI_TARGET_LIST_SHIFT;
     virq = (sgir & GICD_SGI_INTID_MASK);
 
@@ -387,7 +388,6 @@ static bool vgic_v2_to_sgi(struct vcpu *v, register_t sgir)
     switch ( irqmode )
     {
     case GICD_SGI_TARGET_LIST_VAL:
-        sgi_target_init(&target);
         target.list = (sgir & GICD_SGI_TARGET_MASK) >> GICD_SGI_TARGET_SHIFT;
         sgi_mode = SGI_TARGET_LIST;
         break;
@@ -486,6 +486,8 @@ static int vgic_v2_distr_mmio_write(struct vcpu *v, mmio_info_t *info,
 
     case VRANGE32(GICD_ISACTIVER, GICD_ISACTIVERN):
         if ( dabt.size != DABT_WORD ) goto bad_width;
+        if ( r == 0 )
+            goto write_ignore_32;
         printk(XENLOG_G_ERR
                "%pv: vGICD: unhandled word write %#"PRIregister" to ISACTIVER%d\n",
                v, r, gicd_reg - GICD_ISACTIVER);
@@ -613,7 +615,6 @@ bad_width:
     printk(XENLOG_G_ERR
            "%pv: vGICD: bad write width %d r%d=%"PRIregister" offset %#08x\n",
            v, dabt.size, dabt.reg, r, gicd_reg);
-    domain_crash_synchronous();
     return 0;
 
 write_ignore_32:
@@ -724,7 +725,6 @@ static const struct vgic_ops vgic_v2_ops = {
     .domain_free = vgic_v2_domain_free,
     .lpi_to_pending = vgic_v2_lpi_to_pending,
     .lpi_get_priority = vgic_v2_lpi_get_priority,
-    .max_vcpus = 8,
 };
 
 int vgic_v2_init(struct domain *d, int *mmio_count)

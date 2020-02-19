@@ -110,6 +110,38 @@ static always_inline unsigned long __cmpxchg(
     return old;
 }
 
+static always_inline unsigned long cmpxchg_local_(
+    void *ptr, unsigned long old, unsigned long new, unsigned int size)
+{
+    unsigned long prev = ~old;
+
+    switch ( size )
+    {
+    case 1:
+        asm volatile ( "cmpxchgb %b2, %1"
+                       : "=a" (prev), "+m" (*(uint8_t *)ptr)
+                       : "q" (new), "0" (old) );
+        break;
+    case 2:
+        asm volatile ( "cmpxchgw %w2, %1"
+                       : "=a" (prev), "+m" (*(uint16_t *)ptr)
+                       : "r" (new), "0" (old) );
+        break;
+    case 4:
+        asm volatile ( "cmpxchgl %k2, %1"
+                       : "=a" (prev), "+m" (*(uint32_t *)ptr)
+                       : "r" (new), "0" (old) );
+        break;
+    case 8:
+        asm volatile ( "cmpxchgq %2, %1"
+                       : "=a" (prev), "+m" (*(uint64_t *)ptr)
+                       : "r" (new), "0" (old) );
+        break;
+    }
+
+    return prev;
+}
+
 #define cmpxchgptr(ptr,o,n) ({                                          \
     const __typeof__(**(ptr)) *__o = (o);                               \
     __typeof__(**(ptr)) *__n = (n);                                     \
@@ -164,26 +196,54 @@ static always_inline unsigned long __xadd(
     ((typeof(*(ptr)))__xadd(ptr, (typeof(*(ptr)))(v), sizeof(*(ptr))))
 
 /*
+ * Mandatory barriers, for enforced ordering of reads and writes, e.g. for use
+ * with MMIO devices mapped with reduced cacheability.
+ */
+#define mb()            asm volatile ( "mfence" ::: "memory" )
+#define rmb()           asm volatile ( "lfence" ::: "memory" )
+#define wmb()           asm volatile ( "sfence" ::: "memory" )
+
+/*
+ * SMP barriers, for ordering of reads and writes between CPUs, most commonly
+ * used with shared memory.
+ *
  * Both Intel and AMD agree that, from a programmer's viewpoint:
  *  Loads cannot be reordered relative to other loads.
  *  Stores cannot be reordered relative to other stores.
- * 
- * Intel64 Architecture Memory Ordering White Paper
- * <http://developer.intel.com/products/processor/manuals/318147.pdf>
- * 
- * AMD64 Architecture Programmer's Manual, Volume 2: System Programming
- * <http://www.amd.com/us-en/assets/content_type/\
- *  white_papers_and_tech_docs/24593.pdf>
+ *  Loads may be reordered ahead of a unaliasing stores.
+ *
+ * Refer to the vendor system programming manuals for further details.
  */
-#define rmb()           barrier()
-#define wmb()           barrier()
-
 #define smp_mb()        mb()
-#define smp_rmb()       rmb()
-#define smp_wmb()       wmb()
+#define smp_rmb()       barrier()
+#define smp_wmb()       barrier()
 
 #define set_mb(var, value) do { xchg(&var, value); } while (0)
-#define set_wmb(var, value) do { var = value; wmb(); } while (0)
+#define set_wmb(var, value) do { var = value; smp_wmb(); } while (0)
+
+/**
+ * array_index_mask_nospec() - generate a mask that is ~0UL when the
+ *      bounds check succeeds and 0 otherwise
+ * @index: array element index
+ * @size: number of elements in array
+ *
+ * Returns:
+ *     0 - (index < size)
+ */
+static inline unsigned long array_index_mask_nospec(unsigned long index,
+                                                    unsigned long size)
+{
+    unsigned long mask;
+
+    asm volatile ( "cmp %[size], %[index]; sbb %[mask], %[mask];"
+                   : [mask] "=r" (mask)
+                   : [size] "g" (size), [index] "r" (index) );
+
+    return mask;
+}
+
+/* Override default implementation in nospec.h. */
+#define array_index_mask_nospec array_index_mask_nospec
 
 #define local_irq_disable()     asm volatile ( "cli" : : : "memory" )
 #define local_irq_enable()      asm volatile ( "sti" : : : "memory" )

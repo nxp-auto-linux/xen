@@ -26,6 +26,7 @@
 #include <xen/smp.h>
 #include <xen/softirq.h>
 #include <asm/mc146818rtc.h>
+#include <asm/microcode.h>
 #include <asm/msr.h>
 #include <asm/atomic.h>
 #include <asm/mpspec.h>
@@ -302,31 +303,31 @@ void disable_local_APIC(void)
 
     if (enabled_via_apicbase) {
         uint64_t msr_content;
-        rdmsrl(MSR_IA32_APICBASE, msr_content);
-        wrmsrl(MSR_IA32_APICBASE, msr_content &
-               ~(MSR_IA32_APICBASE_ENABLE|MSR_IA32_APICBASE_EXTD));
+        rdmsrl(MSR_APIC_BASE, msr_content);
+        wrmsrl(MSR_APIC_BASE, msr_content &
+               ~(APIC_BASE_ENABLE | APIC_BASE_EXTD));
     }
 
     if ( kexecing && (current_local_apic_mode() != apic_boot_mode) )
     {
         uint64_t msr_content;
-        rdmsrl(MSR_IA32_APICBASE, msr_content);
-        msr_content &= ~(MSR_IA32_APICBASE_ENABLE|MSR_IA32_APICBASE_EXTD);
-        wrmsrl(MSR_IA32_APICBASE, msr_content);
+        rdmsrl(MSR_APIC_BASE, msr_content);
+        msr_content &= ~(APIC_BASE_ENABLE | APIC_BASE_EXTD);
+        wrmsrl(MSR_APIC_BASE, msr_content);
 
         switch ( apic_boot_mode )
         {
         case APIC_MODE_DISABLED:
             break; /* Nothing to do - we did this above */
         case APIC_MODE_XAPIC:
-            msr_content |= MSR_IA32_APICBASE_ENABLE;
-            wrmsrl(MSR_IA32_APICBASE, msr_content);
+            msr_content |= APIC_BASE_ENABLE;
+            wrmsrl(MSR_APIC_BASE, msr_content);
             break;
         case APIC_MODE_X2APIC:
-            msr_content |= MSR_IA32_APICBASE_ENABLE;
-            wrmsrl(MSR_IA32_APICBASE, msr_content);
-            msr_content |= MSR_IA32_APICBASE_EXTD;
-            wrmsrl(MSR_IA32_APICBASE, msr_content);
+            msr_content |= APIC_BASE_ENABLE;
+            wrmsrl(MSR_APIC_BASE, msr_content);
+            msr_content |= APIC_BASE_EXTD;
+            wrmsrl(MSR_APIC_BASE, msr_content);
             break;
         default:
             printk("Default case when reverting #%d lapic to boot state\n",
@@ -478,12 +479,12 @@ static void __enable_x2apic(void)
 {
     uint64_t msr_content;
 
-    rdmsrl(MSR_IA32_APICBASE, msr_content);
-    if ( !(msr_content & MSR_IA32_APICBASE_EXTD) )
+    rdmsrl(MSR_APIC_BASE, msr_content);
+    if ( !(msr_content & APIC_BASE_EXTD) )
     {
-        msr_content |= MSR_IA32_APICBASE_ENABLE | MSR_IA32_APICBASE_EXTD;
+        msr_content |= APIC_BASE_ENABLE | APIC_BASE_EXTD;
         msr_content = (uint32_t)msr_content;
-        wrmsrl(MSR_IA32_APICBASE, msr_content);
+        wrmsrl(MSR_APIC_BASE, msr_content);
     }
 }
 
@@ -743,10 +744,10 @@ int lapic_resume(void)
      */
     if ( !x2apic_enabled )
     {
-        rdmsrl(MSR_IA32_APICBASE, msr_content);
-        msr_content &= ~MSR_IA32_APICBASE_BASE;
-        wrmsrl(MSR_IA32_APICBASE,
-            msr_content | MSR_IA32_APICBASE_ENABLE | mp_lapic_addr);
+        rdmsrl(MSR_APIC_BASE, msr_content);
+        msr_content &= ~APIC_BASE_ADDR_MASK;
+        wrmsrl(MSR_APIC_BASE,
+               msr_content | APIC_BASE_ENABLE | mp_lapic_addr);
     }
     else
         resume_x2apic();
@@ -817,7 +818,8 @@ static int __init detect_init_APIC (void)
     if (enable_local_apic < 0)
         return -1;
 
-    if (rdmsr_safe(MSR_IA32_APICBASE, msr_content)) {
+    if ( rdmsr_safe(MSR_APIC_BASE, msr_content) )
+    {
         printk("No local APIC present\n");
         return -1;
     }
@@ -838,11 +840,12 @@ static int __init detect_init_APIC (void)
          * software for Intel P6 or later and AMD K7
          * (Model > 1) or later.
          */
-        if (!(msr_content & MSR_IA32_APICBASE_ENABLE)) {
+        if ( !(msr_content & APIC_BASE_ENABLE) )
+        {
             printk("Local APIC disabled by BIOS -- reenabling.\n");
-            msr_content &= ~MSR_IA32_APICBASE_BASE;
-            msr_content |= MSR_IA32_APICBASE_ENABLE | APIC_DEFAULT_PHYS_BASE;
-            wrmsrl(MSR_IA32_APICBASE, msr_content);
+            msr_content &= ~APIC_BASE_ADDR_MASK;
+            msr_content |= APIC_BASE_ENABLE | APIC_DEFAULT_PHYS_BASE;
+            wrmsrl(MSR_APIC_BASE, msr_content);
             enabled_via_apicbase = true;
         }
     }
@@ -859,8 +862,8 @@ static int __init detect_init_APIC (void)
     mp_lapic_addr = APIC_DEFAULT_PHYS_BASE;
 
     /* The BIOS may have set up the APIC at some other address */
-    if (msr_content & MSR_IA32_APICBASE_ENABLE)
-        mp_lapic_addr = msr_content & MSR_IA32_APICBASE_BASE;
+    if ( msr_content & APIC_BASE_ENABLE )
+        mp_lapic_addr = msr_content & APIC_BASE_ADDR_MASK;
 
     if (nmi_watchdog != NMI_NONE)
         nmi_watchdog = NMI_LOCAL_APIC;
@@ -902,8 +905,7 @@ void __init x2apic_bsp_setup(void)
             printk("Not enabling x2APIC: depends on iommu_supports_eim.\n");
             return;
         }
-        panic("x2APIC: already enabled by BIOS, but "
-              "iommu_supports_eim failed");
+        panic("x2APIC: already enabled by BIOS, but iommu_supports_eim failed\n");
     }
 
     if ( (ioapic_entries = alloc_ioapic_entries()) == NULL )
@@ -935,7 +937,7 @@ void __init x2apic_bsp_setup(void)
     default:
         if ( x2apic_enabled )
             panic("Interrupt remapping could not be enabled while "
-                  "x2APIC is already enabled by BIOS");
+                  "x2APIC is already enabled by BIOS\n");
 
         printk(XENLOG_ERR
                "Failed to enable Interrupt Remapping: Will not enable x2APIC.\n");
@@ -944,8 +946,8 @@ void __init x2apic_bsp_setup(void)
 
     force_iommu = 1;
 
-    genapic = apic_x2apic_probe();
-    printk("Switched to APIC driver %s.\n", genapic->name);
+    genapic = *apic_x2apic_probe();
+    printk("Switched to APIC driver %s.\n", genapic.name);
 
     if ( !x2apic_enabled )
     {
@@ -1079,6 +1081,13 @@ static void __setup_APIC_LVTT(unsigned int clocks)
 
     apic_write(APIC_LVTT, lvtt_value);
 
+    /*
+     * See Intel SDM: TSC-Deadline Mode chapter. In xAPIC mode,
+     * writing to the APIC LVTT and TSC_DEADLINE MSR isn't serialized.
+     * According to Intel, MFENCE can do the serialization here.
+     */
+    asm volatile( "mfence" : : : "memory" );
+
     tmp_value = apic_read(APIC_TDCR);
     apic_write(APIC_TDCR, tmp_value | APIC_TDR_DIV_1);
 
@@ -1091,6 +1100,97 @@ static void setup_APIC_timer(void)
     local_irq_save(flags);
     __setup_APIC_LVTT(0);
     local_irq_restore(flags);
+}
+
+#define DEADLINE_MODEL_MATCH(m, fr) \
+    { .vendor = X86_VENDOR_INTEL, .family = 6, .model = (m), \
+      .feature = X86_FEATURE_TSC_DEADLINE, \
+      .driver_data = (void *)(unsigned long)(fr) }
+
+static unsigned int __init hsx_deadline_rev(void)
+{
+    switch ( boot_cpu_data.x86_mask )
+    {
+    case 0x02: return 0x3a; /* EP */
+    case 0x04: return 0x0f; /* EX */
+    }
+
+    return ~0U;
+}
+
+static unsigned int __init bdx_deadline_rev(void)
+{
+    switch ( boot_cpu_data.x86_mask )
+    {
+    case 0x02: return 0x00000011;
+    case 0x03: return 0x0700000e;
+    case 0x04: return 0x0f00000c;
+    case 0x05: return 0x0e000003;
+    }
+
+    return ~0U;
+}
+
+static unsigned int __init skx_deadline_rev(void)
+{
+    switch ( boot_cpu_data.x86_mask )
+    {
+    case 0x00 ... 0x02: return ~0U;
+    case 0x03: return 0x01000136;
+    case 0x04: return 0x02000014;
+    }
+
+    return 0;
+}
+
+static const struct x86_cpu_id __initconstrel deadline_match[] = {
+    DEADLINE_MODEL_MATCH(0x3c, 0x22),             /* Haswell */
+    DEADLINE_MODEL_MATCH(0x3f, hsx_deadline_rev), /* Haswell EP/EX */
+    DEADLINE_MODEL_MATCH(0x45, 0x20),             /* Haswell D */
+    DEADLINE_MODEL_MATCH(0x46, 0x17),             /* Haswell H */
+
+    DEADLINE_MODEL_MATCH(0x3d, 0x25),             /* Broadwell */
+    DEADLINE_MODEL_MATCH(0x47, 0x17),             /* Broadwell H */
+    DEADLINE_MODEL_MATCH(0x4f, 0x0b000020),       /* Broadwell EP/EX */
+    DEADLINE_MODEL_MATCH(0x56, bdx_deadline_rev), /* Broadwell D */
+
+    DEADLINE_MODEL_MATCH(0x4e, 0xb2),             /* Skylake M */
+    DEADLINE_MODEL_MATCH(0x55, skx_deadline_rev), /* Skylake X */
+    DEADLINE_MODEL_MATCH(0x5e, 0xb2),             /* Skylake D */
+
+    DEADLINE_MODEL_MATCH(0x8e, 0x52),             /* Kabylake M */
+    DEADLINE_MODEL_MATCH(0x9e, 0x52),             /* Kabylake D */
+
+    {}
+};
+
+static void __init check_deadline_errata(void)
+{
+    const struct x86_cpu_id *m;
+    unsigned int rev;
+
+    if ( boot_cpu_has(X86_FEATURE_HYPERVISOR) )
+        return;
+
+    m = x86_match_cpu(deadline_match);
+    if ( !m )
+        return;
+
+    /*
+     * Function pointers will have the MSB set due to address layout,
+     * immediate revisions will not.
+     */
+    if ( (long)m->driver_data < 0 )
+        rev = ((unsigned int (*)(void))(m->driver_data))();
+    else
+        rev = (unsigned long)m->driver_data;
+
+    if ( this_cpu(ucode_cpu_info).cpu_sig.rev >= rev )
+        return;
+
+    setup_clear_cpu_cap(X86_FEATURE_TSC_DEADLINE);
+    printk(XENLOG_WARNING "TSC_DEADLINE disabled due to Errata; "
+           "please update microcode to version %#x (or later)\n", rev);
 }
 
 static void wait_tick_pvh(void)
@@ -1202,6 +1302,8 @@ void __init setup_boot_APIC_clock(void)
     apic_printk(APIC_VERBOSE, "Using local APIC timer interrupts.\n");
     using_apic_timer = true;
 
+    check_deadline_errata();
+
     local_irq_save(flags);
 
     calibrate_APIC_clock();
@@ -1306,15 +1408,13 @@ void spurious_interrupt(struct cpu_user_regs *regs)
         if (this_cpu(state_dump_pending)) {
             this_cpu(state_dump_pending) = false;
             dump_execstate(regs);
-            goto out;
+            return;
         }
     }
 
     /* see sw-dev-man vol 3, chapter 7.4.13.5 */
     printk(KERN_INFO "spurious APIC interrupt on CPU#%d, should "
            "never happen.\n", smp_processor_id());
-
-out: ;
 }
 
 /*
@@ -1446,23 +1546,21 @@ void __init record_boot_APIC_mode(void)
                 apic_mode_to_str(apic_boot_mode));
 }
 
-/* Look at the bits in MSR_IA32_APICBASE and work out which
- * APIC mode we are in */
+/* Look at the bits in MSR_APIC_BASE and work out which APIC mode we are in */
 enum apic_mode current_local_apic_mode(void)
 {
     u64 msr_contents;
 
-    rdmsrl(MSR_IA32_APICBASE, msr_contents);
+    rdmsrl(MSR_APIC_BASE, msr_contents);
 
     /* Reading EXTD bit from the MSR is only valid if CPUID
      * says so, else reserved */
-    if ( boot_cpu_has(X86_FEATURE_X2APIC)
-         && (msr_contents & MSR_IA32_APICBASE_EXTD) )
+    if ( boot_cpu_has(X86_FEATURE_X2APIC) && (msr_contents & APIC_BASE_EXTD) )
         return APIC_MODE_X2APIC;
 
     /* EN bit should always be valid as long as we can read the MSR
      */
-    if ( msr_contents & MSR_IA32_APICBASE_ENABLE )
+    if ( msr_contents & APIC_BASE_ENABLE )
         return APIC_MODE_XAPIC;
 
     return APIC_MODE_DISABLED;

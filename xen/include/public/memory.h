@@ -1,8 +1,8 @@
 /******************************************************************************
  * memory.h
- * 
+ *
  * Memory reservation and information.
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
  * deal in the Software without restriction, including without limitation the
@@ -41,9 +41,9 @@
 
 #if __XEN_INTERFACE_VERSION__ >= 0x00030209
 /*
- * Maximum # bits addressable by the user of the allocated region (e.g., I/O 
- * devices often have a 32-bit limitation even in 64-bit systems). If zero 
- * then the user has no addressing restriction. This field is not used by 
+ * Maximum # bits addressable by the user of the allocated region (e.g., I/O
+ * devices often have a 32-bit limitation even in 64-bit systems). If zero
+ * then the user has no addressing restriction. This field is not used by
  * XENMEM_decrease_reservation.
  */
 #define XENMEMF_address_bits(x)     (x)
@@ -117,7 +117,7 @@ struct xen_memory_exchange {
      * [IN/OUT] Details of new memory extents.
      * We require that:
      *  1. @in.domid == @out.domid
-     *  2. @in.nr_extents  << @in.extent_order == 
+     *  2. @in.nr_extents  << @in.extent_order ==
      *     @out.nr_extents << @out.extent_order
      *  3. @in.extent_start and @out.extent_start lists must not overlap
      *  4. @out.extent_start lists GPFN bases to be populated
@@ -382,7 +382,7 @@ typedef struct xen_pod_target xen_pod_target_t;
 
 /*
  * Get the number of MFNs saved through memory sharing.
- * The call never fails. 
+ * The call never fails.
  */
 #define XENMEM_get_sharing_freed_pages    18
 #define XENMEM_get_sharing_shared_pages   19
@@ -488,7 +488,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_access_op_t);
 
 /* The following allows sharing of grant refs. This is useful
  * for sharing utilities sitting as "filters" in IO backends
- * (e.g. memshr + blktap(2)). The IO backend is only exposed 
+ * (e.g. memshr + blktap(2)). The IO backend is only exposed
  * to grant references, and this allows sharing of the grefs */
 #define XENMEM_SHARING_OP_FIELD_IS_GREF_FLAG   (xen_mk_ullong(1) << 62)
 
@@ -599,6 +599,74 @@ struct xen_reserved_device_memory_map {
 typedef struct xen_reserved_device_memory_map xen_reserved_device_memory_map_t;
 DEFINE_XEN_GUEST_HANDLE(xen_reserved_device_memory_map_t);
 
+/*
+ * Get the pages for a particular guest resource, so that they can be
+ * mapped directly by a tools domain.
+ */
+#define XENMEM_acquire_resource 28
+struct xen_mem_acquire_resource {
+    /* IN - The domain whose resource is to be mapped */
+    domid_t domid;
+    /* IN - the type of resource */
+    uint16_t type;
+
+#define XENMEM_resource_ioreq_server 0
+#define XENMEM_resource_grant_table 1
+
+    /*
+     * IN - a type-specific resource identifier, which must be zero
+     *      unless stated otherwise.
+     *
+     * type == XENMEM_resource_ioreq_server -> id == ioreq server id
+     * type == XENMEM_resource_grant_table -> id defined below
+     */
+    uint32_t id;
+
+#define XENMEM_resource_grant_table_id_shared 0
+#define XENMEM_resource_grant_table_id_status 1
+
+    /*
+     * IN/OUT - As an IN parameter number of frames of the resource
+     *          to be mapped. However, if the specified value is 0 and
+     *          frame_list is NULL then this field will be set to the
+     *          maximum value supported by the implementation on return.
+     */
+    uint32_t nr_frames;
+    /*
+     * OUT - Must be zero on entry. On return this may contain a bitwise
+     *       OR of the following values.
+     */
+    uint32_t flags;
+
+    /* The resource pages have been assigned to the calling domain */
+#define _XENMEM_rsrc_acq_caller_owned 0
+#define XENMEM_rsrc_acq_caller_owned (1u << _XENMEM_rsrc_acq_caller_owned)
+
+    /*
+     * IN - the index of the initial frame to be mapped. This parameter
+     *      is ignored if nr_frames is 0.
+     */
+    uint64_aligned_t frame;
+
+#define XENMEM_resource_ioreq_server_frame_bufioreq 0
+#define XENMEM_resource_ioreq_server_frame_ioreq(n) (1 + (n))
+
+    /*
+     * IN/OUT - If the tools domain is PV then, upon return, frame_list
+     *          will be populated with the MFNs of the resource.
+     *          If the tools domain is HVM then it is expected that, on
+     *          entry, frame_list will be populated with a list of GFNs
+     *          that will be mapped to the MFNs of the resource.
+     *          If -EIO is returned then the frame_list has only been
+     *          partially mapped and it is up to the caller to unmap all
+     *          the GFNs.
+     *          This parameter may be NULL if nr_frames is 0.
+     */
+    XEN_GUEST_HANDLE(xen_pfn_t) frame_list;
+};
+typedef struct xen_mem_acquire_resource xen_mem_acquire_resource_t;
+DEFINE_XEN_GUEST_HANDLE(xen_mem_acquire_resource_t);
+
 #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
 
 /*
@@ -650,7 +718,7 @@ struct xen_vnuma_topology_info {
 typedef struct xen_vnuma_topology_info xen_vnuma_topology_info_t;
 DEFINE_XEN_GUEST_HANDLE(xen_vnuma_topology_info_t);
 
-/* Next available subop number is 28 */
+/* Next available subop number is 29 */
 
 #endif /* __XEN_PUBLIC_MEMORY_H__ */
 

@@ -31,7 +31,9 @@ enum {
 #define XEN_CPUFEATURE(name, value) X86_FEATURE_##name = value,
 #include <xen/arch-x86/cpufeatureset.h>
 };
-#include "_xc_cpuid_autogen.h"
+
+#include <xen/lib/x86/cpuid.h>
+#include <xen/lib/x86/msr.h>
 
 #define bitmaskof(idx)      (1u << ((idx) & 31))
 #define featureword_of(idx) ((idx) >> 5)
@@ -130,31 +132,99 @@ const uint32_t *xc_get_static_cpu_featuremask(
     }
 }
 
-const uint32_t *xc_get_feature_deep_deps(uint32_t feature)
+int xc_get_cpu_policy_size(xc_interface *xch, uint32_t *nr_leaves,
+                           uint32_t *nr_msrs)
 {
-    static const struct {
-        uint32_t feature;
-        uint32_t fs[FEATURESET_NR_ENTRIES];
-    } deep_deps[] = INIT_DEEP_DEPS;
+    struct xen_sysctl sysctl = {};
+    int ret;
 
-    unsigned int start = 0, end = ARRAY_SIZE(deep_deps);
+    sysctl.cmd = XEN_SYSCTL_get_cpu_policy;
 
-    BUILD_BUG_ON(ARRAY_SIZE(deep_deps) != NR_DEEP_DEPS);
+    ret = do_sysctl(xch, &sysctl);
 
-    /* deep_deps[] is sorted.  Perform a binary search. */
-    while ( start < end )
+    if ( !ret )
     {
-        unsigned int mid = start + ((end - start) / 2);
-
-        if ( deep_deps[mid].feature > feature )
-            end = mid;
-        else if ( deep_deps[mid].feature < feature )
-            start = mid + 1;
-        else
-            return deep_deps[mid].fs;
+        *nr_leaves = sysctl.u.cpu_policy.nr_leaves;
+        *nr_msrs = sysctl.u.cpu_policy.nr_msrs;
     }
 
-    return NULL;
+    return ret;
+}
+
+int xc_get_system_cpu_policy(xc_interface *xch, uint32_t index,
+                             uint32_t *nr_leaves, xen_cpuid_leaf_t *leaves,
+                             uint32_t *nr_msrs, xen_msr_entry_t *msrs)
+{
+    struct xen_sysctl sysctl = {};
+    DECLARE_HYPERCALL_BOUNCE(leaves,
+                             *nr_leaves * sizeof(*leaves),
+                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+    DECLARE_HYPERCALL_BOUNCE(msrs,
+                             *nr_msrs * sizeof(*msrs),
+                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+    int ret;
+
+    if ( xc_hypercall_bounce_pre(xch, leaves) ||
+         xc_hypercall_bounce_pre(xch, msrs) )
+        return -1;
+
+    sysctl.cmd = XEN_SYSCTL_get_cpu_policy;
+    sysctl.u.cpu_policy.index = index;
+    sysctl.u.cpu_policy.nr_leaves = *nr_leaves;
+    set_xen_guest_handle(sysctl.u.cpu_policy.cpuid_policy, leaves);
+    sysctl.u.cpu_policy.nr_msrs = *nr_msrs;
+    set_xen_guest_handle(sysctl.u.cpu_policy.msr_policy, msrs);
+
+    ret = do_sysctl(xch, &sysctl);
+
+    xc_hypercall_bounce_post(xch, leaves);
+    xc_hypercall_bounce_post(xch, msrs);
+
+    if ( !ret )
+    {
+        *nr_leaves = sysctl.u.cpu_policy.nr_leaves;
+        *nr_msrs = sysctl.u.cpu_policy.nr_msrs;
+    }
+
+    return ret;
+}
+
+int xc_get_domain_cpu_policy(xc_interface *xch, uint32_t domid,
+                             uint32_t *nr_leaves, xen_cpuid_leaf_t *leaves,
+                             uint32_t *nr_msrs, xen_msr_entry_t *msrs)
+{
+    DECLARE_DOMCTL;
+    DECLARE_HYPERCALL_BOUNCE(leaves,
+                             *nr_leaves * sizeof(*leaves),
+                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+    DECLARE_HYPERCALL_BOUNCE(msrs,
+                             *nr_msrs * sizeof(*msrs),
+                             XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+    int ret;
+
+    if ( xc_hypercall_bounce_pre(xch, leaves) ||
+         xc_hypercall_bounce_pre(xch, msrs) )
+        return -1;
+
+    domctl.cmd = XEN_DOMCTL_get_cpu_policy;
+    domctl.domain = domid;
+    domctl.u.cpu_policy.nr_leaves = *nr_leaves;
+    set_xen_guest_handle(domctl.u.cpu_policy.cpuid_policy, leaves);
+    domctl.u.cpu_policy.nr_msrs = *nr_msrs;
+    set_xen_guest_handle(domctl.u.cpu_policy.msr_policy, msrs);
+
+    ret = do_domctl(xch, &domctl);
+
+    xc_hypercall_bounce_post(xch, leaves);
+    xc_hypercall_bounce_post(xch, msrs);
+
+    if ( !ret )
+    {
+        *nr_leaves = domctl.u.cpu_policy.nr_leaves;
+        *nr_msrs = domctl.u.cpu_policy.nr_msrs;
+    }
+
+    return ret;
 }
 
 struct cpuid_domain_info
@@ -169,6 +239,18 @@ struct cpuid_domain_info
     bool hvm;
     uint64_t xfeature_mask;
 
+    /*
+     * Careful with featureset lengths.
+     *
+     * Code in this file requires featureset to have at least
+     * xc_get_cpu_featureset_size() entries.  This is a libxc compiletime
+     * constant.
+     *
+     * The featureset length used by the hypervisor may be different.  If the
+     * hypervisor version is longer, XEN_SYSCTL_get_cpu_featureset will fail
+     * with -ENOBUFS, and libxc really does need rebuilding.  If the
+     * hypervisor version is shorter, it is safe to zero-extend.
+     */
     uint32_t *featureset;
     unsigned int nr_features;
 
@@ -239,13 +321,29 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
 
     if ( featureset )
     {
+        /*
+         * The user supplied featureset may be shorter or longer than
+         * host_nr_features.  Shorter is fine, and we will zero-extend.
+         * Longer is fine, so long as it only padded with zeros.
+         */
+        unsigned int fslen = min(host_nr_features, nr_features);
+
         memcpy(info->featureset, featureset,
-               min(host_nr_features, nr_features) * sizeof(*info->featureset));
+               fslen * sizeof(*info->featureset));
 
         /* Check for truncated set bits. */
-        for ( i = nr_features; i < host_nr_features; ++i )
+        for ( i = fslen; i < nr_features; ++i )
             if ( featureset[i] != 0 )
                 return -EOPNOTSUPP;
+    }
+    else
+    {
+        rc = xc_get_cpu_featureset(xch, (info->hvm
+                                         ? XEN_SYSCTL_cpu_featureset_hvm
+                                         : XEN_SYSCTL_cpu_featureset_pv),
+                                   &host_nr_features, info->featureset);
+        if ( rc )
+            return -errno;
     }
 
     /* Get xstate information. */
@@ -253,7 +351,7 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
     domctl.domain = domid;
     rc = do_domctl(xch, &domctl);
     if ( rc )
-        return rc;
+        return -errno;
 
     info->xfeature_mask = domctl.u.vcpuextstate.xfeature_mask;
 
@@ -263,23 +361,15 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
 
         rc = xc_hvm_param_get(xch, domid, HVM_PARAM_PAE_ENABLED, &val);
         if ( rc )
-            return rc;
+            return -errno;
 
         info->pae = !!val;
 
         rc = xc_hvm_param_get(xch, domid, HVM_PARAM_NESTEDHVM, &val);
         if ( rc )
-            return rc;
+            return -errno;
 
         info->nestedhvm = !!val;
-
-        if ( !featureset )
-        {
-            rc = xc_get_cpu_featureset(xch, XEN_SYSCTL_cpu_featureset_hvm,
-                                       &host_nr_features, info->featureset);
-            if ( rc )
-                return rc;
-        }
     }
     else
     {
@@ -287,17 +377,9 @@ static int get_cpuid_domain_info(xc_interface *xch, uint32_t domid,
 
         rc = xc_domain_get_guest_width(xch, domid, &width);
         if ( rc )
-            return rc;
+            return -errno;
 
         info->pv64 = (width == 8);
-
-        if ( !featureset )
-        {
-            rc = xc_get_cpu_featureset(xch, XEN_SYSCTL_cpu_featureset_pv,
-                                       &host_nr_features, info->featureset);
-            if ( rc )
-                return rc;
-        }
     }
 
     return 0;
@@ -308,8 +390,7 @@ static void free_cpuid_domain_info(struct cpuid_domain_info *info)
     free(info->featureset);
 }
 
-static void amd_xc_cpuid_policy(xc_interface *xch,
-                                const struct cpuid_domain_info *info,
+static void amd_xc_cpuid_policy(const struct cpuid_domain_info *info,
                                 const unsigned int *input, unsigned int *regs)
 {
     switch ( input[0] )
@@ -365,8 +446,7 @@ static void amd_xc_cpuid_policy(xc_interface *xch,
     }
 }
 
-static void intel_xc_cpuid_policy(xc_interface *xch,
-                                  const struct cpuid_domain_info *info,
+static void intel_xc_cpuid_policy(const struct cpuid_domain_info *info,
                                   const unsigned int *input, unsigned int *regs)
 {
     switch ( input[0] )
@@ -397,8 +477,7 @@ static void intel_xc_cpuid_policy(xc_interface *xch,
     }
 }
 
-static void xc_cpuid_hvm_policy(xc_interface *xch,
-                                const struct cpuid_domain_info *info,
+static void xc_cpuid_hvm_policy(const struct cpuid_domain_info *info,
                                 const unsigned int *input, unsigned int *regs)
 {
     switch ( input[0] )
@@ -490,13 +569,12 @@ static void xc_cpuid_hvm_policy(xc_interface *xch,
     }
 
     if ( info->vendor == VENDOR_AMD )
-        amd_xc_cpuid_policy(xch, info, input, regs);
+        amd_xc_cpuid_policy(info, input, regs);
     else
-        intel_xc_cpuid_policy(xch, info, input, regs);
+        intel_xc_cpuid_policy(info, input, regs);
 }
 
-static void xc_cpuid_pv_policy(xc_interface *xch,
-                               const struct cpuid_domain_info *info,
+static void xc_cpuid_pv_policy(const struct cpuid_domain_info *info,
                                const unsigned int *input, unsigned int *regs)
 {
     switch ( input[0] )
@@ -575,6 +653,12 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
         break;
     }
 
+    case 0x80000008:
+        regs[0] &= 0x0000ffffu;
+        regs[1] = info->featureset[featureword_of(X86_FEATURE_CLZERO)];
+        regs[2] = regs[3] = 0;
+        break;
+
     case 0x00000005: /* MONITOR/MWAIT */
     case 0x0000000b: /* Extended Topology Enumeration */
     case 0x8000000a: /* SVM revision and features */
@@ -586,9 +670,8 @@ static void xc_cpuid_pv_policy(xc_interface *xch,
     }
 }
 
-static int xc_cpuid_policy(xc_interface *xch,
-                           const struct cpuid_domain_info *info,
-                           const unsigned int *input, unsigned int *regs)
+static void xc_cpuid_policy(const struct cpuid_domain_info *info,
+                            const unsigned int *input, unsigned int *regs)
 {
     /*
      * For hypervisor leaves (0x4000XXXX) only 0x4000xx00.EAX[7:0] bits (max
@@ -598,15 +681,13 @@ static int xc_cpuid_policy(xc_interface *xch,
     if ( (input[0] & 0xffff0000) == 0x40000000 )
     {
         regs[0] = regs[1] = regs[2] = regs[3] = 0;
-        return 0;
+        return;
     }
 
     if ( info->hvm )
-        xc_cpuid_hvm_policy(xch, info, input, regs);
+        xc_cpuid_hvm_policy(info, input, regs);
     else
-        xc_cpuid_pv_policy(xch, info, input, regs);
-
-    return 0;
+        xc_cpuid_pv_policy(info, input, regs);
 }
 
 static int xc_cpuid_do_domctl(
@@ -628,29 +709,6 @@ static int xc_cpuid_do_domctl(
     return do_domctl(xch, &domctl);
 }
 
-static char *alloc_str(void)
-{
-    char *s = malloc(33);
-    if ( s == NULL )
-        return s;
-    memset(s, 0, 33);
-    return s;
-}
-
-void xc_cpuid_to_str(const unsigned int *regs, char **strs)
-{
-    int i, j;
-
-    for ( i = 0; i < 4; i++ )
-    {
-        strs[i] = alloc_str();
-        if ( strs[i] == NULL )
-            continue;
-        for ( j = 0; j < 32; j++ )
-            strs[i][j] = !!((regs[i] & (1U << (31 - j)))) ? '1' : '0';
-    }
-}
-
 static void sanitise_featureset(struct cpuid_domain_info *info)
 {
     const uint32_t fs_size = xc_get_cpu_featureset_size();
@@ -660,7 +718,7 @@ static void sanitise_featureset(struct cpuid_domain_info *info)
 
     if ( info->hvm )
     {
-        /* HVM Guest */
+        /* HVM or PVH Guest */
 
         if ( !info->pae )
             clear_bit(X86_FEATURE_PAE, info->featureset);
@@ -673,7 +731,7 @@ static void sanitise_featureset(struct cpuid_domain_info *info)
     }
     else
     {
-        /* PV or PVH Guest */
+        /* PV Guest */
 
         if ( !info->pv64 )
         {
@@ -700,7 +758,7 @@ static void sanitise_featureset(struct cpuid_domain_info *info)
         const uint32_t *dfs;
 
         if ( !test_bit(b, disabled_features) ||
-             !(dfs = xc_get_feature_deep_deps(b)) )
+             !(dfs = x86_cpuid_lookup_deep_deps(b)) )
              continue;
 
         for ( i = 0; i < ARRAY_SIZE(disabled_features); ++i )
@@ -741,7 +799,7 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid,
     for ( ; ; )
     {
         cpuid(input, regs);
-        xc_cpuid_policy(xch, &info, input, regs);
+        xc_cpuid_policy(&info, input, regs);
 
         if ( regs[0] || regs[1] || regs[2] || regs[3] )
         {
@@ -758,13 +816,22 @@ int xc_cpuid_apply_policy(xc_interface *xch, uint32_t domid,
             if ( (regs[0] & 0x1f) != 0 )
                 continue;
         }
+        /* Extended Topology leaves. */
+        else if ( input[0] == 0xb )
+        {
+            uint8_t level_type = regs[2] >> 8;
+
+            input[1]++;
+            if ( level_type >= 1 && level_type <= 2 )
+                continue;
+        }
 
         input[0]++;
         if ( !(input[0] & 0x80000000u) && (input[0] > base_max ) )
             input[0] = 0x80000000u;
 
         input[1] = XEN_CPUID_INPUT_UNUSED;
-        if ( (input[0] == 4) || (input[0] == 7) )
+        if ( (input[0] == 4) || (input[0] == 7) || (input[0] == 0xb) )
             input[1] = 0;
         else if ( input[0] == 0xd )
             input[1] = 1; /* Xen automatically calculates almost everything. */
@@ -814,7 +881,7 @@ int xc_cpuid_set(
     cpuid(input, regs);
 
     memcpy(polregs, regs, sizeof(regs));
-    xc_cpuid_policy(xch, &info, input, polregs);
+    xc_cpuid_policy(&info, input, polregs);
 
     for ( i = 0; i < 4; i++ )
     {
@@ -824,7 +891,7 @@ int xc_cpuid_set(
             continue;
         }
         
-        config_transformed[i] = alloc_str();
+        config_transformed[i] = calloc(33, 1); /* 32 bits, NUL terminator. */
         if ( config_transformed[i] == NULL )
         {
             rc = -ENOMEM;

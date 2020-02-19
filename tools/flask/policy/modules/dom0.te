@@ -14,9 +14,9 @@ allow dom0_t xen_t:xen {
 	tmem_control getscheduler setscheduler
 };
 allow dom0_t xen_t:xen2 {
-	resource_op psr_cmt_op psr_cat_op pmu_ctrl get_symbol
+	resource_op psr_cmt_op psr_alloc pmu_ctrl get_symbol
 	get_cpu_levelling_caps get_cpu_featureset livepatch_op
-	gcov_op set_parameter
+	coverage_op set_parameter
 };
 
 # Allow dom0 to use all XENVER_ subops that have checks.
@@ -38,8 +38,8 @@ allow dom0_t dom0_t:domain {
 	getpodtarget setpodtarget set_misc_info set_virq_handler
 };
 allow dom0_t dom0_t:domain2 {
-	set_cpuid gettsc settsc setscheduler set_max_evtchn set_vnumainfo
-	get_vnumainfo psr_cmt_op psr_cat_op set_gnttab_limits
+	set_cpuid gettsc settsc setscheduler set_vnumainfo
+	get_vnumainfo psr_cmt_op psr_alloc get_cpu_policy
 };
 allow dom0_t dom0_t:resource { add remove };
 
@@ -65,6 +65,9 @@ allow dom0_t security_t:security { load_policy setenforce setbool };
 
 # Audit policy change events even when they are allowed
 auditallow dom0_t security_t:security { load_policy setenforce setbool };
+
+# Allow dom0 to report platform configuration changes back to the hypervisor
+allow dom0_t xen_t:resource setup;
 
 admin_device(dom0_t, device_t)
 admin_device(dom0_t, irq_t)

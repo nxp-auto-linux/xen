@@ -187,12 +187,7 @@ again:
     /* find all expired events */
     for_each_cpu(cpu, ch->cpumask)
     {
-        s_time_t deadline;
-
-        if ( !cpumask_test_cpu(cpu, ch->cpumask) )
-            continue;
-
-        deadline = ACCESS_ONCE(per_cpu(timer_deadline, cpu));
+        s_time_t deadline = ACCESS_ONCE(per_cpu(timer_deadline, cpu));
 
         if ( deadline <= now )
             __cpumask_set_cpu(cpu, &mask);
@@ -509,6 +504,8 @@ static void hpet_attach_channel(unsigned int cpu,
 static void hpet_detach_channel(unsigned int cpu,
                                 struct hpet_event_channel *ch)
 {
+    unsigned int next;
+
     spin_lock_irq(&ch->lock);
 
     ASSERT(ch == per_cpu(cpu_bc_channel, cpu));
@@ -517,7 +514,7 @@ static void hpet_detach_channel(unsigned int cpu,
 
     if ( cpu != ch->cpu )
         spin_unlock_irq(&ch->lock);
-    else if ( cpumask_empty(ch->cpumask) )
+    else if ( (next = cpumask_first(ch->cpumask)) >= nr_cpu_ids )
     {
         ch->cpu = -1;
         clear_bit(HPET_EVT_USED_BIT, &ch->flags);
@@ -525,7 +522,7 @@ static void hpet_detach_channel(unsigned int cpu,
     }
     else
     {
-        ch->cpu = cpumask_first(ch->cpumask);
+        ch->cpu = next;
         set_channel_irq_affinity(ch);
         local_irq_enable();
     }
@@ -608,7 +605,7 @@ void __init hpet_broadcast_init(void)
         hpet_events[i].shift = 32;
         hpet_events[i].next_event = STIME_MAX;
         spin_lock_init(&hpet_events[i].lock);
-        wmb();
+        smp_wmb();
         hpet_events[i].event_handler = handle_hpet_broadcast;
 
         hpet_events[i].msi.msi_attrib.maskbit = 1;

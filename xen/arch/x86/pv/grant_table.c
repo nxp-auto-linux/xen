@@ -27,12 +27,6 @@
 
 #include "mm.h"
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 static unsigned int grant_to_pte_flags(unsigned int grant_flags,
                                        unsigned int cache_flags)
 {
@@ -50,7 +44,7 @@ static unsigned int grant_to_pte_flags(unsigned int grant_flags,
     return pte_flags;
 }
 
-int create_grant_pv_mapping(uint64_t addr, unsigned long frame,
+int create_grant_pv_mapping(uint64_t addr, mfn_t frame,
                             unsigned int flags, unsigned int cache_flags)
 {
     struct vcpu *curr = current;
@@ -60,7 +54,7 @@ int create_grant_pv_mapping(uint64_t addr, unsigned long frame,
     mfn_t gl1mfn;
     int rc = GNTST_general_error;
 
-    nl1e = l1e_from_pfn(frame, grant_to_pte_flags(flags, cache_flags));
+    nl1e = l1e_from_mfn(frame, grant_to_pte_flags(flags, cache_flags));
     nl1e = adjust_guest_l1e(nl1e, currd);
 
     /*
@@ -80,7 +74,8 @@ int create_grant_pv_mapping(uint64_t addr, unsigned long frame,
 
         gl1mfn = _mfn(addr >> PAGE_SHIFT);
 
-        if ( !get_page_from_mfn(gl1mfn, currd) )
+        page = get_page_from_mfn(gl1mfn, currd);
+        if ( !page )
             goto out;
 
         pl1e = map_domain_page(gl1mfn) + (addr & ~PAGE_MASK);
@@ -101,11 +96,11 @@ int create_grant_pv_mapping(uint64_t addr, unsigned long frame,
             goto out;
         }
 
-        if ( !get_page_from_mfn(gl1mfn, currd) )
+        page = get_page_from_mfn(gl1mfn, currd);
+        if ( !page )
             goto out_unmap;
     }
 
-    page = mfn_to_page(gl1mfn);
     if ( !page_lock(page) )
         goto out_put;
 
@@ -159,10 +154,10 @@ static bool steal_linear_address(unsigned long linear, l1_pgentry_t *out)
         goto out;
     }
 
-    if ( !get_page_from_mfn(gl1mfn, currd) )
+    page = get_page_from_mfn(gl1mfn, currd);
+    if ( !page )
         goto out_unmap;
 
-    page = mfn_to_page(gl1mfn);
     if ( !page_lock(page) )
         goto out_put;
 
@@ -172,15 +167,15 @@ static bool steal_linear_address(unsigned long linear, l1_pgentry_t *out)
     ol1e = *pl1e;
     okay = UPDATE_ENTRY(l1, pl1e, ol1e, l1e_empty(), mfn_x(gl1mfn), curr, 0);
 
+    if ( okay )
+        *out = ol1e;
+
  out_unlock:
     page_unlock(page);
  out_put:
     put_page(page);
  out_unmap:
     unmap_domain_page(pl1e);
-
-    if ( okay )
-        *out = ol1e;
 
  out:
     return okay;
@@ -191,7 +186,7 @@ static bool steal_linear_address(unsigned long linear, l1_pgentry_t *out)
  * new_addr has only ever been available via GNTABOP_unmap_and_replace, and
  * only when !(flags & GNTMAP_contains_pte).
  */
-int replace_grant_pv_mapping(uint64_t addr, unsigned long frame,
+int replace_grant_pv_mapping(uint64_t addr, mfn_t frame,
                              uint64_t new_addr, unsigned int flags)
 {
     struct vcpu *curr = current;
@@ -235,7 +230,8 @@ int replace_grant_pv_mapping(uint64_t addr, unsigned long frame,
 
         gl1mfn = _mfn(addr >> PAGE_SHIFT);
 
-        if ( !get_page_from_mfn(gl1mfn, currd) )
+        page = get_page_from_mfn(gl1mfn, currd);
+        if ( !page )
             goto out;
 
         pl1e = map_domain_page(gl1mfn) + (addr & ~PAGE_MASK);
@@ -263,11 +259,10 @@ int replace_grant_pv_mapping(uint64_t addr, unsigned long frame,
         if ( !pl1e )
             goto out;
 
-        if ( !get_page_from_mfn(gl1mfn, currd) )
+        page = get_page_from_mfn(gl1mfn, currd);
+        if ( !page )
             goto out_unmap;
     }
-
-    page = mfn_to_page(gl1mfn);
 
     if ( !page_lock(page) )
         goto out_put;
@@ -281,14 +276,14 @@ int replace_grant_pv_mapping(uint64_t addr, unsigned long frame,
      * Check that the address supplied is actually mapped to frame (with
      * appropriate permissions).
      */
-    if ( unlikely(l1e_get_pfn(ol1e) != frame) ||
+    if ( unlikely(!mfn_eq(l1e_get_mfn(ol1e), frame)) ||
          unlikely((l1e_get_flags(ol1e) ^ grant_pte_flags) &
                   (_PAGE_PRESENT | _PAGE_RW)) )
     {
         gdprintk(XENLOG_ERR,
                  "PTE %"PRIpte" for %"PRIx64" doesn't match grant (%"PRIpte")\n",
                  l1e_get_intpte(ol1e), addr,
-                 l1e_get_intpte(l1e_from_pfn(frame, grant_pte_flags)));
+                 l1e_get_intpte(l1e_from_mfn(frame, grant_pte_flags)));
         goto out_unlock;
     }
 

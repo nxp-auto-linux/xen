@@ -770,6 +770,7 @@ static int handle_x86_pv_vcpu_blob(struct xc_sr_context *ctx,
     {
         DBGPRINTF("Skipping empty %s record for vcpu %u\n",
                   rec_type_to_str(rec->type), vhdr->vcpu_id);
+        rc = 0;
         goto out;
     }
 
@@ -1104,7 +1105,7 @@ static int x86_pv_stream_complete(struct xc_sr_context *ctx)
     if ( rc )
         return rc;
 
-    rc = xc_dom_gnttab_seed(xch, ctx->domid,
+    rc = xc_dom_gnttab_seed(xch, ctx->domid, false,
                             ctx->restore.console_gfn,
                             ctx->restore.xenstore_gfn,
                             ctx->restore.console_domid,

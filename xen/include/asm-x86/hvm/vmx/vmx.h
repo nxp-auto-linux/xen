@@ -232,18 +232,25 @@ static inline void pi_clear_sn(struct pi_desc *pi_desc)
 /*
  * Exit Qualifications for MOV for Control Register Access
  */
- /* 3:0 - control register number (CRn) */
-#define VMX_CONTROL_REG_ACCESS_NUM(eq)  ((eq) & 0xf)
- /* 5:4 - access type (CR write, CR read, CLTS, LMSW) */
-#define VMX_CONTROL_REG_ACCESS_TYPE(eq) (((eq) >> 4) & 0x3)
-# define VMX_CONTROL_REG_ACCESS_TYPE_MOV_TO_CR   0
-# define VMX_CONTROL_REG_ACCESS_TYPE_MOV_FROM_CR 1
-# define VMX_CONTROL_REG_ACCESS_TYPE_CLTS        2
-# define VMX_CONTROL_REG_ACCESS_TYPE_LMSW        3
- /* 11:8 - general purpose register operand */
-#define VMX_CONTROL_REG_ACCESS_GPR(eq)  (((eq) >> 8) & 0xf)
- /* 31:16 - LMSW source data */
-#define VMX_CONTROL_REG_ACCESS_DATA(eq)  ((uint32_t)(eq) >> 16)
+enum {
+    VMX_CR_ACCESS_TYPE_MOV_TO_CR,
+    VMX_CR_ACCESS_TYPE_MOV_FROM_CR,
+    VMX_CR_ACCESS_TYPE_CLTS,
+    VMX_CR_ACCESS_TYPE_LMSW,
+};
+typedef union cr_access_qual {
+    unsigned long raw;
+    struct {
+        uint16_t cr:4,
+                 access_type:2,  /* VMX_CR_ACCESS_TYPE_* */
+                 lmsw_op_type:1, /* 0 => reg, 1 => mem   */
+                 :1,
+                 gpr:4,
+                 :4;
+        uint16_t lmsw_data;
+        uint32_t :32;
+    };
+} __transparent__ cr_access_qual_t;
 
 /*
  * Access Rights
@@ -311,7 +318,7 @@ extern uint8_t posted_intr_vector;
 #define INVVPID_ALL_CONTEXT                     2
 #define INVVPID_SINGLE_CONTEXT_RETAINING_GLOBAL 3
 
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
 # define GAS_VMX_OP(yes, no) yes
 #else
 # define GAS_VMX_OP(yes, no) no
@@ -320,7 +327,7 @@ extern uint8_t posted_intr_vector;
 static always_inline void __vmptrld(u64 addr)
 {
     asm volatile (
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    "vmptrld %0\n"
 #else
                    VMPTRLD_OPCODE MODRM_EAX_06
@@ -330,7 +337,7 @@ static always_inline void __vmptrld(u64 addr)
                    _ASM_BUGFRAME_TEXT(0)
                    UNLIKELY_END_SECTION
                    :
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    : "m" (addr),
 #else
                    : "a" (&addr),
@@ -342,7 +349,7 @@ static always_inline void __vmptrld(u64 addr)
 static always_inline void __vmpclear(u64 addr)
 {
     asm volatile (
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    "vmclear %0\n"
 #else
                    VMCLEAR_OPCODE MODRM_EAX_06
@@ -352,7 +359,7 @@ static always_inline void __vmpclear(u64 addr)
                    _ASM_BUGFRAME_TEXT(0)
                    UNLIKELY_END_SECTION
                    :
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    : "m" (addr),
 #else
                    : "a" (&addr),
@@ -364,7 +371,7 @@ static always_inline void __vmpclear(u64 addr)
 static always_inline void __vmread(unsigned long field, unsigned long *value)
 {
     asm volatile (
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    "vmread %1, %0\n\t"
 #else
                    VMREAD_OPCODE MODRM_EAX_ECX
@@ -373,7 +380,7 @@ static always_inline void __vmread(unsigned long field, unsigned long *value)
                    UNLIKELY_START(be, vmread)
                    _ASM_BUGFRAME_TEXT(0)
                    UNLIKELY_END_SECTION
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    : "=rm" (*value)
                    : "r" (field),
 #else
@@ -387,7 +394,7 @@ static always_inline void __vmread(unsigned long field, unsigned long *value)
 static always_inline void __vmwrite(unsigned long field, unsigned long value)
 {
     asm volatile (
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    "vmwrite %1, %0\n"
 #else
                    VMWRITE_OPCODE MODRM_EAX_ECX
@@ -397,7 +404,7 @@ static always_inline void __vmwrite(unsigned long field, unsigned long value)
                    _ASM_BUGFRAME_TEXT(0)
                    UNLIKELY_END_SECTION
                    :
-#ifdef HAVE_GAS_VMX
+#ifdef HAVE_AS_VMX
                    : "r" (field) , "rm" (value),
 #else
                    : "a" (field) , "c" (value),
@@ -452,11 +459,11 @@ static inline enum vmx_insn_errno vmwrite_safe(unsigned long field,
     return ret;
 }
 
-static always_inline void __invept(unsigned long type, u64 eptp, u64 gpa)
+static always_inline void __invept(unsigned long type, uint64_t eptp)
 {
     struct {
-        u64 eptp, gpa;
-    } operand = {eptp, gpa};
+        uint64_t eptp, rsvd;
+    } operand = { eptp };
 
     /*
      * If single context invalidation is not supported, we escalate to
@@ -467,7 +474,7 @@ static always_inline void __invept(unsigned long type, u64 eptp, u64 gpa)
         type = INVEPT_ALL_CONTEXT;
 
     asm volatile (
-#ifdef HAVE_GAS_EPT
+#ifdef HAVE_AS_EPT
                    "invept %0, %1\n"
 #else
                    INVEPT_OPCODE MODRM_EAX_08
@@ -477,7 +484,7 @@ static always_inline void __invept(unsigned long type, u64 eptp, u64 gpa)
                    _ASM_BUGFRAME_TEXT(0)
                    UNLIKELY_END_SECTION
                    :
-#ifdef HAVE_GAS_EPT
+#ifdef HAVE_AS_EPT
                    : "m" (operand), "r" (type),
 #else
                    : "a" (&operand), "c" (type),
@@ -496,7 +503,7 @@ static always_inline void __invvpid(unsigned long type, u16 vpid, u64 gva)
 
     /* Fix up #UD exceptions which occur when TLBs are flushed before VMXON. */
     asm volatile ( "1: "
-#ifdef HAVE_GAS_EPT
+#ifdef HAVE_AS_EPT
                    "invvpid %0, %1\n"
 #else
                    INVVPID_OPCODE MODRM_EAX_08
@@ -508,7 +515,7 @@ static always_inline void __invvpid(unsigned long type, u16 vpid, u64 gva)
                    "2:"
                    _ASM_EXTABLE(1b, 2b)
                    :
-#ifdef HAVE_GAS_EPT
+#ifdef HAVE_AS_EPT
                    : "m" (operand), "r" (type),
 #else
                    : "a" (&operand), "c" (type),
@@ -519,7 +526,7 @@ static always_inline void __invvpid(unsigned long type, u16 vpid, u64 gva)
 
 static inline void ept_sync_all(void)
 {
-    __invept(INVEPT_ALL_CONTEXT, 0, 0);
+    __invept(INVEPT_ALL_CONTEXT, 0);
 }
 
 void ept_sync_domain(struct p2m_domain *p2m);
@@ -545,7 +552,7 @@ static inline void vpid_sync_vcpu_gva(struct vcpu *v, unsigned long gva)
         type = INVVPID_ALL_CONTEXT;
 
 execute_invvpid:
-    __invvpid(type, v->arch.hvm_vcpu.n1asid.asid, (u64)gva);
+    __invvpid(type, v->arch.hvm.n1asid.asid, (u64)gva);
 }
 
 static inline void vpid_sync_all(void)
@@ -597,15 +604,16 @@ unsigned int p2m_find_altp2m_by_eptp(struct domain *d, uint64_t eptp);
 
 void update_guest_eip(void);
 
-int alloc_p2m_hap_data(struct p2m_domain *p2m);
-void free_p2m_hap_data(struct p2m_domain *p2m);
-void p2m_init_hap_data(struct p2m_domain *p2m);
-
 void vmx_pi_per_cpu_init(unsigned int cpu);
 void vmx_pi_desc_fixup(unsigned int cpu);
 
+#ifdef CONFIG_HVM
 void vmx_pi_hooks_assign(struct domain *d);
 void vmx_pi_hooks_deassign(struct domain *d);
+#else
+static inline void vmx_pi_hooks_assign(struct domain *d) {}
+static inline void vmx_pi_hooks_deassign(struct domain *d) {}
+#endif
 
 #define APIC_INVALID_DEST           0xffffffff
 

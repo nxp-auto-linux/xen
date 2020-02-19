@@ -1,6 +1,7 @@
 #include <xen/init.h>
 #include <xen/lib.h>
 #include <xen/sched.h>
+#include <xen/nospec.h>
 #include <asm/cpuid.h>
 #include <asm/hvm/hvm.h>
 #include <asm/hvm/nestedhvm.h>
@@ -43,6 +44,16 @@ static int __init parse_xen_cpuid(const char *s)
             if ( !val )
                 setup_clear_cpu_cap(X86_FEATURE_STIBP);
         }
+        else if ( (val = parse_boolean("l1d-flush", s, ss)) >= 0 )
+        {
+            if ( !val )
+                setup_clear_cpu_cap(X86_FEATURE_L1D_FLUSH);
+        }
+        else if ( (val = parse_boolean("ssbd", s, ss)) >= 0 )
+        {
+            if ( !val )
+                setup_clear_cpu_cap(X86_FEATURE_SSBD);
+        }
         else
             rc = -EINVAL;
 
@@ -64,11 +75,6 @@ struct cpuid_policy __read_mostly raw_cpuid_policy,
     __read_mostly host_cpuid_policy,
     __read_mostly pv_max_cpuid_policy,
     __read_mostly hvm_max_cpuid_policy;
-
-static void cpuid_leaf(uint32_t leaf, struct cpuid_leaf *data)
-{
-    cpuid(leaf, &data->a, &data->b, &data->c, &data->d);
-}
 
 static void sanitise_featureset(uint32_t *fs)
 {
@@ -92,7 +98,7 @@ static void sanitise_featureset(uint32_t *fs)
     for_each_set_bit(i, (void *)disabled_features,
                      sizeof(disabled_features) * 8)
     {
-        const uint32_t *dfs = lookup_deep_deps(i);
+        const uint32_t *dfs = x86_cpuid_lookup_deep_deps(i);
         unsigned int j;
 
         ASSERT(dfs); /* deep_features[] should guarentee this. */
@@ -122,42 +128,42 @@ static void recalculate_xstate(struct cpuid_policy *p)
 
     if ( p->basic.avx )
     {
-        xstates |= XSTATE_YMM;
+        xstates |= X86_XCR0_YMM;
         xstate_size = max(xstate_size,
-                          xstate_offsets[_XSTATE_YMM] +
-                          xstate_sizes[_XSTATE_YMM]);
+                          xstate_offsets[X86_XCR0_YMM_POS] +
+                          xstate_sizes[X86_XCR0_YMM_POS]);
     }
 
     if ( p->feat.mpx )
     {
-        xstates |= XSTATE_BNDREGS | XSTATE_BNDCSR;
+        xstates |= X86_XCR0_BNDREGS | X86_XCR0_BNDCSR;
         xstate_size = max(xstate_size,
-                          xstate_offsets[_XSTATE_BNDCSR] +
-                          xstate_sizes[_XSTATE_BNDCSR]);
+                          xstate_offsets[X86_XCR0_BNDCSR_POS] +
+                          xstate_sizes[X86_XCR0_BNDCSR_POS]);
     }
 
     if ( p->feat.avx512f )
     {
-        xstates |= XSTATE_OPMASK | XSTATE_ZMM | XSTATE_HI_ZMM;
+        xstates |= X86_XCR0_OPMASK | X86_XCR0_ZMM | X86_XCR0_HI_ZMM;
         xstate_size = max(xstate_size,
-                          xstate_offsets[_XSTATE_HI_ZMM] +
-                          xstate_sizes[_XSTATE_HI_ZMM]);
+                          xstate_offsets[X86_XCR0_HI_ZMM_POS] +
+                          xstate_sizes[X86_XCR0_HI_ZMM_POS]);
     }
 
     if ( p->feat.pku )
     {
-        xstates |= XSTATE_PKRU;
+        xstates |= X86_XCR0_PKRU;
         xstate_size = max(xstate_size,
-                          xstate_offsets[_XSTATE_PKRU] +
-                          xstate_sizes[_XSTATE_PKRU]);
+                          xstate_offsets[X86_XCR0_PKRU_POS] +
+                          xstate_sizes[X86_XCR0_PKRU_POS]);
     }
 
     if ( p->extd.lwp )
     {
-        xstates |= XSTATE_LWP;
+        xstates |= X86_XCR0_LWP;
         xstate_size = max(xstate_size,
-                          xstate_offsets[_XSTATE_LWP] +
-                          xstate_sizes[_XSTATE_LWP]);
+                          xstate_offsets[X86_XCR0_LWP_POS] +
+                          xstate_sizes[X86_XCR0_LWP_POS]);
     }
 
     p->xstate.max_size  =  xstate_size;
@@ -200,7 +206,10 @@ static void recalculate_misc(struct cpuid_policy *p)
     p->basic.raw[0x6] = EMPTY_LEAF; /* Therm/Power not exposed to guests. */
 
     p->basic.raw[0x8] = EMPTY_LEAF;
-    p->basic.raw[0xb] = EMPTY_LEAF; /* TODO: Rework topology logic. */
+
+    /* TODO: Rework topology logic. */
+    memset(p->topo.raw, 0, sizeof(p->topo.raw));
+
     p->basic.raw[0xc] = EMPTY_LEAF;
 
     p->extd.e1d &= ~CPUID_COMMON_1D_FEATURES;
@@ -260,79 +269,8 @@ static void recalculate_misc(struct cpuid_policy *p)
 static void __init calculate_raw_policy(void)
 {
     struct cpuid_policy *p = &raw_cpuid_policy;
-    unsigned int i;
 
-    cpuid_leaf(0, &p->basic.raw[0]);
-    for ( i = 1; i < min(ARRAY_SIZE(p->basic.raw),
-                         p->basic.max_leaf + 1ul); ++i )
-    {
-        switch ( i )
-        {
-        case 0x4: case 0x7: case 0xd:
-            /* Multi-invocation leaves.  Deferred. */
-            continue;
-        }
-
-        cpuid_leaf(i, &p->basic.raw[i]);
-    }
-
-    if ( p->basic.max_leaf >= 4 )
-    {
-        for ( i = 0; i < ARRAY_SIZE(p->cache.raw); ++i )
-        {
-            union {
-                struct cpuid_leaf l;
-                struct cpuid_cache_leaf c;
-            } u;
-
-            cpuid_count_leaf(4, i, &u.l);
-
-            if ( u.c.type == 0 )
-                break;
-
-            p->cache.subleaf[i] = u.c;
-        }
-
-        /*
-         * The choice of CPUID_GUEST_NR_CACHE is arbitrary.  It is expected
-         * that it will eventually need increasing for future hardware.
-         */
-        if ( i == ARRAY_SIZE(p->cache.raw) )
-            printk(XENLOG_WARNING
-                   "CPUID: Insufficient Leaf 4 space for this hardware\n");
-    }
-
-    if ( p->basic.max_leaf >= 7 )
-    {
-        cpuid_count_leaf(7, 0, &p->feat.raw[0]);
-
-        for ( i = 1; i < min(ARRAY_SIZE(p->feat.raw),
-                             p->feat.max_subleaf + 1ul); ++i )
-            cpuid_count_leaf(7, i, &p->feat.raw[i]);
-    }
-
-    if ( p->basic.max_leaf >= XSTATE_CPUID )
-    {
-        uint64_t xstates;
-
-        cpuid_count_leaf(XSTATE_CPUID, 0, &p->xstate.raw[0]);
-        cpuid_count_leaf(XSTATE_CPUID, 1, &p->xstate.raw[1]);
-
-        xstates = ((uint64_t)(p->xstate.xcr0_high | p->xstate.xss_high) << 32) |
-            (p->xstate.xcr0_low | p->xstate.xss_low);
-
-        for ( i = 2; i < min(63ul, ARRAY_SIZE(p->xstate.raw)); ++i )
-        {
-            if ( xstates & (1ul << i) )
-                cpuid_count_leaf(XSTATE_CPUID, i, &p->xstate.raw[i]);
-        }
-    }
-
-    /* Extended leaves. */
-    cpuid_leaf(0x80000000, &p->extd.raw[0]);
-    for ( i = 1; i < min(ARRAY_SIZE(p->extd.raw),
-                         p->extd.max_leaf + 1 - 0x80000000ul); ++i )
-        cpuid_leaf(0x80000000 + i, &p->extd.raw[i]);
+    x86_cpuid_policy_fill_native(p);
 
     p->x86_vendor = boot_cpu_data.x86_vendor;
 }
@@ -354,6 +292,10 @@ static void __init calculate_host_policy(void)
     recalculate_xstate(p);
     recalculate_misc(p);
 
+    /* When vPMU is disabled, drop it from the host policy. */
+    if ( vpmu_mode == XENPMU_MODE_OFF )
+        p->basic.raw[0xa] = EMPTY_LEAF;
+
     if ( p->extd.svm )
     {
         /* Clamp to implemented features which require hardware support. */
@@ -368,6 +310,28 @@ static void __init calculate_host_policy(void)
     }
 }
 
+static void __init guest_common_feature_adjustments(uint32_t *fs)
+{
+    /* Unconditionally claim to be able to set the hypervisor bit. */
+    __set_bit(X86_FEATURE_HYPERVISOR, fs);
+
+    /*
+     * If IBRS is offered to the guest, unconditionally offer STIBP.  It is a
+     * nop on non-HT hardware, and has this behaviour to make heterogeneous
+     * setups easier to manage.
+     */
+    if ( test_bit(X86_FEATURE_IBRSB, fs) )
+        __set_bit(X86_FEATURE_STIBP, fs);
+
+    /*
+     * On hardware which supports IBRS/IBPB, we can offer IBPB independently
+     * of IBRS by using the AMD feature bit.  An administrator may wish for
+     * performance reasons to offer IBPB without IBRS.
+     */
+    if ( host_cpuid_policy.feat.ibrsb )
+        __set_bit(X86_FEATURE_IBPB, fs);
+}
+
 static void __init calculate_pv_max_policy(void)
 {
     struct cpuid_policy *p = &pv_max_cpuid_policy;
@@ -380,18 +344,14 @@ static void __init calculate_pv_max_policy(void)
     for ( i = 0; i < ARRAY_SIZE(pv_featureset); ++i )
         pv_featureset[i] &= pv_featuremask[i];
 
-    /* Unconditionally claim to be able to set the hypervisor bit. */
-    __set_bit(X86_FEATURE_HYPERVISOR, pv_featureset);
+    /*
+     * If Xen isn't virtualising MSR_SPEC_CTRL for PV guests because of
+     * administrator choice, hide the feature.
+     */
+    if ( !boot_cpu_has(X86_FEATURE_SC_MSR_PV) )
+        __clear_bit(X86_FEATURE_IBRSB, pv_featureset);
 
-    /* On hardware with IBRS/IBPB support, there are further adjustments. */
-    if ( test_bit(X86_FEATURE_IBRSB, pv_featureset) )
-    {
-        /* Offer STIBP unconditionally.  It is a nop on non-HT hardware. */
-        __set_bit(X86_FEATURE_STIBP, pv_featureset);
-
-        /* AMD's IBPB is a subset of IBRS/IBPB. */
-        __set_bit(X86_FEATURE_IBPB, pv_featureset);
-    }
+    guest_common_feature_adjustments(pv_featureset);
 
     sanitise_featureset(pv_featureset);
     cpuid_featureset_to_policy(pv_featureset, p);
@@ -413,14 +373,11 @@ static void __init calculate_hvm_max_policy(void)
     *p = host_cpuid_policy;
     cpuid_policy_to_featureset(p, hvm_featureset);
 
-    hvm_featuremask = hvm_funcs.hap_supported ?
+    hvm_featuremask = hvm_hap_supported() ?
         hvm_hap_featuremask : hvm_shadow_featuremask;
 
     for ( i = 0; i < ARRAY_SIZE(hvm_featureset); ++i )
         hvm_featureset[i] &= hvm_featuremask[i];
-
-    /* Unconditionally claim to be able to set the hypervisor bit. */
-    __set_bit(X86_FEATURE_HYPERVISOR, hvm_featureset);
 
     /*
      * Xen can provide an APIC emulation to HVM guests even if the host's APIC
@@ -438,6 +395,13 @@ static void __init calculate_hvm_max_policy(void)
         __set_bit(X86_FEATURE_SEP, hvm_featureset);
 
     /*
+     * If Xen isn't virtualising MSR_SPEC_CTRL for HVM guests because of
+     * administrator choice, hide the feature.
+     */
+    if ( !boot_cpu_has(X86_FEATURE_SC_MSR_HVM) )
+        __clear_bit(X86_FEATURE_IBRSB, hvm_featureset);
+
+    /*
      * With VT-x, some features are only supported by Xen if dedicated
      * hardware support is also available.
      */
@@ -450,15 +414,7 @@ static void __init calculate_hvm_max_policy(void)
             __clear_bit(X86_FEATURE_XSAVES, hvm_featureset);
     }
 
-    /* On hardware with IBRS/IBPB support, there are further adjustments. */
-    if ( test_bit(X86_FEATURE_IBRSB, hvm_featureset) )
-    {
-        /* Offer STIBP unconditionally.  It is a nop on non-HT hardware. */
-        __set_bit(X86_FEATURE_STIBP, hvm_featureset);
-
-        /* AMD's IBPB is a subset of IBRS/IBPB. */
-        __set_bit(X86_FEATURE_IBPB, hvm_featureset);
-    }
+    guest_common_feature_adjustments(hvm_featureset);
 
     sanitise_featureset(hvm_featureset);
     cpuid_featureset_to_policy(hvm_featureset, p);
@@ -473,34 +429,26 @@ void __init init_guest_cpuid(void)
     calculate_hvm_max_policy();
 }
 
-const uint32_t *lookup_deep_deps(uint32_t feature)
+bool recheck_cpu_features(unsigned int cpu)
 {
-    static const struct {
-        uint32_t feature;
-        uint32_t fs[FSCAPINTS];
-    } deep_deps[] = INIT_DEEP_DEPS;
-    unsigned int start = 0, end = ARRAY_SIZE(deep_deps);
+    bool okay = true;
+    struct cpuinfo_x86 c;
+    const struct cpuinfo_x86 *bsp = &boot_cpu_data;
+    unsigned int i;
 
-    BUILD_BUG_ON(ARRAY_SIZE(deep_deps) != NR_DEEP_DEPS);
+    identify_cpu(&c);
 
-    /* Fast early exit. */
-    if ( !test_bit(feature, deep_features) )
-        return NULL;
-
-    /* deep_deps[] is sorted.  Perform a binary search. */
-    while ( start < end )
+    for ( i = 0; i < NCAPINTS; ++i )
     {
-        unsigned int mid = start + ((end - start) / 2);
+        if ( !(~c.x86_capability[i] & bsp->x86_capability[i]) )
+            continue;
 
-        if ( deep_deps[mid].feature > feature )
-            end = mid;
-        else if ( deep_deps[mid].feature < feature )
-            start = mid + 1;
-        else
-            return deep_deps[mid].fs;
+        printk(XENLOG_ERR "CPU%u: cap[%2u] is %08x (expected %08x)\n",
+               cpu, i, c.x86_capability[i], bsp->x86_capability[i]);
+        okay = false;
     }
 
-    return NULL;
+    return okay;
 }
 
 void recalculate_cpuid_policy(struct domain *d)
@@ -601,14 +549,6 @@ void recalculate_cpuid_policy(struct domain *d)
     recalculate_xstate(p);
     recalculate_misc(p);
 
-    /*
-     * Override STIBP to match IBRS.  Guests can safely use STIBP
-     * functionality on non-HT hardware, but can't necesserily protect
-     * themselves from SP2/Spectre/Branch Target Injection if STIBP is hidden
-     * on HT-capable hardware.
-     */
-    p->feat.stibp = p->feat.ibrsb;
-
     for ( i = 0; i < ARRAY_SIZE(p->cache.raw); ++i )
     {
         if ( p->cache.subleaf[i].type >= 1 &&
@@ -626,6 +566,10 @@ void recalculate_cpuid_policy(struct domain *d)
         }
     }
 
+    if ( vpmu_mode == XENPMU_MODE_OFF ||
+         ((vpmu_mode & XENPMU_MODE_ALL) && !is_hardware_domain(d)) )
+        p->basic.raw[0xa] = EMPTY_LEAF;
+
     if ( !p->extd.svm )
         p->extd.raw[0xa] = EMPTY_LEAF;
 
@@ -640,16 +584,17 @@ void recalculate_cpuid_policy(struct domain *d)
 
 int init_domain_cpuid_policy(struct domain *d)
 {
-    d->arch.cpuid = xmalloc(struct cpuid_policy);
+    struct cpuid_policy *p =
+        xmemdup(is_pv_domain(d) ?  &pv_max_cpuid_policy
+                                : &hvm_max_cpuid_policy);
 
-    if ( !d->arch.cpuid )
+    if ( !p )
         return -ENOMEM;
 
-    *d->arch.cpuid = is_pv_domain(d)
-        ? pv_max_cpuid_policy : hvm_max_cpuid_policy;
-
     if ( d->disable_migrate )
-        d->arch.cpuid->extd.itsc = cpu_has_itsc;
+        p->extd.itsc = cpu_has_itsc;
+
+    d->arch.cpuid = p;
 
     recalculate_cpuid_policy(d);
 
@@ -668,7 +613,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
      * First pass:
      * - Perform max_leaf/subleaf calculations.  Out-of-range leaves return
      *   all zeros, following the AMD model.
-     * - Fill in *res for leaves no longer handled on the legacy path.
+     * - Fill in *res with static data.
      * - Dispatch the virtualised leaves to their respective handlers.
      */
     switch ( leaf )
@@ -685,7 +630,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
             if ( subleaf >= ARRAY_SIZE(p->cache.raw) )
                 return;
 
-            *res = p->cache.raw[subleaf];
+            *res = array_access_nospec(p->cache.raw, subleaf);
             break;
 
         case 0x7:
@@ -694,18 +639,25 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
                                  ARRAY_SIZE(p->feat.raw) - 1) )
                 return;
 
-            *res = p->feat.raw[subleaf];
+            *res = array_access_nospec(p->feat.raw, subleaf);
+            break;
+
+        case 0xb:
+            if ( subleaf >= ARRAY_SIZE(p->topo.raw) )
+                return;
+
+            *res = array_access_nospec(p->topo.raw, subleaf);
             break;
 
         case XSTATE_CPUID:
             if ( !p->basic.xsave || subleaf >= ARRAY_SIZE(p->xstate.raw) )
                 return;
 
-            *res = p->xstate.raw[subleaf];
+            *res = array_access_nospec(p->xstate.raw, subleaf);
             break;
 
         default:
-            *res = p->basic.raw[leaf];
+            *res = array_access_nospec(p->basic.raw, leaf);
             break;
         }
         break;
@@ -729,7 +681,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
                                      ARRAY_SIZE(p->extd.raw) - 1) )
             return;
 
-        *res = p->extd.raw[leaf & 0xffff];
+        *res = array_access_nospec(p->extd.raw, leaf & 0xffff);
         break;
 
     default:
@@ -775,7 +727,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
         if ( is_hvm_domain(d) )
         {
             /* OSXSAVE clear in policy.  Fast-forward CR4 back in. */
-            if ( v->arch.hvm_vcpu.guest_cr[4] & X86_CR4_OSXSAVE )
+            if ( v->arch.hvm.guest_cr[4] & X86_CR4_OSXSAVE )
                 res->c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
         }
         else /* PV domain */
@@ -787,7 +739,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
              *
              * Architecturally, the correct code here is simply:
              *
-             *   if ( v->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE )
+             *   if ( v->arch.pv.ctrlreg[4] & X86_CR4_OSXSAVE )
              *       c |= cpufeat_mask(X86_FEATURE_OSXSAVE);
              *
              * However because of bugs in Xen (before c/s bd19080b, Nov 2010,
@@ -833,7 +785,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
              *    #UD or #GP is currently being serviced.
              */
             /* OSXSAVE clear in policy.  Fast-forward CR4 back in. */
-            if ( (v->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE) ||
+            if ( (v->arch.pv.ctrlreg[4] & X86_CR4_OSXSAVE) ||
                  (regs->entry_vector == TRAP_invalid_op &&
                   guest_kernel_mode(v, regs) &&
                   (read_cr4() & X86_CR4_OSXSAVE)) )
@@ -896,7 +848,7 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
         if ( is_pv_domain(d) && is_hardware_domain(d) &&
              guest_kernel_mode(v, regs) && cpu_has_monitor &&
              regs->entry_vector == TRAP_gp_fault )
-            *res = raw_cpuid_policy.basic.raw[leaf];
+            *res = raw_cpuid_policy.basic.raw[5];
         break;
 
     case 0x7:
@@ -905,8 +857,8 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
         case 0:
             /* OSPKE clear in policy.  Fast-forward CR4 back in. */
             if ( (is_pv_domain(d)
-                  ? v->arch.pv_vcpu.ctrlreg[4]
-                  : v->arch.hvm_vcpu.guest_cr[4]) & X86_CR4_PKE )
+                  ? v->arch.pv.ctrlreg[4]
+                  : v->arch.hvm.guest_cr[4]) & X86_CR4_PKE )
                 res->c |= cpufeat_mask(X86_FEATURE_OSPKE);
             break;
         }
@@ -1016,9 +968,9 @@ void guest_cpuid(const struct vcpu *v, uint32_t leaf,
         break;
 
     case 0x8000001c:
-        if ( (v->arch.xcr0 & XSTATE_LWP) && cpu_has_svm )
+        if ( (v->arch.xcr0 & X86_XCR0_LWP) && cpu_has_svm )
             /* Turn on available bit and other features specified in lwp_cfg. */
-            res->a = (res->d & v->arch.hvm_svm.guest_lwp_cfg) | 1;
+            res->a = (res->d & v->arch.hvm.svm.guest_lwp_cfg) | 1;
         break;
     }
 }

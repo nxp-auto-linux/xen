@@ -111,6 +111,7 @@ static int check_segment(struct segment_register *reg, enum x86_segment seg)
 /* Called by VCPUOP_initialise for HVM guests. */
 int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
 {
+    const struct domain *d = v->domain;
     struct cpu_user_regs *uregs = &v->arch.user_regs;
     struct segment_register cs, ds, ss, es, tr;
     const char *errstr;
@@ -203,10 +204,10 @@ int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
         uregs->rip    = regs->eip;
         uregs->rflags = regs->eflags;
 
-        v->arch.hvm_vcpu.guest_cr[0] = regs->cr0;
-        v->arch.hvm_vcpu.guest_cr[3] = regs->cr3;
-        v->arch.hvm_vcpu.guest_cr[4] = regs->cr4;
-        v->arch.hvm_vcpu.guest_efer  = regs->efer;
+        v->arch.hvm.guest_cr[0] = regs->cr0;
+        v->arch.hvm.guest_cr[3] = regs->cr3;
+        v->arch.hvm.guest_cr[4] = regs->cr4;
+        v->arch.hvm.guest_efer  = regs->efer;
     }
     break;
 
@@ -254,10 +255,10 @@ int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
         uregs->rip    = regs->rip;
         uregs->rflags = regs->rflags;
 
-        v->arch.hvm_vcpu.guest_cr[0] = regs->cr0;
-        v->arch.hvm_vcpu.guest_cr[3] = regs->cr3;
-        v->arch.hvm_vcpu.guest_cr[4] = regs->cr4;
-        v->arch.hvm_vcpu.guest_efer  = regs->efer;
+        v->arch.hvm.guest_cr[0] = regs->cr0;
+        v->arch.hvm.guest_cr[3] = regs->cr3;
+        v->arch.hvm.guest_cr[4] = regs->cr4;
+        v->arch.hvm.guest_efer  = regs->efer;
 
 #define SEG(l, a) (struct segment_register){ 0, { a }, l, 0 }
         cs = SEG(~0u, 0xa9b); /* 64bit code segment. */
@@ -269,21 +270,21 @@ int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
 
     }
 
-    if ( v->arch.hvm_vcpu.guest_efer & EFER_LME )
-        v->arch.hvm_vcpu.guest_efer |= EFER_LMA;
+    if ( v->arch.hvm.guest_efer & EFER_LME )
+        v->arch.hvm.guest_efer |= EFER_LMA;
 
-    if ( v->arch.hvm_vcpu.guest_cr[4] & ~hvm_cr4_guest_valid_bits(v, 0) )
+    if ( v->arch.hvm.guest_cr[4] & ~hvm_cr4_guest_valid_bits(d, false) )
     {
         gprintk(XENLOG_ERR, "Bad CR4 value: %#016lx\n",
-                v->arch.hvm_vcpu.guest_cr[4]);
+                v->arch.hvm.guest_cr[4]);
         return -EINVAL;
     }
 
-    errstr = hvm_efer_valid(v, v->arch.hvm_vcpu.guest_efer, -1);
+    errstr = hvm_efer_valid(v, v->arch.hvm.guest_efer, -1);
     if ( errstr )
     {
         gprintk(XENLOG_ERR, "Bad EFER value (%#016lx): %s\n",
-               v->arch.hvm_vcpu.guest_efer, errstr);
+               v->arch.hvm.guest_efer, errstr);
         return -EINVAL;
     }
 
@@ -296,12 +297,12 @@ int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
     {
         /* Shadow-mode CR3 change. Check PDBR and update refcounts. */
         struct page_info *page = get_page_from_gfn(v->domain,
-                                 v->arch.hvm_vcpu.guest_cr[3] >> PAGE_SHIFT,
+                                 v->arch.hvm.guest_cr[3] >> PAGE_SHIFT,
                                  NULL, P2M_ALLOC);
         if ( !page )
         {
             gprintk(XENLOG_ERR, "Invalid CR3: %#lx\n",
-                    v->arch.hvm_vcpu.guest_cr[3]);
+                    v->arch.hvm.guest_cr[3]);
             return -EINVAL;
         }
 
@@ -315,10 +316,10 @@ int arch_set_info_hvm_guest(struct vcpu *v, const vcpu_hvm_context_t *ctx)
     hvm_set_segment_register(v, x86_seg_tr, &tr);
 
     /* Sync AP's TSC with BSP's. */
-    v->arch.hvm_vcpu.cache_tsc_offset =
-        v->domain->vcpu[0]->arch.hvm_vcpu.cache_tsc_offset;
-    hvm_funcs.set_tsc_offset(v, v->arch.hvm_vcpu.cache_tsc_offset,
-                             v->domain->arch.hvm_domain.sync_tsc);
+    v->arch.hvm.cache_tsc_offset =
+        d->vcpu[0]->arch.hvm.cache_tsc_offset;
+    hvm_set_tsc_offset(v, v->arch.hvm.cache_tsc_offset,
+                       d->arch.hvm.sync_tsc);
 
     paging_update_paging_modes(v);
 

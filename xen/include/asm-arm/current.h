@@ -2,10 +2,12 @@
 #define __ARM_CURRENT_H__
 
 #include <xen/percpu.h>
-#include <public/xen.h>
 
-#include <asm/percpu.h>
 #include <asm/processor.h>
+
+/* Tell whether the guest vCPU enabled Workaround 2 (i.e variant 4) */
+#define CPUINFO_WORKAROUND_2_FLAG_SHIFT   0
+#define CPUINFO_WORKAROUND_2_FLAG (_AC(1, U) << CPUINFO_WORKAROUND_2_FLAG_SHIFT)
 
 #ifndef __ASSEMBLY__
 
@@ -21,7 +23,7 @@ DECLARE_PER_CPU(struct vcpu *, curr_vcpu);
 struct cpu_info {
     struct cpu_user_regs guest_cpu_user_regs;
     unsigned long elr;
-    unsigned int pad;
+    uint32_t flags;
 };
 
 static inline struct cpu_info *get_cpu_info(void)

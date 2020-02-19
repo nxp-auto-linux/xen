@@ -35,6 +35,8 @@
 #include <xen/arch-x86/hvm/start_info.h>
 #include <xen/io/protocols.h>
 
+#include <xen-tools/libs.h>
+
 #include "xg_private.h"
 #include "xc_dom.h"
 #include "xenctrl.h"
@@ -50,6 +52,12 @@
 
 #define X86_CR0_PE 0x01
 #define X86_CR0_ET 0x10
+
+#define X86_DR6_DEFAULT 0xffff0ff0u
+#define X86_DR7_DEFAULT 0x00000400u
+
+#define MTRR_TYPE_WRBACK     6
+#define MTRR_DEF_TYPE_ENABLE (1u << 11)
 
 #define SPECIALPAGE_PAGING   0
 #define SPECIALPAGE_ACCESS   1
@@ -633,6 +641,9 @@ static int alloc_magic_pages_hvm(struct xc_dom_image *dom)
     start_info_size +=
         HVMLOADER_MODULE_CMDLINE_SIZE * HVMLOADER_MODULE_MAX_COUNT;
 
+    start_info_size +=
+        dom->e820_entries * sizeof(struct hvm_memmap_table_entry);
+
     if ( !dom->device_model )
     {
         if ( dom->cmdline )
@@ -855,6 +866,9 @@ static int vcpu_x86_32(struct xc_dom_image *dom)
         dom->parms.virt_base + (dom->start_info_pfn) * PAGE_SIZE_X86;
     ctxt->user_regs.eflags = 1 << 9; /* Interrupt Enable */
 
+    ctxt->debugreg[6] = X86_DR6_DEFAULT;
+    ctxt->debugreg[7] = X86_DR7_DEFAULT;
+
     ctxt->flags = VGCF_in_kernel_X86_32 | VGCF_online_X86_32;
     if ( dom->parms.pae == XEN_PAE_EXTCR3 ||
          dom->parms.pae == XEN_PAE_BIMODAL )
@@ -902,6 +916,9 @@ static int vcpu_x86_64(struct xc_dom_image *dom)
         dom->parms.virt_base + (dom->start_info_pfn) * PAGE_SIZE_X86;
     ctxt->user_regs.rflags = 1 << 9; /* Interrupt Enable */
 
+    ctxt->debugreg[6] = X86_DR6_DEFAULT;
+    ctxt->debugreg[7] = X86_DR7_DEFAULT;
+
     ctxt->flags = VGCF_in_kernel_X86_64 | VGCF_online_X86_64;
     cr3_pfn = xc_dom_p2m(dom, dom->pgtables_seg.pfn);
     ctxt->ctrlreg[3] = xen_pfn_to_cr3_x86_64(cr3_pfn);
@@ -926,6 +943,20 @@ static int vcpu_x86_64(struct xc_dom_image *dom)
     return rc;
 }
 
+const static void *hvm_get_save_record(const void *ctx, unsigned int type,
+                                       unsigned int instance)
+{
+    const struct hvm_save_descriptor *header;
+
+    for ( header = ctx;
+          header->typecode != HVM_SAVE_CODE(END);
+          ctx += sizeof(*header) + header->length, header = ctx )
+        if ( header->typecode == type && header->instance == instance )
+            return ctx + sizeof(*header);
+
+    return NULL;
+}
+
 static int vcpu_hvm(struct xc_dom_image *dom)
 {
     struct {
@@ -940,6 +971,8 @@ static int vcpu_hvm(struct xc_dom_image *dom)
     int rc;
 
     DOMPRINTF_CALLED(dom->xch);
+
+    assert(dom->max_vcpus);
 
     /*
      * Get the full HVM context in order to have the header, it is not
@@ -1006,6 +1039,9 @@ static int vcpu_hvm(struct xc_dom_image *dom)
     /* Set the IP. */
     bsp_ctx.cpu.rip = dom->parms.phys_entry;
 
+    bsp_ctx.cpu.dr6 = X86_DR6_DEFAULT;
+    bsp_ctx.cpu.dr7 = X86_DR7_DEFAULT;
+
     if ( dom->start_info_seg.pfn )
         bsp_ctx.cpu.rbx = dom->start_info_seg.pfn << PAGE_SHIFT;
 
@@ -1014,6 +1050,58 @@ static int vcpu_hvm(struct xc_dom_image *dom)
     bsp_ctx.end_d.instance = 0;
     bsp_ctx.end_d.length = HVM_SAVE_LENGTH(END);
 
+    /* TODO: maybe this should be a firmware option instead? */
+    if ( !dom->device_model )
+    {
+        struct {
+            struct hvm_save_descriptor header_d;
+            HVM_SAVE_TYPE(HEADER) header;
+            struct hvm_save_descriptor mtrr_d;
+            HVM_SAVE_TYPE(MTRR) mtrr;
+            struct hvm_save_descriptor end_d;
+            HVM_SAVE_TYPE(END) end;
+        } mtrr = {
+            .header_d = bsp_ctx.header_d,
+            .header = bsp_ctx.header,
+            .mtrr_d.typecode = HVM_SAVE_CODE(MTRR),
+            .mtrr_d.length = HVM_SAVE_LENGTH(MTRR),
+            .end_d = bsp_ctx.end_d,
+            .end = bsp_ctx.end,
+        };
+        const HVM_SAVE_TYPE(MTRR) *mtrr_record =
+            hvm_get_save_record(full_ctx, HVM_SAVE_CODE(MTRR), 0);
+        unsigned int i;
+
+        if ( !mtrr_record )
+        {
+            xc_dom_panic(dom->xch, XC_INTERNAL_ERROR,
+                         "%s: unable to get MTRR save record", __func__);
+            goto out;
+        }
+
+        memcpy(&mtrr.mtrr, mtrr_record, sizeof(mtrr.mtrr));
+
+        /*
+         * Enable MTRR, set default type to WB.
+         * TODO: add MMIO areas as UC when passthrough is supported.
+         */
+        mtrr.mtrr.msr_mtrr_def_type = MTRR_TYPE_WRBACK | MTRR_DEF_TYPE_ENABLE;
+
+        for ( i = 0; i < dom->max_vcpus; i++ )
+        {
+            mtrr.mtrr_d.instance = i;
+            rc = xc_domain_hvm_setcontext(dom->xch, dom->guest_domid,
+                                          (uint8_t *)&mtrr, sizeof(mtrr));
+            if ( rc != 0 )
+                xc_dom_panic(dom->xch, XC_INTERNAL_ERROR,
+                             "%s: SETHVMCONTEXT failed (rc=%d)", __func__, rc);
+        }
+    }
+
+    /*
+     * Loading the BSP context should be done in the last call to setcontext,
+     * since each setcontext call will put all vCPUs down.
+     */
     rc = xc_domain_hvm_setcontext(dom->xch, dom->guest_domid,
                                   (uint8_t *)&bsp_ctx, sizeof(bsp_ctx));
     if ( rc != 0 )
@@ -1653,10 +1741,9 @@ static void add_module_to_list(struct xc_dom_image *dom,
                < HVMLOADER_MODULE_CMDLINE_SIZE);
         strncpy(modules_cmdline_start + HVMLOADER_MODULE_CMDLINE_SIZE * index,
                 cmdline, HVMLOADER_MODULE_CMDLINE_SIZE);
+        modlist[index].cmdline_paddr = modules_cmdline_paddr +
+                                       HVMLOADER_MODULE_CMDLINE_SIZE * index;
     }
-
-    modlist[index].cmdline_paddr =
-        modules_cmdline_paddr + HVMLOADER_MODULE_CMDLINE_SIZE * index;
 
     start_info->nr_modules++;
 }
@@ -1666,21 +1753,13 @@ static int bootlate_hvm(struct xc_dom_image *dom)
     uint32_t domid = dom->guest_domid;
     xc_interface *xch = dom->xch;
     struct hvm_start_info *start_info;
-    size_t start_info_size;
+    size_t modsize;
     struct hvm_modlist_entry *modlist;
+    struct hvm_memmap_table_entry *memmap;
     unsigned int i;
 
-    start_info_size = sizeof(*start_info) + dom->cmdline_size;
-    start_info_size += sizeof(struct hvm_modlist_entry) * dom->num_modules;
-
-    if ( start_info_size >
-         dom->start_info_seg.pages << XC_DOM_PAGE_SHIFT(dom) )
-    {
-        DOMPRINTF("Trying to map beyond start_info_seg");
-        return -1;
-    }
-
-    start_info = xc_map_foreign_range(xch, domid, start_info_size,
+    start_info = xc_map_foreign_range(xch, domid, dom->start_info_seg.pages <<
+                                                  XC_DOM_PAGE_SHIFT(dom),
                                       PROT_READ | PROT_WRITE,
                                       dom->start_info_seg.pfn);
     if ( start_info == NULL )
@@ -1702,20 +1781,6 @@ static int bootlate_hvm(struct xc_dom_image *dom)
                                 ((uintptr_t)cmdline - (uintptr_t)start_info);
         }
 
-        for ( i = 0; i < dom->num_modules; i++ )
-        {
-            struct xc_hvm_firmware_module mod;
-
-            DOMPRINTF("Adding module %u", i);
-            mod.guest_addr_out =
-                dom->modules[i].seg.vstart - dom->parms.virt_base;
-            mod.length =
-                dom->modules[i].seg.vend - dom->modules[i].seg.vstart;
-
-            add_module_to_list(dom, &mod, dom->modules[i].cmdline,
-                               modlist, start_info);
-        }
-
         /* ACPI module 0 is the RSDP */
         start_info->rsdp_paddr = dom->acpi_modules[0].guest_addr_out ? : 0;
     }
@@ -1725,15 +1790,55 @@ static int bootlate_hvm(struct xc_dom_image *dom)
                            modlist, start_info);
     }
 
+    for ( i = 0; i < dom->num_modules; i++ )
+    {
+        struct xc_hvm_firmware_module mod;
+        uint64_t base = dom->parms.virt_base != UNSET_ADDR ?
+            dom->parms.virt_base : 0;
+
+        mod.guest_addr_out =
+            dom->modules[i].seg.vstart - base;
+        mod.length =
+            dom->modules[i].seg.vend - dom->modules[i].seg.vstart;
+
+        DOMPRINTF("Adding module %u guest_addr %"PRIx64" len %u",
+                  i, mod.guest_addr_out, mod.length);
+
+        add_module_to_list(dom, &mod, dom->modules[i].cmdline,
+                           modlist, start_info);
+    }
+
     if ( start_info->nr_modules )
     {
         start_info->modlist_paddr = (dom->start_info_seg.pfn << PAGE_SHIFT) +
                             ((uintptr_t)modlist - (uintptr_t)start_info);
     }
 
-    start_info->magic = XEN_HVM_START_MAGIC_VALUE;
+    /*
+     * Check a couple of XEN_HVM_MEMMAP_TYPEs to verify consistency with
+     * their corresponding e820 numerical values.
+     */
+    BUILD_BUG_ON(XEN_HVM_MEMMAP_TYPE_RAM != E820_RAM);
+    BUILD_BUG_ON(XEN_HVM_MEMMAP_TYPE_ACPI != E820_ACPI);
 
-    munmap(start_info, start_info_size);
+    modsize = HVMLOADER_MODULE_MAX_COUNT *
+        (sizeof(*modlist) + HVMLOADER_MODULE_CMDLINE_SIZE);
+    memmap = (void*)modlist + modsize;
+
+    start_info->memmap_paddr = (dom->start_info_seg.pfn << PAGE_SHIFT) +
+        ((uintptr_t)modlist - (uintptr_t)start_info) + modsize;
+    start_info->memmap_entries = dom->e820_entries;
+    for ( i = 0; i < dom->e820_entries; i++ )
+    {
+        memmap[i].addr = dom->e820[i].addr;
+        memmap[i].size = dom->e820[i].size;
+        memmap[i].type = dom->e820[i].type;
+    }
+
+    start_info->magic = XEN_HVM_START_MAGIC_VALUE;
+    start_info->version = 1;
+
+    munmap(start_info, dom->start_info_seg.pages << XC_DOM_PAGE_SHIFT(dom));
 
     if ( dom->device_model )
     {

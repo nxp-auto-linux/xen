@@ -47,12 +47,6 @@
 /* Per-CPU variable for enforcing the lock ordering */
 DEFINE_PER_CPU(int, mm_lock_level);
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(_m) __mfn_to_page(mfn_x(_m))
-#undef page_to_mfn
-#define page_to_mfn(_pg) _mfn(__page_to_mfn(_pg))
-
 /************************************************/
 /*              LOG DIRTY SUPPORT               */
 /************************************************/
@@ -219,7 +213,7 @@ int paging_log_dirty_enable(struct domain *d, bool_t log_global)
 {
     int ret;
 
-    if ( need_iommu(d) && log_global )
+    if ( has_iommu_pt(d) && log_global )
     {
         /*
          * Refuse to turn on global log-dirty mode
@@ -369,8 +363,8 @@ int paging_mfn_is_dirty(struct domain *d, mfn_t gmfn)
 
     /* We /really/ mean PFN here, even for non-translated guests. */
     pfn = _pfn(get_gpfn_from_mfn(mfn_x(gmfn)));
-    /* Shared pages are always read-only; invalid pages can't be dirty. */
-    if ( unlikely(SHARED_M2P(pfn_x(pfn)) || !VALID_M2P(pfn_x(pfn))) )
+    /* Invalid pages can't be dirty. */
+    if ( unlikely(!VALID_M2P(pfn_x(pfn))) )
         return 0;
 
     mfn = d->arch.paging.log_dirty.top;
@@ -619,7 +613,7 @@ void paging_log_dirty_range(struct domain *d,
 
     p2m_unlock(p2m);
 
-    flush_tlb_mask(d->domain_dirty_cpumask);
+    flush_tlb_mask(d->dirty_cpumask);
 }
 
 /*
@@ -857,15 +851,14 @@ int paging_enable(struct domain *d, u32 mode)
 
 /* Called from the guest to indicate that a process is being torn down
  * and therefore its pagetables will soon be discarded */
-void pagetable_dying(struct domain *d, paddr_t gpa)
+void pagetable_dying(paddr_t gpa)
 {
 #ifdef CONFIG_SHADOW_PAGING
-    struct vcpu *v;
+    struct vcpu *curr = current;
 
-    ASSERT(paging_mode_shadow(d));
+    ASSERT(paging_mode_shadow(curr->domain));
 
-    v = d->vcpu[0];
-    v->arch.paging.mode->shadow.pagetable_dying(v, gpa);
+    curr->arch.paging.mode->shadow.pagetable_dying(gpa);
 #else
     BUG();
 #endif
@@ -879,6 +872,8 @@ void paging_dump_domain_info(struct domain *d)
         printk("    paging assistance: ");
         if ( paging_mode_shadow(d) )
             printk("shadow ");
+        if ( paging_mode_sh_forced(d) )
+            printk("forced ");
         if ( paging_mode_hap(d) )
             printk("hap ");
         if ( paging_mode_refcounts(d) )
@@ -923,6 +918,7 @@ const struct paging_mode *paging_get_mode(struct vcpu *v)
     return paging_get_nestedmode(v);
 }
 
+#ifdef CONFIG_HVM
 void paging_update_nestedmode(struct vcpu *v)
 {
     ASSERT(nestedhvm_enabled(v->domain));
@@ -934,19 +930,24 @@ void paging_update_nestedmode(struct vcpu *v)
         v->arch.paging.nestedmode = NULL;
     hvm_asid_flush_vcpu(v);
 }
+#endif
 
-void paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
-                            l1_pgentry_t *p, l1_pgentry_t new,
-                            unsigned int level)
+int paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
+                           l1_pgentry_t *p, l1_pgentry_t new,
+                           unsigned int level)
 {
     struct domain *d = p2m->domain;
     struct vcpu *v = current;
+    int rc = 0;
+
     if ( v->domain != d )
         v = d->vcpu ? d->vcpu[0] : NULL;
     if ( likely(v && paging_mode_enabled(d) && paging_get_hostmode(v) != NULL) )
-        paging_get_hostmode(v)->write_p2m_entry(d, gfn, p, new, level);
+        rc = paging_get_hostmode(v)->write_p2m_entry(p2m, gfn, p, new, level);
     else
         safe_write_pte(p, new);
+
+    return rc;
 }
 
 int paging_set_allocation(struct domain *d, unsigned int pages, bool *preempted)

@@ -138,16 +138,16 @@ extern vaddr_t xenheap_virt_start;
 #endif
 
 #ifdef CONFIG_ARM_32
-#define is_xen_heap_page(page) is_xen_heap_mfn(page_to_mfn(page))
+#define is_xen_heap_page(page) is_xen_heap_mfn(mfn_x(page_to_mfn(page)))
 #define is_xen_heap_mfn(mfn) ({                                 \
-    unsigned long _mfn = (mfn);                                 \
-    (_mfn >= mfn_x(xenheap_mfn_start) &&                        \
-     _mfn < mfn_x(xenheap_mfn_end));                            \
+    unsigned long mfn_ = (mfn);                                 \
+    (mfn_ >= mfn_x(xenheap_mfn_start) &&                        \
+     mfn_ < mfn_x(xenheap_mfn_end));                            \
 })
 #else
 #define is_xen_heap_page(page) ((page)->count_info & PGC_xen_heap)
 #define is_xen_heap_mfn(mfn) \
-    (mfn_valid(_mfn(mfn)) && is_xen_heap_page(__mfn_to_page(mfn)))
+    (mfn_valid(_mfn(mfn)) && is_xen_heap_page(mfn_to_page(_mfn(mfn))))
 #endif
 
 #define is_xen_fixed_mfn(mfn)                                   \
@@ -159,13 +159,6 @@ extern vaddr_t xenheap_virt_start;
 
 #define maddr_get_owner(ma)   (page_get_owner(maddr_to_page((ma))))
 
-#define XENSHARE_writable 0
-#define XENSHARE_readonly 1
-extern void share_xen_page_with_guest(
-    struct page_info *page, struct domain *d, int readonly);
-extern void share_xen_page_with_privileged_guests(
-    struct page_info *page, int readonly);
-
 #define frame_table ((struct page_info *)FRAMETABLE_VIRT_START)
 /* PDX of the first page in the frame table. */
 extern unsigned long frametable_base_pdx;
@@ -176,7 +169,7 @@ extern unsigned long total_pages;
 #define PDX_GROUP_SHIFT SECOND_SHIFT
 
 /* Boot-time pagetable setup */
-extern void setup_pagetables(unsigned long boot_phys_offset, paddr_t xen_paddr);
+extern void setup_pagetables(unsigned long boot_phys_offset);
 /* Map FDT in boot pagetable */
 extern void *early_fdt_map(paddr_t fdt_paddr);
 /* Remove early mappings */
@@ -220,12 +213,14 @@ static inline void __iomem *ioremap_wc(paddr_t start, size_t len)
 })
 
 /* Convert between machine frame numbers and page-info structures. */
-#define __mfn_to_page(mfn)  (frame_table + (pfn_to_pdx(mfn) - frametable_base_pdx))
-#define __page_to_mfn(pg)   pdx_to_pfn((unsigned long)((pg) - frame_table) + frametable_base_pdx)
+#define mfn_to_page(mfn)                                            \
+    (frame_table + (mfn_to_pdx(mfn) - frametable_base_pdx))
+#define page_to_mfn(pg)                                             \
+    pdx_to_mfn((unsigned long)((pg) - frame_table) + frametable_base_pdx)
 
 /* Convert between machine addresses and page-info structures. */
-#define maddr_to_page(ma) __mfn_to_page((ma) >> PAGE_SHIFT)
-#define page_to_maddr(pg) ((paddr_t)__page_to_mfn(pg) << PAGE_SHIFT)
+#define maddr_to_page(ma) mfn_to_page(maddr_to_mfn(ma))
+#define page_to_maddr(pg) (mfn_to_maddr(page_to_mfn(pg)))
 
 /* Convert between frame number and address formats.  */
 #define pfn_to_paddr(pfn) ((paddr_t)(pfn) << PAGE_SHIFT)
@@ -235,7 +230,7 @@ static inline void __iomem *ioremap_wc(paddr_t start, size_t len)
 #define gaddr_to_gfn(ga)    _gfn(paddr_to_pfn(ga))
 #define mfn_to_maddr(mfn)   pfn_to_paddr(mfn_x(mfn))
 #define maddr_to_mfn(ma)    _mfn(paddr_to_pfn(ma))
-#define vmap_to_mfn(va)     paddr_to_pfn(virt_to_maddr((vaddr_t)va))
+#define vmap_to_mfn(va)     maddr_to_mfn(virt_to_maddr((vaddr_t)va))
 #define vmap_to_page(va)    mfn_to_page(vmap_to_mfn(va))
 
 /* Page-align address and convert to frame number format */
@@ -293,8 +288,6 @@ static inline uint64_t gvirt_to_maddr(vaddr_t va, paddr_t *pa,
  * These are overriden in various source files while underscored version
  * remain intact.
  */
-#define mfn_to_page(mfn)    __mfn_to_page(mfn)
-#define page_to_mfn(pg)     __page_to_mfn(pg)
 #define virt_to_mfn(va)     __virt_to_mfn(va)
 #define mfn_to_virt(mfn)    __mfn_to_virt(mfn)
 
@@ -314,38 +307,19 @@ static inline struct page_info *virt_to_page(const void *v)
 
 static inline void *page_to_virt(const struct page_info *pg)
 {
-    return mfn_to_virt(page_to_mfn(pg));
+    return mfn_to_virt(mfn_x(page_to_mfn(pg)));
 }
 
 struct page_info *get_page_from_gva(struct vcpu *v, vaddr_t va,
                                     unsigned long flags);
 
 /*
- * The MPT (machine->physical mapping table) is an array of word-sized
- * values, indexed on machine frame number. It is expected that guest OSes
- * will use it to store a "physical" frame number to give the appearance of
- * contiguous (or near contiguous) physical memory.
+ * Arm does not have an M2P, but common code expects a handful of
+ * M2P-related defines and functions. Provide dummy versions of these.
  */
-#undef  machine_to_phys_mapping
-#define machine_to_phys_mapping  ((unsigned long *)RDWR_MPT_VIRT_START)
 #define INVALID_M2P_ENTRY        (~0UL)
-#define VALID_M2P(_e)            (!((_e) & (1UL<<(BITS_PER_LONG-1))))
 #define SHARED_M2P_ENTRY         (~0UL - 1UL)
 #define SHARED_M2P(_e)           ((_e) == SHARED_M2P_ENTRY)
-
-#define _set_gpfn_from_mfn(mfn, pfn) ({                        \
-    struct domain *d = page_get_owner(__mfn_to_page(mfn));     \
-    if(d && (d == dom_cow))                                    \
-        machine_to_phys_mapping[(mfn)] = SHARED_M2P_ENTRY;     \
-    else                                                       \
-        machine_to_phys_mapping[(mfn)] = (pfn);                \
-    })
-
-static inline void put_gfn(struct domain *d, unsigned long gfn) {}
-static inline int relinquish_shared_pages(struct domain *d)
-{
-    return 0;
-}
 
 /* Xen always owns P2M on ARM */
 #define set_gpfn_from_mfn(mfn, pfn) do { (void) (mfn), (void)(pfn); } while (0)
@@ -380,6 +354,14 @@ static inline void put_page_and_type(struct page_info *page)
 }
 
 void clear_and_clean_page(struct page_info *page);
+
+static inline
+int arch_acquire_resource(struct domain *d, unsigned int type, unsigned int id,
+                          unsigned long frame, unsigned int nr_frames,
+                          xen_pfn_t mfn_list[], unsigned int *flags)
+{
+    return -EOPNOTSUPP;
+}
 
 #endif /*  __ARCH_ARM_MM__ */
 /*

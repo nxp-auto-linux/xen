@@ -38,7 +38,7 @@
 #define MIN_PER_HOUR    60
 #define HOUR_PER_DAY    24
 
-#define domain_vrtc(x) (&(x)->arch.hvm_domain.pl_time->vrtc)
+#define domain_vrtc(x) (&(x)->arch.hvm.pl_time->vrtc)
 #define vcpu_vrtc(x)   (domain_vrtc((x)->domain))
 #define vrtc_domain(x) (container_of(x, struct pl_time, vrtc)->domain)
 #define vrtc_vcpu(x)   (pt_global_vcpu_target(vrtc_domain(x)))
@@ -148,7 +148,7 @@ static void rtc_timer_update(RTCState *s)
                 s_time_t now = NOW();
 
                 s->period = period;
-                if ( v->domain->arch.hvm_domain.params[HVM_PARAM_VPT_ALIGN] )
+                if ( v->domain->arch.hvm.params[HVM_PARAM_VPT_ALIGN] )
                     delta = 0;
                 else
                     delta = period - ((now - s->start_time) % period);
@@ -156,7 +156,7 @@ static void rtc_timer_update(RTCState *s)
                 {
                     TRACE_2D(TRC_HVM_EMUL_RTC_START_TIMER, delta, period);
                     create_periodic_time(v, &s->pt, delta, period,
-                                         RTC_IRQ, rtc_pf_callback, s);
+                                         RTC_IRQ, rtc_pf_callback, s, false);
                 }
                 else
                     s->check_ticks_since = now;
@@ -737,8 +737,9 @@ void rtc_migrate_timers(struct vcpu *v)
 }
 
 /* Save RTC hardware state */
-static int rtc_save(struct domain *d, hvm_domain_context_t *h)
+static int rtc_save(struct vcpu *v, hvm_domain_context_t *h)
 {
+    const struct domain *d = v->domain;
     RTCState *s = domain_vrtc(d);
     int rc;
 

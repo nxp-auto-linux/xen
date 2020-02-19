@@ -48,7 +48,7 @@ static int vm_event_enable(
     xen_event_channel_notification_t notification_fn)
 {
     int rc;
-    unsigned long ring_gfn = d->arch.hvm_domain.params[param];
+    unsigned long ring_gfn = d->arch.hvm.params[param];
 
     if ( !*ved )
         *ved = xzalloc(struct vm_event_domain);
@@ -496,7 +496,7 @@ static int vm_event_wait_slot(struct vm_event_domain *ved)
     return rc;
 }
 
-bool_t vm_event_check_ring(struct vm_event_domain *ved)
+bool vm_event_check_ring(struct vm_event_domain *ved)
 {
     return (ved && ved->ring_page);
 }
@@ -514,7 +514,7 @@ bool_t vm_event_check_ring(struct vm_event_domain *ved)
  *
  */
 int __vm_event_claim_slot(struct domain *d, struct vm_event_domain *ved,
-                          bool_t allow_sleep)
+                          bool allow_sleep)
 {
     if ( !vm_event_check_ring(ved) )
         return -EOPNOTSUPP;
@@ -630,8 +630,6 @@ int vm_event_domctl(struct domain *d, struct xen_domctl_vm_event_op *vec,
         {
         case XEN_VM_EVENT_ENABLE:
         {
-            struct p2m_domain *p2m = p2m_get_hostp2m(d);
-
             rc = -EOPNOTSUPP;
             /* hvm fixme: p2m_is_foreign types need addressing */
             if ( is_hvm_domain(hardware_domain) )
@@ -644,12 +642,12 @@ int vm_event_domctl(struct domain *d, struct xen_domctl_vm_event_op *vec,
 
             /* No paging if iommu is used */
             rc = -EMLINK;
-            if ( unlikely(need_iommu(d)) )
+            if ( unlikely(has_iommu_pt(d)) )
                 break;
 
             rc = -EXDEV;
             /* Disallow paging in a PoD guest */
-            if ( p2m->pod.entry_count )
+            if ( p2m_pod_entry_count(p2m_get_hostp2m(d)) )
                 break;
 
             /* domain_pause() not required here, see XSA-99 */

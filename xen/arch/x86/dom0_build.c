@@ -12,6 +12,7 @@
 #include <xen/sched-if.h>
 #include <xen/softirq.h>
 
+#include <asm/amd.h>
 #include <asm/dom0_build.h>
 #include <asm/guest.h>
 #include <asm/hpet.h>
@@ -19,17 +20,43 @@
 #include <asm/p2m.h>
 #include <asm/setup.h>
 
-static long __initdata dom0_nrpages;
-static long __initdata dom0_min_nrpages;
-static long __initdata dom0_max_nrpages = LONG_MAX;
+struct memsize {
+    long nr_pages;
+    unsigned int percent;
+    bool minus;
+};
+
+static struct memsize __initdata dom0_size;
+static struct memsize __initdata dom0_min_size;
+static struct memsize __initdata dom0_max_size = { .nr_pages = LONG_MAX };
+static bool __initdata dom0_mem_set;
+
+static bool __init memsize_gt_zero(const struct memsize *sz)
+{
+    return !sz->minus && sz->nr_pages;
+}
+
+static unsigned long __init get_memsize(const struct memsize *sz,
+                                        unsigned long avail)
+{
+    unsigned long pages;
+
+    pages = sz->nr_pages + sz->percent * avail / 100;
+    return sz->minus ? avail - pages : pages;
+}
 
 /*
  * dom0_mem=[min:<min_amt>,][max:<max_amt>,][<amt>]
- * 
+ *
  * <min_amt>: The minimum amount of memory which should be allocated for dom0.
  * <max_amt>: The maximum amount of memory which should be allocated for dom0.
  * <amt>:     The precise amount of memory to allocate for dom0.
- * 
+ *
+ * The format of <min_amt>, <max_amt> and <amt> is as follows:
+ * <size> | <frac>% | <size>+<frac>%
+ * <size> is a size value like 1G (1 GByte), <frac> is percentage of host
+ * memory (so 1G+10% means 10 percent of host memory + 1 GByte).
+ *
  * Notes:
  *  1. <amt> is clamped from below by <min_amt> and from above by available
  *     memory and <max_amt>
@@ -38,19 +65,61 @@ static long __initdata dom0_max_nrpages = LONG_MAX;
  *  4. If <amt> is not specified, it is calculated as follows:
  *     "All of memory is allocated to domain 0, minus 1/16th which is reserved
  *      for uses such as DMA buffers (the reservation is clamped to 128MB)."
- * 
+ *
  * Each value can be specified as positive or negative:
  *  If +ve: The specified amount is an absolute value.
  *  If -ve: The specified amount is subtracted from total available memory.
  */
-static long __init parse_amt(const char *s, const char **ps)
+static int __init parse_amt(const char *s, const char **ps, struct memsize *sz)
 {
-    long pages = parse_size_and_unit((*s == '-') ? s+1 : s, ps) >> PAGE_SHIFT;
-    return (*s == '-') ? -pages : pages;
+    unsigned long val;
+    struct memsize tmp = { };
+    unsigned int items = 0;
+
+    tmp.minus = (*s == '-');
+    if ( tmp.minus )
+        s++;
+
+    do
+    {
+        if ( !isdigit(*s) )
+            return -EINVAL;
+
+        val = parse_size_and_unit(s, ps);
+        s = *ps;
+        if ( *s == '%' )
+        {
+            if ( val >= 100 )
+                return -EINVAL;
+            tmp.percent = val;
+            s++;
+            items++; /* No other item allowed. */
+        }
+        else
+        {
+            /* <size> item must be first one. */
+            if ( items )
+                return -EINVAL;
+            tmp.nr_pages = val >> PAGE_SHIFT;
+        }
+        items++;
+    } while ( *s++ == '+' && items < 2 );
+
+    *ps = --s;
+    if ( *s && *s != ',' )
+        return -EINVAL;
+
+    *sz = tmp;
+
+    return 0;
 }
 
 static int __init parse_dom0_mem(const char *s)
 {
+    int ret;
+
+    dom0_mem_set = true;
+
     /* xen-shim uses shim_mem parameter instead of dom0_mem */
     if ( pv_shim )
     {
@@ -60,14 +129,14 @@ static int __init parse_dom0_mem(const char *s)
 
     do {
         if ( !strncmp(s, "min:", 4) )
-            dom0_min_nrpages = parse_amt(s+4, &s);
+            ret = parse_amt(s + 4, &s, &dom0_min_size);
         else if ( !strncmp(s, "max:", 4) )
-            dom0_max_nrpages = parse_amt(s+4, &s);
+            ret = parse_amt(s + 4, &s, &dom0_max_size);
         else
-            dom0_nrpages = parse_amt(s, &s);
-    } while ( *s++ == ',' );
+            ret = parse_amt(s, &s, &dom0_size);
+    } while ( *s++ == ',' && !ret );
 
-    return s[-1] ? -EINVAL : 0;
+    return s[-1] ? -EINVAL : ret;
 }
 custom_param("dom0_mem", parse_dom0_mem);
 
@@ -134,20 +203,19 @@ struct vcpu *__init dom0_setup_vcpu(struct domain *d,
                                     unsigned int prev_cpu)
 {
     unsigned int cpu = cpumask_cycle(prev_cpu, &dom0_cpus);
-    struct vcpu *v = alloc_vcpu(d, vcpu_id, cpu);
+    struct vcpu *v = vcpu_create(d, vcpu_id, cpu);
 
     if ( v )
     {
         if ( pv_shim )
         {
-            __cpumask_set_cpu(vcpu_id, v->cpu_hard_affinity);
-            __cpumask_set_cpu(vcpu_id, v->cpu_soft_affinity);
+            sched_set_affinity(v, cpumask_of(vcpu_id), cpumask_of(vcpu_id));
         }
         else
         {
             if ( !d->is_pinned && !dom0_affinity_relaxed )
-                cpumask_copy(v->cpu_hard_affinity, &dom0_cpus);
-            cpumask_copy(v->cpu_soft_affinity, &dom0_cpus);
+                sched_set_affinity(v, &dom0_cpus, NULL);
+            sched_set_affinity(v, NULL, &dom0_cpus);
         }
     }
 
@@ -202,15 +270,8 @@ unsigned int __init dom0_max_vcpus(void)
 
 struct vcpu *__init alloc_dom0_vcpu0(struct domain *dom0)
 {
-    unsigned int max_vcpus = dom0_max_vcpus();
-
     dom0->node_affinity = dom0_nodes;
     dom0->auto_node_affinity = !dom0_nr_pxms;
-
-    dom0->vcpu = xzalloc_array(struct vcpu *, max_vcpus);
-    if ( !dom0->vcpu )
-        return NULL;
-    dom0->max_vcpus = max_vcpus;
 
     return dom0_setup_vcpu(dom0, 0,
                            cpumask_last(&dom0_cpus) /* so it wraps around to first pcpu */);
@@ -219,31 +280,31 @@ struct vcpu *__init alloc_dom0_vcpu0(struct domain *dom0)
 #ifdef CONFIG_SHADOW_PAGING
 bool __initdata opt_dom0_shadow;
 #endif
-bool __initdata dom0_pvh;
+bool __initdata dom0_pvh = !IS_ENABLED(CONFIG_PV);
+bool __initdata dom0_verbose;
 
-/*
- * List of parameters that affect Dom0 creation:
- *
- *  - pvh               Create a PVHv2 Dom0.
- *  - shadow            Use shadow paging for Dom0.
- */
 static int __init parse_dom0_param(const char *s)
 {
     const char *ss;
     int rc = 0;
 
     do {
+        int val;
 
         ss = strchr(s, ',');
         if ( !ss )
             ss = strchr(s, '\0');
 
-        if ( !strncmp(s, "pvh", ss - s) )
+        if ( IS_ENABLED(CONFIG_PV) && !cmdline_strcmp(s, "pv") )
+            dom0_pvh = false;
+        else if ( IS_ENABLED(CONFIG_HVM) && !cmdline_strcmp(s, "pvh") )
             dom0_pvh = true;
 #ifdef CONFIG_SHADOW_PAGING
-        else if ( !strncmp(s, "shadow", ss - s) )
-            opt_dom0_shadow = true;
+        else if ( (val = parse_boolean("shadow", s, ss)) >= 0 )
+            opt_dom0_shadow = val;
 #endif
+        else if ( (val = parse_boolean("verbose", s, ss)) >= 0 )
+            dom0_verbose = val;
         else
             rc = -EINVAL;
 
@@ -280,6 +341,9 @@ unsigned long __init dom0_compute_nr_pages(
     unsigned long avail = 0, nr_pages, min_pages, max_pages;
     bool need_paging;
 
+    if ( !dom0_mem_set && CONFIG_DOM0_MEM[0] )
+        parse_dom0_mem(CONFIG_DOM0_MEM);
+
     for_each_node_mask ( node, dom0_nodes )
         avail += avail_domheap_pages_region(node, 0, 0) +
                  initial_images_nrpages(node);
@@ -304,9 +368,9 @@ unsigned long __init dom0_compute_nr_pages(
         (!iommu_hap_pt_share || !paging_mode_hap(d));
     for ( ; ; need_paging = false )
     {
-        nr_pages = dom0_nrpages;
-        min_pages = dom0_min_nrpages;
-        max_pages = dom0_max_nrpages;
+        nr_pages = get_memsize(&dom0_size, avail);
+        min_pages = get_memsize(&dom0_min_size, avail);
+        max_pages = get_memsize(&dom0_max_size, avail);
 
         /*
          * If allocation isn't specified, reserve 1/16th of available memory
@@ -314,13 +378,18 @@ unsigned long __init dom0_compute_nr_pages(
          * maximum of 128MB.
          */
         if ( !nr_pages )
-            nr_pages = -(pv_shim ? pv_shim_mem(avail)
+        {
+            nr_pages = avail - (pv_shim ? pv_shim_mem(avail)
                                  : min(avail / 16, 128UL << (20 - PAGE_SHIFT)));
+            if ( is_hvm_domain(d) && !need_paging )
+                /*
+                 * Temporary workaround message until internal (paging) memory
+                 * accounting required to build a pvh dom0 is improved.
+                 */
+                printk("WARNING: PVH dom0 without dom0_mem set is still unstable. "
+                       "If you get crashes during boot, try adding a dom0_mem parameter\n");
+        }
 
-        /* Negative specification means "all memory - specified amount". */
-        if ( (long)nr_pages  < 0 ) nr_pages  += avail;
-        if ( (long)min_pages < 0 ) min_pages += avail;
-        if ( (long)max_pages < 0 ) max_pages += avail;
 
         /* Clamp according to min/max limits and available memory. */
         nr_pages = max(nr_pages, min_pages);
@@ -335,8 +404,8 @@ unsigned long __init dom0_compute_nr_pages(
     }
 
     if ( is_pv_domain(d) &&
-         (parms->p2m_base == UNSET_ADDR) && (dom0_nrpages <= 0) &&
-         ((dom0_min_nrpages <= 0) || (nr_pages > min_pages)) )
+         (parms->p2m_base == UNSET_ADDR) && !memsize_gt_zero(&dom0_size) &&
+         (!memsize_gt_zero(&dom0_min_size) || (nr_pages > min_pages)) )
     {
         /*
          * Legacy Linux kernels (i.e. such without a XEN_ELFNOTE_INIT_P2M
@@ -362,7 +431,7 @@ unsigned long __init dom0_compute_nr_pages(
         {
             end = sizeof_long >= sizeof(end) ? 0 : 1UL << (8 * sizeof_long);
             nr_pages = (end - vend) / (2 * sizeof_long);
-            if ( dom0_min_nrpages > 0 && nr_pages < min_pages )
+            if ( memsize_gt_zero(&dom0_min_size) && nr_pages < min_pages )
                 nr_pages = min_pages;
             printk("Dom0 memory clipped to %lu pages\n", nr_pages);
         }
@@ -440,6 +509,16 @@ int __init dom0_setup_permissions(struct domain *d)
         rc |= ioports_deny_access(d, pmtmr_ioport, pmtmr_ioport + 3);
     /* PCI configuration space (NB. 0xcf8 has special treatment). */
     rc |= ioports_deny_access(d, 0xcfc, 0xcff);
+#ifdef CONFIG_HVM
+    if ( is_hvm_domain(d) )
+    {
+        /* HVM debug console IO port. */
+        rc |= ioports_deny_access(d, XEN_HVM_DEBUGCONS_IOPORT,
+                                  XEN_HVM_DEBUGCONS_IOPORT);
+        if ( amd_acpi_c1e_quirk )
+            rc |= ioports_deny_access(d, acpi_smi_cmd, acpi_smi_cmd);
+    }
+#endif
     /* Command-line I/O ranges. */
     process_dom0_ioports_disable(d);
 
@@ -498,7 +577,6 @@ int __init dom0_setup_permissions(struct domain *d)
 
 int __init construct_dom0(struct domain *d, const module_t *image,
                           unsigned long image_headroom, module_t *initrd,
-                          void *(*bootstrap_map)(const module_t *),
                           char *cmdline)
 {
     int rc;
@@ -518,8 +596,13 @@ int __init construct_dom0(struct domain *d, const module_t *image,
     }
 #endif
 
-    rc = (is_hvm_domain(d) ? dom0_construct_pvh : dom0_construct_pv)
-         (d, image, image_headroom, initrd, bootstrap_map, cmdline);
+    if ( is_hvm_domain(d) )
+        rc = dom0_construct_pvh(d, image, image_headroom, initrd, cmdline);
+    else if ( is_pv_domain(d) )
+        rc = dom0_construct_pv(d, image, image_headroom, initrd, cmdline);
+    else
+        panic("Cannot construct Dom0. No guest interface available\n");
+
     if ( rc )
         return rc;
 

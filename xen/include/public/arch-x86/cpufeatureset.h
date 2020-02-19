@@ -156,7 +156,7 @@ XEN_CPUFEATURE(NX,            2*32+20) /*A  Execute Disable */
 XEN_CPUFEATURE(MMXEXT,        2*32+22) /*A  AMD MMX extensions */
 XEN_CPUFEATURE(FFXSR,         2*32+25) /*A  FFXSR instruction optimizations */
 XEN_CPUFEATURE(PAGE1GB,       2*32+26) /*H  1Gb large page support */
-XEN_CPUFEATURE(RDTSCP,        2*32+27) /*S  RDTSCP */
+XEN_CPUFEATURE(RDTSCP,        2*32+27) /*A  RDTSCP */
 XEN_CPUFEATURE(LM,            2*32+29) /*A  Long Mode (x86-64) */
 XEN_CPUFEATURE(3DNOWEXT,      2*32+30) /*A  AMD 3DNow! extensions */
 XEN_CPUFEATURE(3DNOW,         2*32+31) /*A  3DNow! */
@@ -243,8 +243,10 @@ XEN_CPUFEATURE(IBPB,          8*32+12) /*A  IBPB support only (no IBRS, used by 
 XEN_CPUFEATURE(AVX512_4VNNIW, 9*32+ 2) /*A  AVX512 Neural Network Instructions */
 XEN_CPUFEATURE(AVX512_4FMAPS, 9*32+ 3) /*A  AVX512 Multiply Accumulation Single Precision */
 XEN_CPUFEATURE(IBRSB,         9*32+26) /*A  IBRS and IBPB support (used by Intel) */
-XEN_CPUFEATURE(STIBP,         9*32+27) /*A! STIBP */
+XEN_CPUFEATURE(STIBP,         9*32+27) /*A  STIBP */
+XEN_CPUFEATURE(L1D_FLUSH,     9*32+28) /*S  MSR_FLUSH_CMD and L1D flush. */
 XEN_CPUFEATURE(ARCH_CAPS,     9*32+29) /*   IA32_ARCH_CAPABILITIES MSR */
+XEN_CPUFEATURE(SSBD,          9*32+31) /*A  MSR_SPEC_CTRL.SSBD available */
 
 #endif /* XEN_CPUFEATURE */
 

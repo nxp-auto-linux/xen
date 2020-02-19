@@ -17,7 +17,7 @@ obj-bin-y += bzimage.init.o
 obj-bin-y += clear_page.o
 obj-bin-y += copy_page.o
 obj-y += cpuid.o
-obj-y += compat.o x86_64/compat.o
+obj-$(CONFIG_PV) += compat.o x86_64/compat.o
 obj-$(CONFIG_KEXEC) += crash.o
 obj-y += debug.o
 obj-y += delay.o
@@ -27,6 +27,7 @@ obj-y += domain.o
 obj-bin-y += dom0_build.init.o
 obj-y += domain_page.o
 obj-y += e820.o
+obj-y += emul-i8254.o
 obj-y += extable.o
 obj-y += flushtlb.o
 obj-$(CONFIG_CRASH_DEBUG) += gdbstub.o
@@ -45,7 +46,7 @@ obj-y += microcode_amd.o
 obj-y += microcode_intel.o
 obj-y += microcode.o
 obj-y += mm.o x86_64/mm.o
-obj-y += monitor.o
+obj-$(CONFIG_HVM) += monitor.o
 obj-y += mpparse.o
 obj-y += nmi.o
 obj-y += numa.o
@@ -126,10 +127,7 @@ prelink-efi.o: $(ALL_OBJS) efi/boot.init.o efi/runtime.o efi/compat.o
 	$(guard) $(LD) $(LDFLAGS) -r -o $@ $(filter-out %/efi/built_in.o,$^)
 endif
 
-$(BASEDIR)/common/symbols-dummy.o:
-	$(MAKE) -f $(BASEDIR)/Rules.mk -C $(BASEDIR)/common symbols-dummy.o
-
-$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+$(TARGET)-syms: prelink.o xen.lds
 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
 	$(NM) -pa --format=sysv $(@D)/.$(@F).0 \
@@ -163,40 +161,50 @@ EFI_LDFLAGS += --minor-image-version=$(XEN_SUBVERSION)
 EFI_LDFLAGS += --major-os-version=2 --minor-os-version=0
 EFI_LDFLAGS += --major-subsystem-version=2 --minor-subsystem-version=0
 
+# Check if the compiler supports the MS ABI.
+export XEN_BUILD_EFI := $(shell $(CC) $(filter-out $(CFLAGS-y) .%.d,$(CFLAGS)) -c efi/check.c -o efi/check.o 2>/dev/null && echo y)
+# Check if the linker supports PE.
+XEN_BUILD_PE := $(if $(XEN_BUILD_EFI),$(shell $(LD) -mi386pep --subsystem=10 -o efi/check.efi efi/check.o 2>/dev/null && echo y))
+CFLAGS-$(XEN_BUILD_EFI) += -DXEN_BUILD_EFI
+
 $(TARGET).efi: VIRT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A VIRT_START$$,,p')
 $(TARGET).efi: ALT_BASE = 0x$(shell $(NM) efi/relocs-dummy.o | sed -n 's, A ALT_START$$,,p')
 # Don't use $(wildcard ...) here - at least make 3.80 expands this too early!
-$(TARGET).efi: guard = $(if $(shell echo efi/dis* | grep disabled),:)
+$(TARGET).efi: guard = $(if $(filter y,$(XEN_BUILD_PE)),,:)
 
 ifneq ($(build_id_linker),)
 ifeq ($(call ld-ver-build-id,$(LD) $(filter -m%,$(EFI_LDFLAGS))),y)
 CFLAGS += -DBUILD_ID_EFI
 EFI_LDFLAGS += $(build_id_linker)
 note_file := efi/buildid.o
+# NB: this must be the last input in the linker call, because inputs following
+# the -b option will all be treated as being in the specified format.
+note_file_option := -b pe-x86-64 $(note_file)
 else
 note_file := note.o
 endif
 else
 note_file :=
 endif
+note_file_option ?= $(note_file)
 
-$(TARGET).efi: prelink-efi.o $(note_file) efi.lds efi/relocs-dummy.o $(BASEDIR)/common/symbols-dummy.o efi/mkreloc
+$(TARGET).efi: prelink-efi.o $(note_file) efi.lds efi/relocs-dummy.o efi/mkreloc
 	$(foreach base, $(VIRT_BASE) $(ALT_BASE), \
 	          $(guard) $(LD) $(call EFI_LDFLAGS,$(base)) -T efi.lds -N $< efi/relocs-dummy.o \
-	                $(BASEDIR)/common/symbols-dummy.o $(note_file) -o $(@D)/.$(@F).$(base).0 &&) :
+	                $(BASEDIR)/common/symbols-dummy.o $(note_file_option) -o $(@D)/.$(@F).$(base).0 &&) :
 	$(guard) efi/mkreloc $(foreach base,$(VIRT_BASE) $(ALT_BASE),$(@D)/.$(@F).$(base).0) >$(@D)/.$(@F).0r.S
 	$(guard) $(NM) -pa --format=sysv $(@D)/.$(@F).$(VIRT_BASE).0 \
 		| $(guard) $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort >$(@D)/.$(@F).0s.S
 	$(guard) $(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0r.o $(@D)/.$(@F).0s.o
 	$(foreach base, $(VIRT_BASE) $(ALT_BASE), \
 	          $(guard) $(LD) $(call EFI_LDFLAGS,$(base)) -T efi.lds -N $< \
-	                $(@D)/.$(@F).0r.o $(@D)/.$(@F).0s.o $(note_file) -o $(@D)/.$(@F).$(base).1 &&) :
+	                $(@D)/.$(@F).0r.o $(@D)/.$(@F).0s.o $(note_file_option) -o $(@D)/.$(@F).$(base).1 &&) :
 	$(guard) efi/mkreloc $(foreach base,$(VIRT_BASE) $(ALT_BASE),$(@D)/.$(@F).$(base).1) >$(@D)/.$(@F).1r.S
 	$(guard) $(NM) -pa --format=sysv $(@D)/.$(@F).$(VIRT_BASE).1 \
 		| $(guard) $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort >$(@D)/.$(@F).1s.S
 	$(guard) $(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o
 	$(guard) $(LD) $(call EFI_LDFLAGS,$(VIRT_BASE)) -T efi.lds -N $< \
-	                $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o $(note_file) -o $@
+	                $(@D)/.$(@F).1r.o $(@D)/.$(@F).1s.o $(note_file_option) -o $@
 	if $(guard) false; then rm -f $@; echo 'EFI support disabled'; \
 	else $(NM) -pa --format=sysv $(@D)/$(@F) \
 		| $(BASEDIR)/tools/symbols --xensyms --sysv --sort >$(@D)/$(@F).map; fi
@@ -205,17 +213,30 @@ $(TARGET).efi: prelink-efi.o $(note_file) efi.lds efi/relocs-dummy.o $(BASEDIR)/
 efi/boot.init.o efi/runtime.o efi/compat.o efi/buildid.o: $(BASEDIR)/arch/x86/efi/built_in.o
 efi/boot.init.o efi/runtime.o efi/compat.o efi/buildid.o: ;
 
-asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c
-	$(CC) $(filter-out -flto,$(CFLAGS)) -S -o $@ $<
+asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c $(BASEDIR)/include/asm-x86/asm-macros.h
+	$(CC) $(filter-out -Wa$(comma)% -flto,$(CFLAGS)) -S -o $@ $<
+
+asm-macros.i: CFLAGS += -D__ASSEMBLY__ -P
+
+$(BASEDIR)/include/asm-x86/asm-macros.h: asm-macros.i Makefile
+	echo '#if 0' >$@.new
+	echo '.if 0' >>$@.new
+	echo '#endif' >>$@.new
+	echo 'asm ( ".include \"$@\"" );' >>$@.new
+	echo '#if 0' >>$@.new
+	echo '.endif' >>$@.new
+	cat $< >>$@.new
+	echo '#endif' >>$@.new
+	$(call move-if-changed,$@.new,$@)
 
 xen.lds: xen.lds.S
-	$(CC) -P -E -Ui386 $(AFLAGS) -o $@ $<
-	sed -e 's/xen\.lds\.o:/xen\.lds:/g' <.xen.lds.d >.xen.lds.d.new
-	mv -f .xen.lds.d.new .xen.lds.d
+	$(CC) -P -E -Ui386 $(filter-out -Wa$(comma)%,$(AFLAGS)) -o $@ $<
+	sed -e 's/.*\.lds\.o:/$(@F):/g' <.$(@F).d >.$(@F).d.new
+	mv -f .$(@F).d.new .$(@F).d
 
 efi.lds: xen.lds.S
-	$(CC) -P -E -Ui386 -DEFI $(AFLAGS) -o $@ $<
-	sed -e 's/efi\.lds\.o:/efi\.lds:/g' <.$(@F).d >.$(@F).d.new
+	$(CC) -P -E -Ui386 -DEFI $(filter-out -Wa$(comma)%,$(AFLAGS)) -o $@ $<
+	sed -e 's/.*\.lds\.o:/$(@F):/g' <.$(@F).d >.$(@F).d.new
 	mv -f .$(@F).d.new .$(@F).d
 
 boot/mkelf32: boot/mkelf32.c
@@ -227,7 +248,8 @@ efi/mkreloc: efi/mkreloc.c
 .PHONY: clean
 clean::
 	rm -f asm-offsets.s *.lds boot/*.o boot/*~ boot/core boot/mkelf32
+	rm -f asm-macros.i $(BASEDIR)/include/asm-x86/asm-macros.*
 	rm -f $(BASEDIR)/.xen-syms.[0-9]* boot/.*.d
-	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.efi efi/disabled efi/mkreloc
+	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.efi efi/mkreloc
 	rm -f boot/cmdline.S boot/reloc.S boot/*.lnk boot/*.bin
 	rm -f note.o

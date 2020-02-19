@@ -22,7 +22,7 @@
 #include <xen/hvm/hvm_info_table.h>
 #include <xen/hvm/params.h>
 
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#include <xen-tools/libs.h>
 
 /* Needed for Python versions earlier than 2.3. */
 #ifndef PyMODINIT_FUNC
@@ -117,17 +117,27 @@ static PyObject *pyxc_domain_create(XcObject *self,
                                     PyObject *args,
                                     PyObject *kwds)
 {
-    uint32_t dom = 0, ssidref = 0, flags = 0, target = 0;
+    uint32_t dom = 0, target = 0;
     int      ret, i;
     PyObject *pyhandle = NULL;
-    xen_domain_handle_t handle = { 
-        0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
-        0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef };
+    struct xen_domctl_createdomain config = {
+        .handle = {
+            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+            0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
+        },
+        .max_vcpus = 1,
+        .max_evtchn_port = -1, /* No limit. */
+        .max_grant_frames = 32,
+        .max_maptrack_frames = 1024,
+    };
 
-    static char *kwd_list[] = { "domid", "ssidref", "handle", "flags", "target", NULL };
+    static char *kwd_list[] = { "domid", "ssidref", "handle", "flags",
+                                "target", "max_vcpus", NULL };
 
-    if ( !PyArg_ParseTupleAndKeywords(args, kwds, "|iiOii", kwd_list,
-                                      &dom, &ssidref, &pyhandle, &flags, &target))
+    if ( !PyArg_ParseTupleAndKeywords(args, kwds, "|iiOiii", kwd_list,
+                                      &dom, &config.ssidref, &pyhandle,
+                                      &config.flags, &target,
+                                      &config.max_vcpus) )
         return NULL;
     if ( pyhandle != NULL )
     {
@@ -140,12 +150,20 @@ static PyObject *pyxc_domain_create(XcObject *self,
             PyObject *p = PyList_GetItem(pyhandle, i);
             if ( !PyLongOrInt_Check(p) )
                 goto out_exception;
-            handle[i] = (uint8_t)PyLongOrInt_AsLong(p);
+            config.handle[i] = (uint8_t)PyLongOrInt_AsLong(p);
         }
     }
 
-    if ( (ret = xc_domain_create(self->xc_handle, ssidref,
-                                 handle, flags, &dom, NULL)) < 0 )
+#if defined (__i386) || defined(__x86_64__)
+    if ( config.flags & XEN_DOMCTL_CDF_hvm_guest )
+        config.arch.emulation_flags = (XEN_X86_EMU_ALL & ~XEN_X86_EMU_VPCI);
+#elif defined (__arm__) || defined(__aarch64__)
+    config.arch.gic_version = XEN_DOMCTL_CONFIG_GIC_NATIVE;
+#else
+#error Architecture not supported
+#endif
+
+    if ( (ret = xc_domain_create(self->xc_handle, &dom, &config)) < 0 )
         return pyxc_error_to_exception(self->xc_handle);
 
     if ( target )
@@ -800,9 +818,9 @@ static PyObject *pyxc_gnttab_hvm_seed(XcObject *self,
 				      &console_domid, &xenstore_domid) )
         return NULL;
 
-    if ( xc_dom_gnttab_hvm_seed(self->xc_handle, dom,
-				console_gmfn, xenstore_gmfn,
-				console_domid, xenstore_domid) != 0 )
+    if ( xc_dom_gnttab_seed(self->xc_handle, dom, true,
+                            console_gmfn, xenstore_gmfn,
+                            console_domid, xenstore_domid) != 0 )
         return pyxc_error_to_exception(self->xc_handle);
 
     return Py_None;
@@ -1079,7 +1097,7 @@ static PyObject *pyxc_topologyinfo(XcObject *self)
         }
     }
 
-    ret_obj = Py_BuildValue("{s:i}", "max_cpu_index", num_cpus + 1);
+    ret_obj = Py_BuildValue("{s:i}", "max_cpu_index", num_cpus - 1);
 
     PyDict_SetItemString(ret_obj, "cpu_to_core", cpu_to_core_obj);
     Py_DECREF(cpu_to_core_obj);
@@ -2160,7 +2178,7 @@ static PyMethodDef pyxc_methods[] = {
       " xenstore_gmfn [int]: \n"
       " console_domid [int]: \n"
       " xenstore_domid [int]: \n"
-      "Returns: None on sucess. Raises exception on error.\n" },
+      "Returns: None on success. Raises exception on error.\n" },
 
     { "hvm_get_param", 
       (PyCFunction)pyxc_hvm_param_get,
@@ -2182,7 +2200,7 @@ static PyMethodDef pyxc_methods[] = {
     { "get_device_group",
       (PyCFunction)pyxc_get_device_group,
       METH_VARARGS, "\n"
-      "get sibling devices infomation.\n"
+      "get sibling devices information.\n"
       " dom     [int]:      Domain to assign device to.\n"
       " seg     [int]:      PCI segment.\n"
       " bus     [int]:      PCI bus.\n"
@@ -2367,7 +2385,7 @@ static PyMethodDef pyxc_methods[] = {
     { "domain_set_memmap_limit", 
       (PyCFunction)pyxc_domain_set_memmap_limit, 
       METH_VARARGS, "\n"
-      "Set a domain's physical memory mappping limit\n"
+      "Set a domain's physical memory mapping limit\n"
       " dom [int]: Identifier of domain.\n"
       " map_limitkb [int]: .\n"
       "Returns: [int] 0 on success; -1 on error.\n" },
@@ -2421,7 +2439,7 @@ static PyMethodDef pyxc_methods[] = {
       "Set a domain's TSC mode\n"
       " dom        [int]: Domain whose TSC mode is being set.\n"
       " tsc_mode   [int]: 0=default (monotonic, but native where possible)\n"
-      "                   1=always emulate 2=never emulate 3=pvrdtscp\n"
+      "                   1=always emulate 2=never emulate\n"
       "Returns: [int] 0 on success; -1 on error.\n" },
 
     { "domain_disable_migrate",

@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <string.h>
+#include <inttypes.h>
 
 #define XC_WANT_COMPAT_MAP_FOREIGN_API
 #include <xenctrl.h>
@@ -54,7 +55,7 @@
 
 static void Noreturn failwith_xc(xc_interface *xch)
 {
-	char error_str[1028];
+	char error_str[XC_MAX_ERROR_MSG_LEN + 6];
 	if (xch) {
 		const xc_error *error = xc_get_last_error(xch);
 		if (error->code == XC_ERROR_NONE)
@@ -70,47 +71,6 @@ static void Noreturn failwith_xc(xc_interface *xch)
 			 "Unable to open XC interface");
 	}
 	caml_raise_with_string(*caml_named_value("xc.error"), error_str);
-}
-
-CAMLprim value stub_sizeof_core_header(value unit)
-{
-	CAMLparam1(unit);
-	CAMLreturn(Val_int(sizeof(struct xc_core_header)));
-}
-
-CAMLprim value stub_sizeof_vcpu_guest_context(value unit)
-{
-	CAMLparam1(unit);
-	CAMLreturn(Val_int(sizeof(struct vcpu_guest_context)));
-}
-
-CAMLprim value stub_sizeof_xen_pfn(value unit)
-{
-	CAMLparam1(unit);
-	CAMLreturn(Val_int(sizeof(xen_pfn_t)));
-}
-
-#define XC_CORE_MAGIC     0xF00FEBED
-#define XC_CORE_MAGIC_HVM 0xF00FEBEE
-
-CAMLprim value stub_marshall_core_header(value header)
-{
-	CAMLparam1(header);
-	CAMLlocal1(s);
-	struct xc_core_header c_header;
-
-	c_header.xch_magic = (Field(header, 0))
-		? XC_CORE_MAGIC
-		: XC_CORE_MAGIC_HVM;
-	c_header.xch_nr_vcpus = Int_val(Field(header, 1));
-	c_header.xch_nr_pages = Nativeint_val(Field(header, 2));
-	c_header.xch_ctxt_offset = Int64_val(Field(header, 3));
-	c_header.xch_index_offset = Int64_val(Field(header, 4));
-	c_header.xch_pages_offset = Int64_val(Field(header, 5));
-
-	s = caml_alloc_string(sizeof(c_header));
-	memcpy(String_val(s), (char *) &c_header, sizeof(c_header));
-	CAMLreturn(s);
 }
 
 CAMLprim value stub_xc_interface_open(void)
@@ -138,49 +98,75 @@ CAMLprim value stub_xc_interface_close(value xch)
 	CAMLreturn(Val_unit);
 }
 
-static int domain_create_flag_table[] = {
-	XEN_DOMCTL_CDF_hvm_guest,
-	XEN_DOMCTL_CDF_hap,
-};
-
-CAMLprim value stub_xc_domain_create(value xch, value ssidref,
-                                     value flags, value handle,
-                                     value domconfig)
+static void domain_handle_of_uuid_string(xen_domain_handle_t h,
+					 const char *uuid)
 {
-	CAMLparam4(xch, ssidref, flags, handle);
+#define X "%02"SCNx8
+#define UUID_FMT (X X X X "-" X X "-" X X "-" X X "-" X X X X X X)
+
+	if ( sscanf(uuid, UUID_FMT, &h[0], &h[1], &h[2], &h[3], &h[4],
+		    &h[5], &h[6], &h[7], &h[8], &h[9], &h[10], &h[11],
+		    &h[12], &h[13], &h[14], &h[15]) != 16 )
+	{
+		char buf[128];
+
+		snprintf(buf, sizeof(buf),
+			 "Xc.int_array_of_uuid_string: %s", uuid);
+
+		caml_invalid_argument(buf);
+	}
+
+#undef X
+}
+
+CAMLprim value stub_xc_domain_create(value xch, value config)
+{
+	CAMLparam2(xch, config);
+	CAMLlocal2(l, arch_domconfig);
+
+	/* Mnemonics for the named fields inside domctl_create_config */
+#define VAL_SSIDREF             Field(config, 0)
+#define VAL_HANDLE              Field(config, 1)
+#define VAL_FLAGS               Field(config, 2)
+#define VAL_MAX_VCPUS           Field(config, 3)
+#define VAL_MAX_EVTCHN_PORT     Field(config, 4)
+#define VAL_MAX_GRANT_FRAMES    Field(config, 5)
+#define VAL_MAX_MAPTRACK_FRAMES Field(config, 6)
+#define VAL_ARCH                Field(config, 7)
 
 	uint32_t domid = 0;
-	xen_domain_handle_t h = { 0 };
 	int result;
-	int i;
-	uint32_t c_ssidref = Int32_val(ssidref);
-	unsigned int c_flags = 0;
-	value l;
-	xc_domain_configuration_t config = {};
+	struct xen_domctl_createdomain cfg = {
+		.ssidref = Int32_val(VAL_SSIDREF),
+		.max_vcpus = Int_val(VAL_MAX_VCPUS),
+		.max_evtchn_port = Int_val(VAL_MAX_EVTCHN_PORT),
+		.max_grant_frames = Int_val(VAL_MAX_GRANT_FRAMES),
+		.max_maptrack_frames = Int_val(VAL_MAX_MAPTRACK_FRAMES),
+	};
 
-        if (Wosize_val(handle) != 16)
-		caml_invalid_argument("Handle not a 16-integer array");
+	domain_handle_of_uuid_string(cfg.handle, String_val(VAL_HANDLE));
 
-	for (i = 0; i < sizeof(h); i++) {
-		h[i] = Int_val(Field(handle, i)) & 0xff;
-	}
+	for ( l = VAL_FLAGS; l != Val_none; l = Field(l, 1) )
+		cfg.flags |= 1u << Int_val(Field(l, 0));
 
-	for (l = flags; l != Val_none; l = Field(l, 1)) {
-		int v = Int_val(Field(l, 0));
-		c_flags |= domain_create_flag_table[v];
-	}
-
-	switch(Tag_val(domconfig)) {
+	arch_domconfig = Field(VAL_ARCH, 0);
+	switch ( Tag_val(VAL_ARCH) )
+	{
 	case 0: /* ARM - nothing to do */
 		caml_failwith("Unhandled: ARM");
 		break;
 
 	case 1: /* X86 - emulation flags in the block */
 #if defined(__i386__) || defined(__x86_64__)
-		for (l = Field(Field(domconfig, 0), 0);
-		     l != Val_none;
-		     l = Field(l, 1))
-			config.emulation_flags |= 1u << Int_val(Field(l, 0));
+
+        /* Mnemonics for the named fields inside xen_x86_arch_domainconfig */
+#define VAL_EMUL_FLAGS          Field(arch_domconfig, 0)
+
+		for ( l = VAL_EMUL_FLAGS; l != Val_none; l = Field(l, 1) )
+			cfg.arch.emulation_flags |= 1u << Int_val(Field(l, 0));
+
+#undef VAL_EMUL_FLAGS
+
 #else
 		caml_failwith("Unhandled: x86");
 #endif
@@ -190,8 +176,17 @@ CAMLprim value stub_xc_domain_create(value xch, value ssidref,
 		caml_failwith("Unhandled domconfig type");
 	}
 
+#undef VAL_ARCH
+#undef VAL_MAX_MAPTRACK_FRAMES
+#undef VAL_MAX_GRANT_FRAMES
+#undef VAL_MAX_EVTCHN_PORT
+#undef VAL_MAX_VCPUS
+#undef VAL_FLAGS
+#undef VAL_HANDLE
+#undef VAL_SSIDREF
+
 	caml_enter_blocking_section();
-	result = xc_domain_create(_H(xch), c_ssidref, h, c_flags, &domid, &config);
+	result = xc_domain_create(_H(xch), &domid, &cfg);
 	caml_leave_blocking_section();
 
 	if (result < 0)
@@ -217,15 +212,10 @@ CAMLprim value stub_xc_domain_max_vcpus(value xch, value domid,
 value stub_xc_domain_sethandle(value xch, value domid, value handle)
 {
 	CAMLparam3(xch, domid, handle);
-	xen_domain_handle_t h = { 0 };
+	xen_domain_handle_t h;
 	int i;
 
-        if (Wosize_val(handle) != 16)
-		caml_invalid_argument("Handle not a 16-integer array");
-
-	for (i = 0; i < sizeof(h); i++) {
-		h[i] = Int_val(Field(handle, i)) & 0xff;
-	}
+	domain_handle_of_uuid_string(h, String_val(handle));
 
 	i = xc_domain_sethandle(_H(xch), _D(domid), h);
 	if (i)
@@ -690,7 +680,7 @@ CAMLprim value stub_xc_pcpu_info(value xch, value nr_cpus)
 
 	if (Int_val(nr_cpus) < 1)
 		caml_invalid_argument("nr_cpus");
-	
+
 	info = calloc(Int_val(nr_cpus) + 1, sizeof(*info));
 	if (!info)
 		caml_raise_out_of_memory();
@@ -1048,38 +1038,6 @@ CAMLprim value stub_shadow_allocation_set(value xch, value domid,
 		failwith_xc(_H(xch));
 
 	CAMLreturn(Val_unit);
-}
-
-CAMLprim value stub_xc_domain_get_pfn_list(value xch, value domid,
-                                           value nr_pfns)
-{
-	CAMLparam3(xch, domid, nr_pfns);
-	CAMLlocal2(array, v);
-	unsigned long c_nr_pfns;
-	long ret, i;
-	uint64_t *c_array;
-
-	c_nr_pfns = Nativeint_val(nr_pfns);
-
-	c_array = malloc(sizeof(uint64_t) * c_nr_pfns);
-	if (!c_array)
-		caml_raise_out_of_memory();
-
-	ret = xc_get_pfn_list(_H(xch), _D(domid),
-			      c_array, c_nr_pfns);
-	if (ret < 0) {
-		free(c_array);
-		failwith_xc(_H(xch));
-	}
-
-	array = caml_alloc(ret, 0);
-	for (i = 0; i < ret; i++) {
-		v = caml_copy_nativeint(c_array[i]);
-		Store_field(array, i, v);
-	}
-	free(c_array);
-
-	CAMLreturn(array);
 }
 
 CAMLprim value stub_xc_domain_ioport_permission(value xch, value domid,

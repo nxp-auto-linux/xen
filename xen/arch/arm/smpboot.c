@@ -27,10 +27,12 @@
 #include <xen/smp.h>
 #include <xen/softirq.h>
 #include <xen/timer.h>
+#include <xen/warning.h>
 #include <xen/irq.h>
 #include <xen/console.h>
 #include <asm/cpuerrata.h>
 #include <asm/gic.h>
+#include <asm/procinfo.h>
 #include <asm/psci.h>
 #include <asm/acpi.h>
 
@@ -50,8 +52,8 @@ nodemask_t __read_mostly node_online_map = { { [0] = 1UL } };
 static unsigned char __initdata cpu0_boot_stack[STACK_SIZE]
        __attribute__((__aligned__(STACK_SIZE)));
 
-/* Initial boot cpu data */
-struct init_info __initdata init_data =
+/* Boot cpu data */
+struct init_info init_data =
 {
     .stack = cpu0_boot_stack,
 };
@@ -69,15 +71,28 @@ DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_mask);
 /* representing HT and core siblings of each logical CPU */
 DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_mask);
 
+/*
+ * By default non-boot CPUs not identical to the boot CPU will be
+ * parked.
+ */
+static bool __read_mostly opt_hmp_unsafe = false;
+boolean_param("hmp-unsafe", opt_hmp_unsafe);
+
 static void setup_cpu_sibling_map(int cpu)
 {
     if ( !zalloc_cpumask_var(&per_cpu(cpu_sibling_mask, cpu)) ||
          !zalloc_cpumask_var(&per_cpu(cpu_core_mask, cpu)) )
-        panic("No memory for CPU sibling/core maps");
+        panic("No memory for CPU sibling/core maps\n");
 
     /* A CPU is a sibling with itself and is always on its own core. */
     cpumask_set_cpu(cpu, per_cpu(cpu_sibling_mask, cpu));
     cpumask_set_cpu(cpu, per_cpu(cpu_core_mask, cpu));
+}
+
+static void remove_cpu_sibling_map(int cpu)
+{
+    free_cpumask_var(per_cpu(cpu_sibling_mask, cpu));
+    free_cpumask_var(per_cpu(cpu_core_mask, cpu));
 }
 
 void __init
@@ -255,6 +270,10 @@ void __init smp_init_cpus(void)
     else
         acpi_smp_init_cpus();
 
+    if ( opt_hmp_unsafe )
+        warning_add("WARNING: HMP COMPUTING HAS BEEN ENABLED.\n"
+                    "It has implications on the security and stability of the system,\n"
+                    "unless the cpu affinity of all domains is specified.\n");
 }
 
 int __init
@@ -270,7 +289,7 @@ smp_get_max_cpus (void)
 }
 
 void __init
-smp_prepare_cpus (unsigned int max_cpus)
+smp_prepare_cpus(void)
 {
     cpumask_copy(&cpu_present_map, &cpu_possible_map);
 
@@ -289,8 +308,34 @@ void start_secondary(unsigned long boot_phys_offset,
     set_processor_id(cpuid);
 
     identify_cpu(&current_cpu_data);
+    processor_setup();
 
     init_traps();
+
+    /*
+     * Currently Xen assumes the platform has only one kind of CPUs.
+     * This assumption does not hold on big.LITTLE platform and may
+     * result to instability and insecure platform (unless cpu affinity
+     * is manually specified for all domains). Better to park them for
+     * now.
+     */
+    if ( !opt_hmp_unsafe &&
+         current_cpu_data.midr.bits != boot_cpu_data.midr.bits )
+    {
+        printk(XENLOG_ERR "CPU%u MIDR (0x%x) does not match boot CPU MIDR (0x%x),\n"
+               "disable cpu (see big.LITTLE.txt under docs/).\n",
+               smp_processor_id(), current_cpu_data.midr.bits,
+               boot_cpu_data.midr.bits);
+        stop_cpu();
+    }
+
+    if ( dcache_line_bytes != read_dcache_line_bytes() )
+    {
+        printk(XENLOG_ERR "CPU%u dcache line size (%zu) does not match the boot CPU (%zu)\n",
+               smp_processor_id(), read_dcache_line_bytes(),
+               dcache_line_bytes);
+        stop_cpu();
+    }
 
     mmu_init_secondary_cpu();
 
@@ -356,6 +401,8 @@ void stop_cpu(void)
     /* Make sure the write happens before we sleep forever */
     dsb(sy);
     isb();
+    call_psci_cpu_off();
+
     while ( 1 )
         wfi();
 }
@@ -457,6 +504,36 @@ void __cpu_die(unsigned int cpu)
     cpu_is_dead = false;
     smp_mb();
 }
+
+static int cpu_smpboot_callback(struct notifier_block *nfb,
+                                unsigned long action,
+                                void *hcpu)
+{
+    unsigned int cpu = (unsigned long)hcpu;
+
+    switch ( action )
+    {
+    case CPU_DEAD:
+        remove_cpu_sibling_map(cpu);
+        break;
+    default:
+        break;
+    }
+
+    return NOTIFY_DONE;
+}
+
+static struct notifier_block cpu_smpboot_nfb = {
+    .notifier_call = cpu_smpboot_callback,
+};
+
+static int __init cpu_smpboot_notifier_init(void)
+{
+    register_cpu_notifier(&cpu_smpboot_nfb);
+
+    return 0;
+}
+presmp_initcall(cpu_smpboot_notifier_init);
 
 /*
  * Local variables:

@@ -93,29 +93,22 @@ static uint8_t get_xen_consumer(xen_event_channel_notification_t fn)
 /* Get the notification function for a given Xen-bound event channel. */
 #define xen_notification_fn(e) (xen_consumers[(e)->xen_consumer-1])
 
-static int virq_is_global(uint32_t virq)
+static bool virq_is_global(unsigned int virq)
 {
-    int rc;
-
-    ASSERT(virq < NR_VIRQS);
-
     switch ( virq )
     {
     case VIRQ_TIMER:
     case VIRQ_DEBUG:
     case VIRQ_XENOPROF:
     case VIRQ_XENPMU:
-        rc = 0;
-        break;
+        return false;
+
     case VIRQ_ARCH_0 ... VIRQ_ARCH_7:
-        rc = arch_virq_is_global(virq);
-        break;
-    default:
-        rc = 1;
-        break;
+        return arch_virq_is_global(virq);
     }
 
-    return rc;
+    ASSERT(virq < NR_VIRQS);
+    return true;
 }
 
 
@@ -372,11 +365,16 @@ int evtchn_bind_virq(evtchn_bind_virq_t *bind, evtchn_port_t port)
     if ( (virq < 0) || (virq >= ARRAY_SIZE(v->virq_to_evtchn)) )
         return -EINVAL;
 
+   /*
+    * Make sure the guest controlled value virq is bounded even during
+    * speculative execution.
+    */
+    virq = array_index_nospec(virq, ARRAY_SIZE(v->virq_to_evtchn));
+
     if ( virq_is_global(virq) && (vcpu != 0) )
         return -EINVAL;
 
-    if ( (vcpu < 0) || (vcpu >= d->max_vcpus) ||
-         ((v = d->vcpu[vcpu]) == NULL) )
+    if ( (v = domain_vcpu(d, vcpu)) == NULL )
         return -ENOENT;
 
     spin_lock(&d->event_lock);
@@ -425,8 +423,7 @@ static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
     int            port, vcpu = bind->vcpu;
     long           rc = 0;
 
-    if ( (vcpu < 0) || (vcpu >= d->max_vcpus) ||
-         (d->vcpu[vcpu] == NULL) )
+    if ( domain_vcpu(d, vcpu) == NULL )
         return -ENOENT;
 
     spin_lock(&d->event_lock);
@@ -753,7 +750,7 @@ void send_guest_vcpu_virq(struct vcpu *v, uint32_t virq)
     spin_unlock_irqrestore(&v->virq_lock, flags);
 }
 
-static void send_guest_global_virq(struct domain *d, uint32_t virq)
+void send_guest_global_virq(struct domain *d, uint32_t virq)
 {
     unsigned long flags;
     int port;
@@ -809,7 +806,6 @@ static DEFINE_SPINLOCK(global_virq_handlers_lock);
 
 void send_global_virq(uint32_t virq)
 {
-    ASSERT(virq < NR_VIRQS);
     ASSERT(virq_is_global(virq));
 
     send_guest_global_virq(global_virq_handlers[virq] ?: hardware_domain, virq);
@@ -938,8 +934,10 @@ long evtchn_bind_vcpu(unsigned int port, unsigned int vcpu_id)
     struct domain *d = current->domain;
     struct evtchn *chn;
     long           rc = 0;
+    struct vcpu   *v;
 
-    if ( (vcpu_id >= d->max_vcpus) || (d->vcpu[vcpu_id] == NULL) )
+    /* Use the vcpu info to prevent speculative out-of-bound accesses */
+    if ( (v = domain_vcpu(d, vcpu_id)) == NULL )
         return -ENOENT;
 
     spin_lock(&d->event_lock);
@@ -963,22 +961,22 @@ long evtchn_bind_vcpu(unsigned int port, unsigned int vcpu_id)
     {
     case ECS_VIRQ:
         if ( virq_is_global(chn->u.virq) )
-            chn->notify_vcpu_id = vcpu_id;
+            chn->notify_vcpu_id = v->vcpu_id;
         else
             rc = -EINVAL;
         break;
     case ECS_UNBOUND:
     case ECS_INTERDOMAIN:
-        chn->notify_vcpu_id = vcpu_id;
+        chn->notify_vcpu_id = v->vcpu_id;
         break;
     case ECS_PIRQ:
-        if ( chn->notify_vcpu_id == vcpu_id )
+        if ( chn->notify_vcpu_id == v->vcpu_id )
             break;
         unlink_pirq_port(chn, d->vcpu[chn->notify_vcpu_id]);
-        chn->notify_vcpu_id = vcpu_id;
+        chn->notify_vcpu_id = v->vcpu_id;
         pirq_set_affinity(d, chn->u.pirq.irq,
-                          cpumask_of(d->vcpu[vcpu_id]->processor));
-        link_pirq_port(port, chn, d->vcpu[vcpu_id]);
+                          cpumask_of(v->processor));
+        link_pirq_port(port, chn, v);
         break;
     default:
         rc = -EINVAL;
@@ -1292,10 +1290,10 @@ void evtchn_check_pollers(struct domain *d, unsigned int port)
     }
 }
 
-int evtchn_init(struct domain *d)
+int evtchn_init(struct domain *d, unsigned int max_port)
 {
     evtchn_2l_init(d);
-    d->max_evtchn_port = INT_MAX;
+    d->max_evtchn_port = min_t(unsigned int, max_port, INT_MAX);
 
     d->evtchn = alloc_evtchn_bucket(d, 0);
     if ( !d->evtchn )
@@ -1311,8 +1309,7 @@ int evtchn_init(struct domain *d)
     evtchn_from_port(d, 0)->state = ECS_RESERVED;
 
 #if MAX_VIRT_CPUS > BITS_PER_LONG
-    d->poll_mask = xzalloc_array(unsigned long,
-                                 BITS_TO_LONGS(domain_max_vcpus(d)));
+    d->poll_mask = xzalloc_array(unsigned long, BITS_TO_LONGS(d->max_vcpus));
     if ( !d->poll_mask )
     {
         free_evtchn_bucket(d, d->evtchn);
@@ -1386,11 +1383,9 @@ static void domain_dump_evtchn_info(struct domain *d)
     unsigned int port;
     int irq;
 
-    bitmap_scnlistprintf(keyhandler_scratch, sizeof(keyhandler_scratch),
-                         d->poll_mask, d->max_vcpus);
     printk("Event channel information for domain %d:\n"
-           "Polling vCPUs: {%s}\n"
-           "    port [p/m/s]\n", d->domain_id, keyhandler_scratch);
+           "Polling vCPUs: {%*pbl}\n"
+           "    port [p/m/s]\n", d->domain_id, d->max_vcpus, d->poll_mask);
 
     spin_lock(&d->event_lock);
 

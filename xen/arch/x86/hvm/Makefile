@@ -1,5 +1,6 @@
 subdir-y += svm
 subdir-y += vmx
+subdir-y += viridian
 
 obj-y += asid.o
 obj-y += dm.o
@@ -10,7 +11,6 @@ obj-y += grant_table.o
 obj-y += hpet.o
 obj-y += hvm.o
 obj-y += hypercall.o
-obj-y += i8254.o
 obj-y += intercept.o
 obj-y += io.o
 obj-y += ioreq.o
@@ -24,7 +24,6 @@ obj-y += rtc.o
 obj-y += save.o
 obj-y += stdvga.o
 obj-y += vioapic.o
-obj-y += viridian.o
 obj-y += vlapic.o
 obj-y += vm_event.o
 obj-y += vmsi.o

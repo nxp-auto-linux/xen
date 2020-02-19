@@ -156,7 +156,6 @@
 #ifndef __ASSEMBLY__
 #include <xen/device_tree.h>
 #include <xen/irq.h>
-#include <asm-arm/vgic.h>
 
 #define DT_COMPAT_GIC_CORTEX_A15 "arm,cortex-a15-gic"
 
@@ -167,7 +166,7 @@
 
 #define DT_MATCH_GIC_V3 DT_MATCH_COMPATIBLE("arm,gic-v3")
 
-#ifdef CONFIG_HAS_GICV3
+#ifdef CONFIG_GICV3
 /*
  * GICv3 registers that needs to be saved/restored
  */
@@ -195,7 +194,7 @@ struct gic_v2 {
  */
 union gic_state_data {
     struct gic_v2 v2;
-#ifdef CONFIG_HAS_GICV3
+#ifdef CONFIG_GICV3
     struct gic_v3 v3;
 #endif
 };
@@ -205,20 +204,35 @@ union gic_state_data {
  * The LR register format is different for GIC HW version
  */
 struct gic_lr {
-   /* Physical IRQ */
-   uint32_t pirq;
    /* Virtual IRQ */
    uint32_t virq;
    uint8_t priority;
-   uint8_t state;
-   uint8_t hw_status;
-   uint8_t grp;
+   bool active;
+   bool pending;
+   bool hw_status;
+   union
+   {
+       /* Only filled when there are a corresponding pIRQ (hw_state = true) */
+       struct
+       {
+           uint32_t pirq;
+       } hw;
+       /* Only filled when there are no corresponding pIRQ (hw_state = false) */
+       struct
+       {
+           bool eoi;
+           uint8_t source;      /* GICv2 only */
+       } virt;
+   };
 };
 
 enum gic_version {
+    GIC_INVALID = 0,    /* the default until explicitly set up */
     GIC_V2,
     GIC_V3,
 };
+
+DECLARE_PER_CPU(uint64_t, lr_mask);
 
 extern enum gic_version gic_hw_version(void);
 
@@ -235,16 +249,12 @@ extern int gic_route_irq_to_guest(struct domain *, unsigned int virq,
 int gic_remove_irq_from_guest(struct domain *d, unsigned int virq,
                               struct irq_desc *desc);
 
-extern void gic_inject(void);
 extern void gic_clear_pending_irqs(struct vcpu *v);
-extern int gic_events_need_delivery(void);
 
 extern void init_maintenance_interrupt(void);
 extern void gic_raise_guest_irq(struct vcpu *v, unsigned int irq,
         unsigned int priority);
 extern void gic_raise_inflight_irq(struct vcpu *v, unsigned int virtual_irq);
-extern void gic_remove_from_lr_pending(struct vcpu *v, struct pending_irq *p);
-extern void gic_remove_irq_from_queues(struct vcpu *v, struct pending_irq *p);
 
 /* Accept an interrupt from the GIC and dispatch its handler */
 extern void gic_interrupt(struct cpu_user_regs *regs, int is_fiq);
@@ -286,6 +296,7 @@ extern void send_SGI_allbutself(enum gic_sgi sgi);
 
 /* print useful debug info */
 extern void gic_dump_info(struct vcpu *v);
+extern void gic_dump_vgic_info(struct vcpu *v);
 
 /* Number of interrupt lines */
 extern unsigned int gic_number_lines(void);
@@ -293,7 +304,6 @@ extern unsigned int gic_number_lines(void);
 /* IRQ translation function for the device tree */
 int gic_irq_xlate(const u32 *intspec, unsigned int intsize,
                   unsigned int *out_hwirq, unsigned int *out_type);
-void gic_clear_lrs(struct vcpu *v);
 
 struct gic_info {
     /* GIC version */
@@ -332,6 +342,10 @@ struct gic_hw_operations {
     void (*deactivate_irq)(struct irq_desc *irqd);
     /* Read IRQ id and Ack */
     unsigned int (*read_irq)(void);
+    /* Force the active state of an IRQ by accessing the distributor */
+    void (*set_active_state)(struct irq_desc *irqd, bool state);
+    /* Force the pending state of an IRQ by accessing the distributor */
+    void (*set_pending_state)(struct irq_desc *irqd, bool state);
     /* Set IRQ type */
     void (*set_irq_type)(struct irq_desc *desc, unsigned int type);
     /* Set IRQ priority */
@@ -342,8 +356,8 @@ struct gic_hw_operations {
     /* Disable CPU physical and virtual interfaces */
     void (*disable_interface)(void);
     /* Update LR register with state and priority */
-    void (*update_lr)(int lr, const struct pending_irq *pending_irq,
-                      unsigned int state);
+    void (*update_lr)(int lr, unsigned int virq, uint8_t priority,
+                      unsigned int hw_irq, unsigned int state);
     /* Update HCR status register */
     void (*update_hcr_status)(uint32_t flag, bool set);
     /* Clear LR register */
@@ -356,6 +370,8 @@ struct gic_hw_operations {
     unsigned int (*read_vmcr_priority)(void);
     /* Read APRn register */
     unsigned int (*read_apr)(int apr_reg);
+    /* Query the pending state of an interrupt at the distributor level. */
+    bool (*read_pending_state)(struct irq_desc *irqd);
     /* Secondary CPU init */
     int (*secondary_init)(void);
     /* Create GIC node for the hardware domain */
@@ -372,6 +388,42 @@ struct gic_hw_operations {
     /* Handle LPIs, which require special handling */
     void (*do_LPI)(unsigned int lpi);
 };
+
+extern const struct gic_hw_operations *gic_hw_ops;
+
+static inline unsigned int gic_get_nr_lrs(void)
+{
+    return gic_hw_ops->info->nr_lrs;
+}
+
+/*
+ * Set the active state of an IRQ. This should be used with care, as this
+ * directly forces the active bit, without considering the GIC state machine.
+ * For private IRQs this only works for those of the current CPU.
+ */
+static inline void gic_set_active_state(struct irq_desc *irqd, bool state)
+{
+    gic_hw_ops->set_active_state(irqd, state);
+}
+
+/*
+ * Set the pending state of an IRQ. This should be used with care, as this
+ * directly forces the pending bit, without considering the GIC state machine.
+ * For private IRQs this only works for those of the current CPU.
+ */
+static inline void gic_set_pending_state(struct irq_desc *irqd, bool state)
+{
+    gic_hw_ops->set_pending_state(irqd, state);
+}
+
+/*
+ * Read the pending state of an interrupt from the distributor.
+ * For private IRQs this only works for those of the current CPU.
+ */
+static inline bool gic_read_pending_state(struct irq_desc *irqd)
+{
+    return gic_hw_ops->read_pending_state(irqd);
+}
 
 void register_gic_ops(const struct gic_hw_operations *ops);
 int gic_make_hwdom_dt_node(const struct domain *d,

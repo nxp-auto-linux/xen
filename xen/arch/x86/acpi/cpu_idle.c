@@ -759,11 +759,11 @@ void acpi_dead_idle(void)
     struct acpi_processor_power *power;
     struct acpi_processor_cx *cx;
 
-    if ( (power = processor_powers[smp_processor_id()]) == NULL )
+    if ( (power = processor_powers[smp_processor_id()]) == NULL ||
+         power->count < 2 )
         goto default_halt;
 
-    if ( (cx = &power->states[power->count-1]) == NULL )
-        goto default_halt;
+    cx = &power->states[power->count - 1];
 
     if ( cx->entry_method == ACPI_CSTATE_EM_FFH )
     {
@@ -842,6 +842,9 @@ int cpuidle_init_cpu(unsigned int cpu)
             acpi_power->states[i].idx = i;
 
         acpi_power->cpu = cpu;
+
+        spin_lock_init(&acpi_power->stat_lock);
+
         processor_powers[cpu] = acpi_power;
     }
 
@@ -849,7 +852,6 @@ int cpuidle_init_cpu(unsigned int cpu)
     acpi_power->states[1].type = ACPI_STATE_C1;
     acpi_power->states[1].entry_method = ACPI_CSTATE_EM_HALT;
     acpi_power->safe_state = &acpi_power->states[1];
-    spin_lock_init(&acpi_power->stat_lock);
 
     return 0;
 }
@@ -1170,7 +1172,7 @@ static void print_cx_pminfo(uint32_t cpu, struct xen_processor_power *power)
 #define print_cx_pminfo(c, p)
 #endif
 
-long set_cx_pminfo(uint32_t cpu, struct xen_processor_power *power)
+long set_cx_pminfo(uint32_t acpi_id, struct xen_processor_power *power)
 {
     XEN_GUEST_HANDLE(xen_processor_cx_t) states;
     xen_processor_cx_t xen_cx;
@@ -1183,16 +1185,15 @@ long set_cx_pminfo(uint32_t cpu, struct xen_processor_power *power)
     if ( pm_idle_save && pm_idle != acpi_processor_idle )
         return 0;
 
-    print_cx_pminfo(cpu, power);
+    print_cx_pminfo(acpi_id, power);
 
-    /* map from acpi_id to cpu_id */
-    cpu_id = get_cpu_id(cpu);
+    cpu_id = get_cpu_id(acpi_id);
     if ( cpu_id == -1 )
     {
         static bool warn_once = true;
 
         if ( warn_once || opt_cpu_info )
-            printk(XENLOG_WARNING "No CPU ID for APIC ID %#x\n", cpu);
+            printk(XENLOG_WARNING "No CPU for ACPI ID %#x\n", acpi_id);
         warn_once = false;
         return -EINVAL;
     }
@@ -1364,8 +1365,6 @@ void cpuidle_disable_deep_cstate(void)
         else
             max_cstate = 1;
     }
-
-    mb();
 
     hpet_disable_legacy_broadcast();
 }

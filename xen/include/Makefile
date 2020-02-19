@@ -5,6 +5,7 @@ ifneq ($(CONFIG_COMPAT),)
 compat-arch-$(CONFIG_X86) := x86_32
 
 headers-y := \
+    compat/argo.h \
     compat/callback.h \
     compat/elfnote.h \
     compat/event_channel.h \
@@ -26,17 +27,23 @@ headers-$(CONFIG_X86)     += compat/arch-x86/pmu.h
 headers-$(CONFIG_X86)     += compat/arch-x86/xen-mca.h
 headers-$(CONFIG_X86)     += compat/arch-x86/xen.h
 headers-$(CONFIG_X86)     += compat/arch-x86/xen-$(compat-arch-y).h
-headers-$(CONFIG_X86)     += compat/hvm/hvm_vcpu.h
 headers-$(CONFIG_X86)     += compat/hvm/dm_op.h
+headers-$(CONFIG_X86)     += compat/hvm/hvm_op.h
+headers-$(CONFIG_X86)     += compat/hvm/hvm_vcpu.h
 headers-y                 += compat/arch-$(compat-arch-y).h compat/pmu.h compat/xlat.h
-headers-$(CONFIG_FLASK)   += compat/xsm/flask_op.h
+headers-$(CONFIG_XSM_FLASK) += compat/xsm/flask_op.h
 
 cppflags-y                := -include public/xen-compat.h -DXEN_GENERATING_COMPAT_HEADERS
 cppflags-$(CONFIG_X86)    += -m32
 
 # 8-byte types are 4-byte aligned on x86_32 ...
+ifeq ($(clang),y)
+prefix-$(CONFIG_X86)      := \#pragma pack(push, 4)
+suffix-$(CONFIG_X86)      := \#pragma pack(pop)
+else
 prefix-$(CONFIG_X86)      := \#pragma pack(4)
 suffix-$(CONFIG_X86)      := \#pragma pack()
+endif
 
 endif
 
@@ -60,7 +67,7 @@ compat/%.h: compat/%.i Makefile $(BASEDIR)/tools/compat-build-header.py
 	mv -f $@.new $@
 
 compat/%.i: compat/%.c Makefile
-	$(CPP) $(filter-out -M% %.d -include %/include/xen/config.h,$(CFLAGS)) $(cppflags-y) -o $@ $<
+	$(CPP) $(filter-out -Wa$(comma)% -M% %.d -include %/include/xen/config.h,$(CFLAGS)) $(cppflags-y) -o $@ $<
 
 compat/%.c: public/%.h xlat.lst Makefile $(BASEDIR)/tools/compat-build-source.py
 	mkdir -p $(@D)
@@ -135,14 +142,13 @@ headers++.chk: $(PUBLIC_HEADERS) Makefile
 endif
 
 ifeq ($(XEN_TARGET_ARCH),x86_64)
+.PHONY: lib-x86-all
+lib-x86-all:
+	$(MAKE) -C xen/lib/x86 all
 
-$(BASEDIR)/include/asm-x86/cpuid-autogen.h: $(BASEDIR)/include/public/arch-x86/cpufeatureset.h $(BASEDIR)/tools/gen-cpuid.py FORCE
-	$(PYTHON) $(BASEDIR)/tools/gen-cpuid.py -i $^ -o $@.new
-	$(call move-if-changed,$@.new,$@)
-
-all: $(BASEDIR)/include/asm-x86/cpuid-autogen.h
+all: lib-x86-all
 endif
 
 clean::
 	rm -rf compat config generated headers*.chk
-	rm -f $(BASEDIR)/include/asm-x86/cpuid-autogen.h
+	rm -f $(BASEDIR)/include/xen/lib/x86/cpuid-autogen.h

@@ -177,18 +177,17 @@ let from_channel_f chan domain_f watch_f store_f =
 let from_channel store cons doms chan =
 	(* don't let the permission get on our way, full perm ! *)
 	let op = Store.get_ops store Perms.Connection.full_rights in
-	let xc = Xenctrl.interface_open () in
 
 	let domain_f domid mfn port =
 		let ndom =
 			if domid > 0 then
-				Domains.create xc doms domid mfn port
+				Domains.create doms domid mfn port
 			else
 				Domains.create0 doms
 			in
 		Connections.add_domain cons ndom;
 		in
-	let watch_f domid path token = 
+	let watch_f domid path token =
 		let con = Connections.find_domain cons domid in
 		ignore (Connections.add_watch cons con path token)
 		in
@@ -196,8 +195,7 @@ let from_channel store cons doms chan =
 		op.Store.write path value;
 		op.Store.setperms path perms
 		in
-	finally (fun () -> from_channel_f chan domain_f watch_f store_f)
-	        (fun () -> Xenctrl.interface_close xc)
+	from_channel_f chan domain_f watch_f store_f
 
 let from_file store cons doms file =
 	let channel = open_in file in
@@ -238,7 +236,7 @@ let _ =
 			default_pidfile
 		in
 
-	(try 
+	(try
 		Unixext.mkdir_rec (Filename.dirname pidfile) 0o755
 	with _ ->
 		()
@@ -251,11 +249,11 @@ let _ =
 			Some (Unix.handle_unix_error Utils.create_unix_socket Define.xs_daemon_socket),
 			Some (Unix.handle_unix_error Utils.create_unix_socket Define.xs_daemon_socket_ro)
 		in
-	
+
 	if cf.daemonize then
 		Unixext.daemonize ()
 	else
-		printf "Xen Storage Daemon, version %d.%d\n%!" 
+		printf "Xen Storage Daemon, version %d.%d\n%!"
 			Define.xenstored_major Define.xenstored_minor;
 
 	(try Unixext.pidfile_write pidfile with _ -> ());
@@ -313,8 +311,8 @@ let _ =
 	Select.use_poll (not cf.use_select);
 
 	Sys.set_signal Sys.sighup (Sys.Signal_handle sighup_handler);
-	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun i -> quit := true));
-	Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun i -> sigusr1_handler store));
+	Sys.set_signal Sys.sigterm (Sys.Signal_handle (fun _ -> quit := true));
+	Sys.set_signal Sys.sigusr1 (Sys.Signal_handle (fun _ -> sigusr1_handler store));
 	Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
 
 	if cf.activate_access_log then begin
@@ -328,19 +326,17 @@ let _ =
 		(if cf.domain_init then [ Event.fd eventchn ] else [])
 		in
 
-	let xc = Xenctrl.interface_open () in
-
 	let process_special_fds rset =
 		let accept_connection can_write fd =
-			let (cfd, addr) = Unix.accept fd in
+			let (cfd, _addr) = Unix.accept fd in
 			debug "new connection through socket";
 			Connections.add_anonymous cons cfd can_write
-		and handle_eventchn fd =
+		and handle_eventchn _fd =
 			let port = Event.pending eventchn in
 			debug "pending port %d" (Xeneventchn.to_int port);
 			finally (fun () ->
 				if Some port = eventchn.Event.virq_port then (
-					let (notify, deaddom) = Domains.cleanup xc domains in
+					let (notify, deaddom) = Domains.cleanup domains in
 					List.iter (Connections.del_domain cons) deaddom;
 					if deaddom <> [] || notify then
 						Connections.fire_spec_watches cons "@releaseDomain"

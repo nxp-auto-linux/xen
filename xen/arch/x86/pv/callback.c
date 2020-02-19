@@ -31,17 +31,11 @@
 
 #include <public/callback.h>
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 static int register_guest_nmi_callback(unsigned long address)
 {
     struct vcpu *curr = current;
     struct domain *d = curr->domain;
-    struct trap_info *t = &curr->arch.pv_vcpu.trap_ctxt[TRAP_nmi];
+    struct trap_info *t = &curr->arch.pv.trap_ctxt[TRAP_nmi];
 
     if ( !is_canonical_address(address) )
         return -EINVAL;
@@ -66,7 +60,7 @@ static int register_guest_nmi_callback(unsigned long address)
 static void unregister_guest_nmi_callback(void)
 {
     struct vcpu *curr = current;
-    struct trap_info *t = &curr->arch.pv_vcpu.trap_ctxt[TRAP_nmi];
+    struct trap_info *t = &curr->arch.pv.trap_ctxt[TRAP_nmi];
 
     memset(t, 0, sizeof(*t));
 }
@@ -82,38 +76,34 @@ static long register_guest_callback(struct callback_register *reg)
     switch ( reg->type )
     {
     case CALLBACKTYPE_event:
-        curr->arch.pv_vcpu.event_callback_eip    = reg->address;
+        curr->arch.pv.event_callback_eip = reg->address;
         break;
 
     case CALLBACKTYPE_failsafe:
-        curr->arch.pv_vcpu.failsafe_callback_eip = reg->address;
+        curr->arch.pv.failsafe_callback_eip = reg->address;
         if ( reg->flags & CALLBACKF_mask_events )
-            set_bit(_VGCF_failsafe_disables_events,
-                    &curr->arch.vgc_flags);
+            curr->arch.vgc_flags |= VGCF_failsafe_disables_events;
         else
-            clear_bit(_VGCF_failsafe_disables_events,
-                      &curr->arch.vgc_flags);
+            curr->arch.vgc_flags &= ~VGCF_failsafe_disables_events;
         break;
 
     case CALLBACKTYPE_syscall:
-        curr->arch.pv_vcpu.syscall_callback_eip  = reg->address;
+        curr->arch.pv.syscall_callback_eip = reg->address;
         if ( reg->flags & CALLBACKF_mask_events )
-            set_bit(_VGCF_syscall_disables_events,
-                    &curr->arch.vgc_flags);
+            curr->arch.vgc_flags |= VGCF_syscall_disables_events;
         else
-            clear_bit(_VGCF_syscall_disables_events,
-                      &curr->arch.vgc_flags);
+            curr->arch.vgc_flags &= ~VGCF_syscall_disables_events;
         break;
 
     case CALLBACKTYPE_syscall32:
-        curr->arch.pv_vcpu.syscall32_callback_eip = reg->address;
-        curr->arch.pv_vcpu.syscall32_disables_events =
+        curr->arch.pv.syscall32_callback_eip = reg->address;
+        curr->arch.pv.syscall32_disables_events =
             !!(reg->flags & CALLBACKF_mask_events);
         break;
 
     case CALLBACKTYPE_sysenter:
-        curr->arch.pv_vcpu.sysenter_callback_eip = reg->address;
-        curr->arch.pv_vcpu.sysenter_disables_events =
+        curr->arch.pv.sysenter_callback_eip = reg->address;
+        curr->arch.pv.sysenter_disables_events =
             !!(reg->flags & CALLBACKF_mask_events);
         break;
 
@@ -228,32 +218,30 @@ static long compat_register_guest_callback(struct compat_callback_register *reg)
     switch ( reg->type )
     {
     case CALLBACKTYPE_event:
-        curr->arch.pv_vcpu.event_callback_cs     = reg->address.cs;
-        curr->arch.pv_vcpu.event_callback_eip    = reg->address.eip;
+        curr->arch.pv.event_callback_cs = reg->address.cs;
+        curr->arch.pv.event_callback_eip = reg->address.eip;
         break;
 
     case CALLBACKTYPE_failsafe:
-        curr->arch.pv_vcpu.failsafe_callback_cs  = reg->address.cs;
-        curr->arch.pv_vcpu.failsafe_callback_eip = reg->address.eip;
+        curr->arch.pv.failsafe_callback_cs = reg->address.cs;
+        curr->arch.pv.failsafe_callback_eip = reg->address.eip;
         if ( reg->flags & CALLBACKF_mask_events )
-            set_bit(_VGCF_failsafe_disables_events,
-                    &curr->arch.vgc_flags);
+            curr->arch.vgc_flags |= VGCF_failsafe_disables_events;
         else
-            clear_bit(_VGCF_failsafe_disables_events,
-                      &curr->arch.vgc_flags);
+            curr->arch.vgc_flags &= ~VGCF_failsafe_disables_events;
         break;
 
     case CALLBACKTYPE_syscall32:
-        curr->arch.pv_vcpu.syscall32_callback_cs     = reg->address.cs;
-        curr->arch.pv_vcpu.syscall32_callback_eip    = reg->address.eip;
-        curr->arch.pv_vcpu.syscall32_disables_events =
+        curr->arch.pv.syscall32_callback_cs = reg->address.cs;
+        curr->arch.pv.syscall32_callback_eip = reg->address.eip;
+        curr->arch.pv.syscall32_disables_events =
             (reg->flags & CALLBACKF_mask_events) != 0;
         break;
 
     case CALLBACKTYPE_sysenter:
-        curr->arch.pv_vcpu.sysenter_callback_cs     = reg->address.cs;
-        curr->arch.pv_vcpu.sysenter_callback_eip    = reg->address.eip;
-        curr->arch.pv_vcpu.sysenter_disables_events =
+        curr->arch.pv.sysenter_callback_cs = reg->address.cs;
+        curr->arch.pv.sysenter_callback_eip = reg->address.eip;
+        curr->arch.pv.sysenter_disables_events =
             (reg->flags & CALLBACKF_mask_events) != 0;
         break;
 
@@ -364,14 +352,13 @@ long do_set_trap_table(XEN_GUEST_HANDLE_PARAM(const_trap_info_t) traps)
 {
     struct trap_info cur;
     struct vcpu *curr = current;
-    struct trap_info *dst = curr->arch.pv_vcpu.trap_ctxt;
+    struct trap_info *dst = curr->arch.pv.trap_ctxt;
     long rc = 0;
 
     /* If no table is presented then clear the entire virtual IDT. */
     if ( guest_handle_is_null(traps) )
     {
         memset(dst, 0, NR_VECTORS * sizeof(*dst));
-        init_int80_direct_trap(curr);
         return 0;
     }
 
@@ -393,9 +380,6 @@ long do_set_trap_table(XEN_GUEST_HANDLE_PARAM(const_trap_info_t) traps)
 
         memcpy(&dst[cur.vector], &cur, sizeof(cur));
 
-        if ( cur.vector == 0x80 )
-            init_int80_direct_trap(curr);
-
         guest_handle_add_offset(traps, 1);
 
         if ( hypercall_preempt_check() )
@@ -413,14 +397,13 @@ int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps)
 {
     struct vcpu *curr = current;
     struct compat_trap_info cur;
-    struct trap_info *dst = curr->arch.pv_vcpu.trap_ctxt;
+    struct trap_info *dst = curr->arch.pv.trap_ctxt;
     long rc = 0;
 
     /* If no table is presented then clear the entire virtual IDT. */
     if ( guest_handle_is_null(traps) )
     {
         memset(dst, 0, NR_VECTORS * sizeof(*dst));
-        init_int80_direct_trap(curr);
         return 0;
     }
 
@@ -438,9 +421,6 @@ int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps)
         fixup_guest_code_selector(curr->domain, cur.cs);
 
         XLAT_trap_info(dst + cur.vector, &cur);
-
-        if ( cur.vector == 0x80 )
-            init_int80_direct_trap(curr);
 
         guest_handle_add_offset(traps, 1);
 

@@ -30,7 +30,9 @@
 #include <xen/lib.h>
 #include <xen/errno.h>
 #include <xen/sched.h>
+#include <xen/softirq.h>
 #include <xen/irq.h>
+#include <xen/vpci.h>
 #include <public/hvm/ioreq.h>
 #include <asm/hvm/io.h>
 #include <asm/hvm/vpic.h>
@@ -171,7 +173,7 @@ static DEFINE_RCU_READ_LOCK(msixtbl_rcu_lock);
  */
 static bool msixtbl_initialised(const struct domain *d)
 {
-    return !!d->arch.hvm_domain.msixtbl_list.next;
+    return d->arch.hvm.msixtbl_list.next;
 }
 
 static struct msixtbl_entry *msixtbl_find_entry(
@@ -180,7 +182,7 @@ static struct msixtbl_entry *msixtbl_find_entry(
     struct msixtbl_entry *entry;
     struct domain *d = v->domain;
 
-    list_for_each_entry( entry, &d->arch.hvm_domain.msixtbl_list, list )
+    list_for_each_entry( entry, &d->arch.hvm.msixtbl_list, list )
         if ( addr >= entry->gtable &&
              addr < entry->gtable + entry->table_len )
             return entry;
@@ -309,7 +311,7 @@ static int msixtbl_write(struct vcpu *v, unsigned long address,
     if ( !(val & PCI_MSIX_VECTOR_BITMASK) &&
          test_and_clear_bit(nr_entry, &entry->table_flags) )
     {
-        v->arch.hvm_vcpu.hvm_io.msix_unmask_address = address;
+        v->arch.hvm.hvm_io.msix_unmask_address = address;
         goto out;
     }
 
@@ -381,8 +383,8 @@ static bool_t msixtbl_range(const struct hvm_io_handler *handler,
                   PCI_MSIX_ENTRY_VECTOR_CTRL_OFFSET) &&
                  !(data & PCI_MSIX_VECTOR_BITMASK) )
             {
-                curr->arch.hvm_vcpu.hvm_io.msix_snoop_address = addr;
-                curr->arch.hvm_vcpu.hvm_io.msix_snoop_gpa = 0;
+                curr->arch.hvm.hvm_io.msix_snoop_address = addr;
+                curr->arch.hvm.hvm_io.msix_snoop_gpa = 0;
             }
         }
         else if ( (size == 4 || size == 8) &&
@@ -399,9 +401,9 @@ static bool_t msixtbl_range(const struct hvm_io_handler *handler,
             BUILD_BUG_ON((PCI_MSIX_ENTRY_VECTOR_CTRL_OFFSET + 4) &
                          (PCI_MSIX_ENTRY_SIZE - 1));
 
-            curr->arch.hvm_vcpu.hvm_io.msix_snoop_address =
+            curr->arch.hvm.hvm_io.msix_snoop_address =
                 addr + size * r->count - 4;
-            curr->arch.hvm_vcpu.hvm_io.msix_snoop_gpa =
+            curr->arch.hvm.hvm_io.msix_snoop_gpa =
                 r->data + size * r->count - 4;
         }
     }
@@ -428,7 +430,7 @@ static void add_msixtbl_entry(struct domain *d,
     entry->pdev = pdev;
     entry->gtable = (unsigned long) gtable;
 
-    list_add_rcu(&entry->list, &d->arch.hvm_domain.msixtbl_list);
+    list_add_rcu(&entry->list, &d->arch.hvm.msixtbl_list);
 }
 
 static void free_msixtbl_entry(struct rcu_head *rcu)
@@ -481,7 +483,7 @@ int msixtbl_pt_register(struct domain *d, struct pirq *pirq, uint64_t gtable)
 
     pdev = msi_desc->dev;
 
-    list_for_each_entry( entry, &d->arch.hvm_domain.msixtbl_list, list )
+    list_for_each_entry( entry, &d->arch.hvm.msixtbl_list, list )
         if ( pdev == entry->pdev )
             goto found;
 
@@ -504,13 +506,13 @@ out:
         for_each_vcpu ( d, v )
         {
             if ( (v->pause_flags & VPF_blocked_in_xen) &&
-                 !v->arch.hvm_vcpu.hvm_io.msix_snoop_gpa &&
-                 v->arch.hvm_vcpu.hvm_io.msix_snoop_address ==
+                 !v->arch.hvm.hvm_io.msix_snoop_gpa &&
+                 v->arch.hvm.hvm_io.msix_snoop_address ==
                  (gtable + msi_desc->msi_attrib.entry_nr *
                            PCI_MSIX_ENTRY_SIZE +
                   PCI_MSIX_ENTRY_VECTOR_CTRL_OFFSET) )
-                v->arch.hvm_vcpu.hvm_io.msix_unmask_address =
-                    v->arch.hvm_vcpu.hvm_io.msix_snoop_address;
+                v->arch.hvm.hvm_io.msix_unmask_address =
+                    v->arch.hvm.hvm_io.msix_snoop_address;
         }
     }
 
@@ -540,7 +542,7 @@ void msixtbl_pt_unregister(struct domain *d, struct pirq *pirq)
 
     pdev = msi_desc->dev;
 
-    list_for_each_entry( entry, &d->arch.hvm_domain.msixtbl_list, list )
+    list_for_each_entry( entry, &d->arch.hvm.msixtbl_list, list )
         if ( pdev == entry->pdev )
             goto found;
 
@@ -562,7 +564,7 @@ void msixtbl_init(struct domain *d)
     if ( !is_hvm_domain(d) || !has_vlapic(d) || msixtbl_initialised(d) )
         return;
 
-    INIT_LIST_HEAD(&d->arch.hvm_domain.msixtbl_list);
+    INIT_LIST_HEAD(&d->arch.hvm.msixtbl_list);
 
     handler = hvm_next_io_handler(d);
     if ( handler )
@@ -582,7 +584,7 @@ void msixtbl_pt_cleanup(struct domain *d)
     spin_lock(&d->event_lock);
 
     list_for_each_entry_safe( entry, temp,
-                              &d->arch.hvm_domain.msixtbl_list, list )
+                              &d->arch.hvm.msixtbl_list, list )
         del_msixtbl_entry(entry);
 
     spin_unlock(&d->event_lock);
@@ -590,13 +592,13 @@ void msixtbl_pt_cleanup(struct domain *d)
 
 void msix_write_completion(struct vcpu *v)
 {
-    unsigned long ctrl_address = v->arch.hvm_vcpu.hvm_io.msix_unmask_address;
-    unsigned long snoop_addr = v->arch.hvm_vcpu.hvm_io.msix_snoop_address;
+    unsigned long ctrl_address = v->arch.hvm.hvm_io.msix_unmask_address;
+    unsigned long snoop_addr = v->arch.hvm.hvm_io.msix_snoop_address;
 
-    v->arch.hvm_vcpu.hvm_io.msix_snoop_address = 0;
+    v->arch.hvm.hvm_io.msix_snoop_address = 0;
 
     if ( !ctrl_address && snoop_addr &&
-         v->arch.hvm_vcpu.hvm_io.msix_snoop_gpa )
+         v->arch.hvm.hvm_io.msix_snoop_gpa )
     {
         const struct msi_desc *desc;
         uint32_t data;
@@ -608,7 +610,7 @@ void msix_write_completion(struct vcpu *v)
 
         if ( desc &&
              hvm_copy_from_guest_phys(&data,
-                                      v->arch.hvm_vcpu.hvm_io.msix_snoop_gpa,
+                                      v->arch.hvm.hvm_io.msix_snoop_gpa,
                                       sizeof(data)) == HVMTRANS_okay &&
              !(data & PCI_MSIX_VECTOR_BITMASK) )
             ctrl_address = snoop_addr;
@@ -617,7 +619,293 @@ void msix_write_completion(struct vcpu *v)
     if ( !ctrl_address )
         return;
 
-    v->arch.hvm_vcpu.hvm_io.msix_unmask_address = 0;
+    v->arch.hvm.hvm_io.msix_unmask_address = 0;
     if ( msixtbl_write(v, ctrl_address, 4, 0) != X86EMUL_OKAY )
         gdprintk(XENLOG_WARNING, "MSI-X write completion failure\n");
 }
+
+#ifdef CONFIG_HAS_VPCI
+static unsigned int msi_gflags(uint16_t data, uint64_t addr, bool masked)
+{
+    /*
+     * We need to use the DOMCTL constants here because the output of this
+     * function is used as input to pt_irq_create_bind, which also takes the
+     * input from the DOMCTL itself.
+     */
+    return MASK_INSR(MASK_EXTR(addr, MSI_ADDR_DEST_ID_MASK),
+                     XEN_DOMCTL_VMSI_X86_DEST_ID_MASK) |
+           MASK_INSR(MASK_EXTR(addr, MSI_ADDR_REDIRECTION_MASK),
+                     XEN_DOMCTL_VMSI_X86_RH_MASK) |
+           MASK_INSR(MASK_EXTR(addr, MSI_ADDR_DESTMODE_MASK),
+                     XEN_DOMCTL_VMSI_X86_DM_MASK) |
+           MASK_INSR(MASK_EXTR(data, MSI_DATA_DELIVERY_MODE_MASK),
+                     XEN_DOMCTL_VMSI_X86_DELIV_MASK) |
+           MASK_INSR(MASK_EXTR(data, MSI_DATA_TRIGGER_MASK),
+                     XEN_DOMCTL_VMSI_X86_TRIG_MASK) |
+           /* NB: by default MSI vectors are bound masked. */
+           (masked ? 0 : XEN_DOMCTL_VMSI_X86_UNMASKED);
+}
+
+static void vpci_mask_pirq(struct domain *d, int pirq, bool mask)
+{
+    unsigned long flags;
+    struct irq_desc *desc = domain_spin_lock_irq_desc(d, pirq, &flags);
+
+    if ( !desc )
+        return;
+    guest_mask_msi_irq(desc, mask);
+    spin_unlock_irqrestore(&desc->lock, flags);
+}
+
+void vpci_msi_arch_mask(struct vpci_msi *msi, const struct pci_dev *pdev,
+                        unsigned int entry, bool mask)
+{
+    vpci_mask_pirq(pdev->domain, msi->arch.pirq + entry, mask);
+}
+
+static int vpci_msi_update(const struct pci_dev *pdev, uint32_t data,
+                           uint64_t address, unsigned int vectors,
+                           unsigned int pirq, uint32_t mask)
+{
+    unsigned int i;
+
+    ASSERT(pcidevs_locked());
+
+    for ( i = 0; i < vectors; i++ )
+    {
+        uint8_t vector = MASK_EXTR(data, MSI_DATA_VECTOR_MASK);
+        uint8_t vector_mask = 0xff >> (8 - fls(vectors) + 1);
+        struct xen_domctl_bind_pt_irq bind = {
+            .machine_irq = pirq + i,
+            .irq_type = PT_IRQ_TYPE_MSI,
+            .u.msi.gvec = (vector & ~vector_mask) |
+                          ((vector + i) & vector_mask),
+            .u.msi.gflags = msi_gflags(data, address, (mask >> i) & 1),
+        };
+        int rc = pt_irq_create_bind(pdev->domain, &bind);
+
+        if ( rc )
+        {
+            gdprintk(XENLOG_ERR,
+                     "%04x:%02x:%02x.%u: failed to bind PIRQ %u: %d\n",
+                     pdev->seg, pdev->bus, PCI_SLOT(pdev->devfn),
+                     PCI_FUNC(pdev->devfn), pirq + i, rc);
+            while ( bind.machine_irq-- > pirq )
+                pt_irq_destroy_bind(pdev->domain, &bind);
+            return rc;
+        }
+    }
+
+    return 0;
+}
+
+int vpci_msi_arch_update(struct vpci_msi *msi, const struct pci_dev *pdev)
+{
+    int rc;
+
+    ASSERT(msi->arch.pirq != INVALID_PIRQ);
+
+    pcidevs_lock();
+    rc = vpci_msi_update(pdev, msi->data, msi->address, msi->vectors,
+                         msi->arch.pirq, msi->mask);
+    if ( rc )
+    {
+        spin_lock(&pdev->domain->event_lock);
+        unmap_domain_pirq(pdev->domain, msi->arch.pirq);
+        spin_unlock(&pdev->domain->event_lock);
+        pcidevs_unlock();
+        msi->arch.pirq = INVALID_PIRQ;
+        return rc;
+    }
+    pcidevs_unlock();
+
+    return 0;
+}
+
+static int vpci_msi_enable(const struct pci_dev *pdev, uint32_t data,
+                           uint64_t address, unsigned int nr,
+                           paddr_t table_base, uint32_t mask)
+{
+    struct msi_info msi_info = {
+        .seg = pdev->seg,
+        .bus = pdev->bus,
+        .devfn = pdev->devfn,
+        .table_base = table_base,
+        .entry_nr = nr,
+    };
+    unsigned vectors = table_base ? 1 : nr;
+    int rc, pirq = INVALID_PIRQ;
+
+    /* Get a PIRQ. */
+    rc = allocate_and_map_msi_pirq(pdev->domain, -1, &pirq,
+                                   table_base ? MAP_PIRQ_TYPE_MSI
+                                              : MAP_PIRQ_TYPE_MULTI_MSI,
+                                   &msi_info);
+    if ( rc )
+    {
+        gdprintk(XENLOG_ERR, "%04x:%02x:%02x.%u: failed to map PIRQ: %d\n",
+                 pdev->seg, pdev->bus, PCI_SLOT(pdev->devfn),
+                 PCI_FUNC(pdev->devfn), rc);
+        return rc;
+    }
+
+    pcidevs_lock();
+    rc = vpci_msi_update(pdev, data, address, vectors, pirq, mask);
+    if ( rc )
+    {
+        spin_lock(&pdev->domain->event_lock);
+        unmap_domain_pirq(pdev->domain, pirq);
+        spin_unlock(&pdev->domain->event_lock);
+        pcidevs_unlock();
+        return rc;
+    }
+    pcidevs_unlock();
+
+    return pirq;
+}
+
+int vpci_msi_arch_enable(struct vpci_msi *msi, const struct pci_dev *pdev,
+                         unsigned int vectors)
+{
+    int rc;
+
+    ASSERT(msi->arch.pirq == INVALID_PIRQ);
+    rc = vpci_msi_enable(pdev, msi->data, msi->address, vectors, 0, msi->mask);
+    if ( rc >= 0 )
+    {
+        msi->arch.pirq = rc;
+        rc = 0;
+    }
+
+    return rc;
+}
+
+static void vpci_msi_disable(const struct pci_dev *pdev, int pirq,
+                             unsigned int nr)
+{
+    unsigned int i;
+
+    ASSERT(pirq != INVALID_PIRQ);
+
+    pcidevs_lock();
+    for ( i = 0; i < nr; i++ )
+    {
+        struct xen_domctl_bind_pt_irq bind = {
+            .machine_irq = pirq + i,
+            .irq_type = PT_IRQ_TYPE_MSI,
+        };
+        int rc;
+
+        rc = pt_irq_destroy_bind(pdev->domain, &bind);
+        ASSERT(!rc);
+    }
+
+    spin_lock(&pdev->domain->event_lock);
+    unmap_domain_pirq(pdev->domain, pirq);
+    spin_unlock(&pdev->domain->event_lock);
+    pcidevs_unlock();
+}
+
+void vpci_msi_arch_disable(struct vpci_msi *msi, const struct pci_dev *pdev)
+{
+    vpci_msi_disable(pdev, msi->arch.pirq, msi->vectors);
+    msi->arch.pirq = INVALID_PIRQ;
+}
+
+void vpci_msi_arch_init(struct vpci_msi *msi)
+{
+    msi->arch.pirq = INVALID_PIRQ;
+}
+
+void vpci_msi_arch_print(const struct vpci_msi *msi)
+{
+    printk("vec=%#02x%7s%6s%3sassert%5s%7s dest_id=%lu pirq: %d\n",
+           MASK_EXTR(msi->data, MSI_DATA_VECTOR_MASK),
+           msi->data & MSI_DATA_DELIVERY_LOWPRI ? "lowest" : "fixed",
+           msi->data & MSI_DATA_TRIGGER_LEVEL ? "level" : "edge",
+           msi->data & MSI_DATA_LEVEL_ASSERT ? "" : "de",
+           msi->address & MSI_ADDR_DESTMODE_LOGIC ? "log" : "phys",
+           msi->address & MSI_ADDR_REDIRECTION_LOWPRI ? "lowest" : "fixed",
+           MASK_EXTR(msi->address, MSI_ADDR_DEST_ID_MASK),
+           msi->arch.pirq);
+}
+
+void vpci_msix_arch_mask_entry(struct vpci_msix_entry *entry,
+                               const struct pci_dev *pdev, bool mask)
+{
+    ASSERT(entry->arch.pirq != INVALID_PIRQ);
+    vpci_mask_pirq(pdev->domain, entry->arch.pirq, mask);
+}
+
+int vpci_msix_arch_enable_entry(struct vpci_msix_entry *entry,
+                                const struct pci_dev *pdev, paddr_t table_base)
+{
+    int rc;
+
+    ASSERT(entry->arch.pirq == INVALID_PIRQ);
+    rc = vpci_msi_enable(pdev, entry->data, entry->addr,
+                         vmsix_entry_nr(pdev->vpci->msix, entry),
+                         table_base, entry->masked);
+    if ( rc >= 0 )
+    {
+        entry->arch.pirq = rc;
+        rc = 0;
+    }
+
+    return rc;
+}
+
+int vpci_msix_arch_disable_entry(struct vpci_msix_entry *entry,
+                                 const struct pci_dev *pdev)
+{
+    if ( entry->arch.pirq == INVALID_PIRQ )
+        return -ENOENT;
+
+    vpci_msi_disable(pdev, entry->arch.pirq, 1);
+    entry->arch.pirq = INVALID_PIRQ;
+
+    return 0;
+}
+
+void vpci_msix_arch_init_entry(struct vpci_msix_entry *entry)
+{
+    entry->arch.pirq = INVALID_PIRQ;
+}
+
+int vpci_msix_arch_print(const struct vpci_msix *msix)
+{
+    unsigned int i;
+
+    for ( i = 0; i < msix->max_entries; i++ )
+    {
+        const struct vpci_msix_entry *entry = &msix->entries[i];
+
+        printk("%6u vec=%02x%7s%6s%3sassert%5s%7s dest_id=%lu mask=%u pirq: %d\n",
+               i, MASK_EXTR(entry->data, MSI_DATA_VECTOR_MASK),
+               entry->data & MSI_DATA_DELIVERY_LOWPRI ? "lowest" : "fixed",
+               entry->data & MSI_DATA_TRIGGER_LEVEL ? "level" : "edge",
+               entry->data & MSI_DATA_LEVEL_ASSERT ? "" : "de",
+               entry->addr & MSI_ADDR_DESTMODE_LOGIC ? "log" : "phys",
+               entry->addr & MSI_ADDR_REDIRECTION_LOWPRI ? "lowest" : "fixed",
+               MASK_EXTR(entry->addr, MSI_ADDR_DEST_ID_MASK),
+               entry->masked, entry->arch.pirq);
+        if ( i && !(i % 64) )
+        {
+            struct pci_dev *pdev = msix->pdev;
+
+            spin_unlock(&msix->pdev->vpci->lock);
+            process_pending_softirqs();
+            /* NB: we assume that pdev cannot go away for an alive domain. */
+            if ( !pdev->vpci || !spin_trylock(&pdev->vpci->lock) )
+                return -EBUSY;
+            if ( pdev->vpci->msix != msix )
+            {
+                spin_unlock(&pdev->vpci->lock);
+                return -EAGAIN;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif /* CONFIG_HAS_VPCI */

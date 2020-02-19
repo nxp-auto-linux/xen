@@ -1,21 +1,21 @@
 /******************************************************************************
  * x86_emulate.h
- * 
+ *
  * Generic x86 (32-bit and 64-bit) instruction decoder and emulator.
- * 
+ *
  * Copyright (c) 2005-2007 Keir Fraser
  * Copyright (c) 2005-2007 XenSource Inc.
- * 
+ *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this program; If not, see <http://www.gnu.org/licenses/>.
  */
@@ -23,7 +23,17 @@
 #ifndef __X86_EMULATE_H__
 #define __X86_EMULATE_H__
 
+#include <xen/lib/x86/cpuid.h>
+
 #define MAX_INST_LEN 15
+
+#if defined(__i386__)
+# define X86_NR_GPRS 8
+#elif defined(__x86_64__)
+# define X86_NR_GPRS 16
+#else
+# error Unknown compilation width
+#endif
 
 struct x86_emulate_ctxt;
 
@@ -150,6 +160,8 @@ struct x86_emul_fpu_aux {
   * strictly expected for now.
  */
 #define X86EMUL_UNRECOGNIZED   X86EMUL_UNIMPLEMENTED
+ /* (cmpxchg accessor): CMPXCHG failed. */
+#define X86EMUL_CMPXCHG_FAILED 7
 
 /* FPU sub-types which may be requested via ->get_fpu(). */
 enum x86_emulate_fpu_type {
@@ -158,13 +170,10 @@ enum x86_emulate_fpu_type {
     X86EMUL_FPU_mmx, /* MMX instruction set (%mm0-%mm7) */
     X86EMUL_FPU_xmm, /* SSE instruction set (%xmm0-%xmm7/15) */
     X86EMUL_FPU_ymm, /* AVX/XOP instruction set (%ymm0-%ymm7/15) */
+    X86EMUL_FPU_opmask, /* AVX512 opmask instruction set (%k0-%k7) */
+    X86EMUL_FPU_zmm, /* AVX512 instruction set (%zmm0-%zmm7/31) */
     /* This sentinel will never be passed to ->get_fpu(). */
     X86EMUL_FPU_none
-};
-
-struct cpuid_leaf
-{
-    uint32_t a, b, c, d;
 };
 
 struct x86_emulate_state;
@@ -172,7 +181,7 @@ struct x86_emulate_state;
 /*
  * These operations represent the instruction emulator's interface to memory,
  * I/O ports, privileged state... pretty much everything other than GPRs.
- * 
+ *
  * NOTES:
  *  1. If the access fails (cannot emulate, or a standard access faults) then
  *     it is up to the memop to propagate the fault to the guest VM via
@@ -237,10 +246,27 @@ struct x86_emulate_ops
         struct x86_emulate_ctxt *ctxt);
 
     /*
-     * cmpxchg: Emulate an atomic (LOCKed) CMPXCHG operation.
+     * rmw: Emulate a memory read-modify-write.
+     * @eflags: [IN/OUT] Pointer to EFLAGS to be updated according to
+     *                   instruction effects.
+     * @state:  [IN/OUT] Pointer to (opaque) emulator state.
+     */
+    int (*rmw)(
+        enum x86_segment seg,
+        unsigned long offset,
+        unsigned int bytes,
+        uint32_t *eflags,
+        struct x86_emulate_state *state,
+        struct x86_emulate_ctxt *ctxt);
+
+    /*
+     * cmpxchg: Emulate a CMPXCHG operation.
      *  @p_old: [IN ] Pointer to value expected to be current at @addr.
+     *          [OUT] Pointer to value found at @addr (may always be
+     *                updated, meaningful for X86EMUL_CMPXCHG_FAILED only).
      *  @p_new: [IN ] Pointer to value to write to @addr.
      *  @bytes: [IN ] Operation size (up to 8 (x86/32) or 16 (x86/64) bytes).
+     *  @lock:  [IN ] atomic (LOCKed) operation
      */
     int (*cmpxchg)(
         enum x86_segment seg,
@@ -248,6 +274,7 @@ struct x86_emulate_ops
         void *p_old,
         void *p_new,
         unsigned int bytes,
+        bool lock,
         struct x86_emulate_ctxt *ctxt);
 
     /*
@@ -390,6 +417,24 @@ struct x86_emulate_ops
         struct x86_emulate_ctxt *ctxt);
 
     /*
+     * read_xcr: Read from extended control register.
+     *  @reg:   [IN ] Register to read.
+     */
+    int (*read_xcr)(
+        unsigned int reg,
+        uint64_t *val,
+        struct x86_emulate_ctxt *ctxt);
+
+    /*
+     * write_xcr: Write to extended control register.
+     *  @reg:   [IN ] Register to write.
+     */
+    int (*write_xcr)(
+        unsigned int reg,
+        uint64_t val,
+        struct x86_emulate_ctxt *ctxt);
+
+    /*
      * read_msr: Read from model-specific register.
      *  @reg:   [IN ] Register to read.
      */
@@ -420,12 +465,8 @@ struct x86_emulate_ops
 
     /*
      * get_fpu: Load emulated environment's FPU state onto processor.
-     *  @exn_callback: On any FPU or SIMD exception, pass control to
-     *                 (*exception_callback)(exception_callback_arg, regs).
      */
     int (*get_fpu)(
-        void (*exception_callback)(void *, struct cpu_user_regs *),
-        void *exception_callback_arg,
         enum x86_emulate_fpu_type type,
         struct x86_emulate_ctxt *ctxt);
 
@@ -601,14 +642,27 @@ int x86_emulate_wrapper(
 #define x86_emulate x86_emulate_wrapper
 #endif
 
+/* Map GPRs by ModRM encoding to their offset within struct cpu_user_regs. */
+extern const uint8_t cpu_user_regs_gpr_offsets[X86_NR_GPRS];
+
 /*
  * Given the 'reg' portion of a ModRM byte, and a register block, return a
  * pointer into the block that addresses the relevant register.
- * @highbyte_regs specifies whether to decode AH,CH,DH,BH.
  */
-void *
-decode_register(
-    uint8_t modrm_reg, struct cpu_user_regs *regs, int highbyte_regs);
+static inline unsigned long *decode_gpr(struct cpu_user_regs *regs,
+                                        unsigned int modrm)
+{
+    /* Check that the array is a power of two. */
+    BUILD_BUG_ON(ARRAY_SIZE(cpu_user_regs_gpr_offsets) &
+                 (ARRAY_SIZE(cpu_user_regs_gpr_offsets) - 1));
+
+    ASSERT(modrm < ARRAY_SIZE(cpu_user_regs_gpr_offsets));
+
+    /* For safety in release builds.  Debug builds will hit the ASSERT() */
+    modrm &= ARRAY_SIZE(cpu_user_regs_gpr_offsets) - 1;
+
+    return (void *)regs + cpu_user_regs_gpr_offsets[modrm];
+}
 
 /* Unhandleable read, write or instruction fetch */
 int
@@ -662,7 +716,25 @@ static inline void x86_emulate_free_state(struct x86_emulate_state *state) {}
 void x86_emulate_free_state(struct x86_emulate_state *state);
 #endif
 
+int x86emul_read_xcr(unsigned int reg, uint64_t *val,
+                     struct x86_emulate_ctxt *ctxt);
+int x86emul_write_xcr(unsigned int reg, uint64_t val,
+                      struct x86_emulate_ctxt *ctxt);
+
+int x86emul_read_dr(unsigned int reg, unsigned long *val,
+                    struct x86_emulate_ctxt *ctxt);
+int x86emul_write_dr(unsigned int reg, unsigned long val,
+                     struct x86_emulate_ctxt *ctxt);
+
 #endif
+
+int
+x86_emul_rmw(
+    void *ptr,
+    unsigned int bytes,
+    uint32_t *eflags,
+    struct x86_emulate_state *state,
+    struct x86_emulate_ctxt *ctxt);
 
 static inline void x86_emul_hw_exception(
     unsigned int vector, int error_code, struct x86_emulate_ctxt *ctxt)

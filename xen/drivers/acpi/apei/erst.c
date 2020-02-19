@@ -2,7 +2,7 @@
  * APEI Error Record Serialization Table support
  *
  * ERST is a way provided by APEI to save and retrieve hardware error
- * infomation to and from a persistent store.
+ * information to and from a persistent store.
  *
  * For more information about ERST, please refer to ACPI Specification
  * version 4.0, section 17.4.
@@ -799,7 +799,7 @@ int __init erst_init(void)
 		printk(KERN_WARNING "Failed to get ERST table: %s\n", msg);
 		return -EINVAL;
 	}
-	map_pages_to_xen((unsigned long)__va(erst_addr), PFN_DOWN(erst_addr),
+	map_pages_to_xen((unsigned long)__va(erst_addr), maddr_to_mfn(erst_addr),
 			 PFN_UP(erst_addr + erst_len) - PFN_DOWN(erst_addr),
 			 PAGE_HYPERVISOR);
 	erst_tab = __va(erst_addr);

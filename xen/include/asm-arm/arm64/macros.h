@@ -1,15 +1,25 @@
 #ifndef __ASM_ARM_ARM64_MACROS_H
 #define __ASM_ARM_ARM64_MACROS_H
 
-/*
- * Emit a 64-bit absolute little endian symbol reference in a way that
- * ensures that it will be resolved at build time, even when building a
- * PIE binary. This requires cooperation from the linker script, which
- * must emit the lo32/hi32 halves individually.
- */
-    .macro	le64sym, sym
-    .long	\sym\()_lo32
-    .long	\sym\()_hi32
+    /*
+     * @dst: Result of get_cpu_info()
+     */
+    .macro  adr_cpu_info, dst
+    add     \dst, sp, #STACK_SIZE
+    and     \dst, \dst, #~(STACK_SIZE - 1)
+    sub     \dst, \dst, #CPUINFO_sizeof
     .endm
 
-#endif /* __ASM_ARM_ARM32_MACROS_H */
+    /*
+     * @dst: Result of READ_ONCE(per_cpu(sym, smp_processor_id()))
+     * @sym: The name of the per-cpu variable
+     * @tmp: scratch register
+     */
+    .macro  ldr_this_cpu, dst, sym, tmp
+    ldr     \dst, =per_cpu__\sym
+    mrs     \tmp, tpidr_el2
+    ldr     \dst, [\dst, \tmp]
+    .endm
+
+#endif /* __ASM_ARM_ARM64_MACROS_H */
+

@@ -2,7 +2,7 @@
  * Explicitly intended for multiple inclusion.
  */
 
-#include <asm/cpuid-autogen.h>
+#include <xen/lib/x86/cpuid-autogen.h>
 
 #define FSCAPINTS FEATURESET_NR_ENTRIES
 
@@ -25,9 +25,9 @@ XEN_CPUFEATURE(XEN_SMAP,        (FSCAPINTS+0)*32+11) /* SMAP gets used by Xen it
 XEN_CPUFEATURE(LFENCE_DISPATCH, (FSCAPINTS+0)*32+12) /* lfence set as Dispatch Serialising */
 XEN_CPUFEATURE(IND_THUNK_LFENCE,(FSCAPINTS+0)*32+13) /* Use IND_THUNK_LFENCE */
 XEN_CPUFEATURE(IND_THUNK_JMP,   (FSCAPINTS+0)*32+14) /* Use IND_THUNK_JMP */
-XEN_CPUFEATURE(XEN_IBPB,        (FSCAPINTS+0)*32+15) /* IBRSB || IBPB */
-XEN_CPUFEATURE(XEN_IBRS_SET,    (FSCAPINTS+0)*32+16) /* IBRSB && IRBS set in Xen */
-XEN_CPUFEATURE(XEN_IBRS_CLEAR,  (FSCAPINTS+0)*32+17) /* IBRSB && IBRS clear in Xen */
-XEN_CPUFEATURE(RSB_NATIVE,      (FSCAPINTS+0)*32+18) /* RSB overwrite needed for native */
-XEN_CPUFEATURE(RSB_VMEXIT,      (FSCAPINTS+0)*32+19) /* RSB overwrite needed for vmexit */
-XEN_CPUFEATURE(NO_XPTI,         (FSCAPINTS+0)*32+20) /* XPTI mitigation not in use */
+XEN_CPUFEATURE(SC_MSR_PV,       (FSCAPINTS+0)*32+16) /* MSR_SPEC_CTRL used by Xen for PV */
+XEN_CPUFEATURE(SC_MSR_HVM,      (FSCAPINTS+0)*32+17) /* MSR_SPEC_CTRL used by Xen for HVM */
+XEN_CPUFEATURE(SC_RSB_PV,       (FSCAPINTS+0)*32+18) /* RSB overwrite needed for PV */
+XEN_CPUFEATURE(SC_RSB_HVM,      (FSCAPINTS+0)*32+19) /* RSB overwrite needed for HVM */
+XEN_CPUFEATURE(SC_MSR_IDLE,     (FSCAPINTS+0)*32+21) /* (SC_MSR_PV || SC_MSR_HVM) && default_xen_spec_ctrl */
+XEN_CPUFEATURE(XEN_LBR,         (FSCAPINTS+0)*32+22) /* Xen uses MSR_DEBUGCTL.LBR */

@@ -23,6 +23,7 @@ struct xenforeignmemory_handle {
     unsigned flags;
     int fd;
     Xentoolcore__Active_Handle tc_ah;
+    int unimpl_errno;
 };
 
 int osdep_xenforeignmemory_open(xenforeignmemory_handle *fmem);
@@ -35,14 +36,51 @@ void *osdep_xenforeignmemory_map(xenforeignmemory_handle *fmem,
 int osdep_xenforeignmemory_unmap(xenforeignmemory_handle *fmem,
                                  void *addr, size_t num);
 
-int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem,
-                                    domid_t domid);
-
 #if defined(__NetBSD__) || defined(__sun__)
 /* Strictly compat for those two only only */
 void *compat_mapforeign_batch(xenforeignmem_handle *fmem, uint32_t dom,
                               void *addr, int prot, int flags,
                               xen_pfn_t *arr, int num);
+#endif
+
+struct xenforeignmemory_resource_handle {
+    domid_t domid;
+    unsigned int type;
+    unsigned int id;
+    unsigned long frame;
+    unsigned long nr_frames;
+    void *addr;
+    int prot;
+    int flags;
+};
+
+#ifndef __linux__
+static inline int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem,
+                                                  domid_t domid)
+{
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
+static inline int osdep_xenforeignmemory_map_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres)
+{
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
+static inline int osdep_xenforeignmemory_unmap_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres)
+{
+    return 0;
+}
+#else
+int osdep_xenforeignmemory_restrict(xenforeignmemory_handle *fmem,
+                                    domid_t domid);
+int osdep_xenforeignmemory_map_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres);
+int osdep_xenforeignmemory_unmap_resource(
+    xenforeignmemory_handle *fmem, xenforeignmemory_resource_handle *fres);
 #endif
 
 #define PERROR(_f...) \

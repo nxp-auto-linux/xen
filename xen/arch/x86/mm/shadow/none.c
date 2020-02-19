@@ -37,7 +37,7 @@ static int _page_fault(struct vcpu *v, unsigned long va,
     return 0;
 }
 
-static bool _invlpg(struct vcpu *v, unsigned long va)
+static bool _invlpg(struct vcpu *v, unsigned long linear)
 {
     ASSERT_UNREACHABLE();
     return true;
@@ -50,7 +50,7 @@ static unsigned long _gva_to_gfn(struct vcpu *v, struct p2m_domain *p2m,
     return gfn_x(INVALID_GFN);
 }
 
-static void _update_cr3(struct vcpu *v, int do_locking)
+static void _update_cr3(struct vcpu *v, int do_locking, bool noflush)
 {
     ASSERT_UNREACHABLE();
 }
@@ -60,11 +60,12 @@ static void _update_paging_modes(struct vcpu *v)
     ASSERT_UNREACHABLE();
 }
 
-static void _write_p2m_entry(struct domain *d, unsigned long gfn,
-                             l1_pgentry_t *p, l1_pgentry_t new,
-                             unsigned int level)
+static int _write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
+                            l1_pgentry_t *p, l1_pgentry_t new,
+                            unsigned int level)
 {
     ASSERT_UNREACHABLE();
+    return -EOPNOTSUPP;
 }
 
 static const struct paging_mode sh_paging_none = {

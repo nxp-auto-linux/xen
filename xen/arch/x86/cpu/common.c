@@ -3,6 +3,7 @@
 #include <xen/delay.h>
 #include <xen/smp.h>
 #include <asm/current.h>
+#include <asm/debugreg.h>
 #include <asm/processor.h>
 #include <asm/xstate.h>
 #include <asm/msr.h>
@@ -10,10 +11,10 @@
 #include <asm/mpspec.h>
 #include <asm/apic.h>
 #include <mach_apic.h>
-#include <asm/setup.h>
 #include <public/sysctl.h> /* for XEN_INVALID_{SOCKET,CORE}_ID */
 
 #include "cpu.h"
+#include "mcheck/x86_mca.h"
 
 bool_t opt_arat = 1;
 boolean_param("arat", opt_arat);
@@ -47,12 +48,6 @@ unsigned int paddr_bits __read_mostly = 36;
 unsigned int hap_paddr_bits __read_mostly = 36;
 unsigned int vaddr_bits __read_mostly = VADDR_BITS;
 
-/*
- * Default host IA32_CR_PAT value to cover all memory types.
- * BIOS usually sets it to 0x07040600070406.
- */
-u64 host_pat = 0x050100070406;
-
 static unsigned int cleared_caps[NCAPINTS];
 static unsigned int forced_caps[NCAPINTS];
 
@@ -69,7 +64,7 @@ void __init setup_clear_cpu_cap(unsigned int cap)
 		       __builtin_return_address(0), cap);
 
 	__clear_bit(cap, boot_cpu_data.x86_capability);
-	dfs = lookup_deep_deps(cap);
+	dfs = x86_cpuid_lookup_deep_deps(cap);
 
 	if (!dfs)
 		return;
@@ -119,8 +114,13 @@ void (* __read_mostly ctxt_switch_masking)(const struct vcpu *next);
 bool __init probe_cpuid_faulting(void)
 {
 	uint64_t val;
+	int rc;
 
-	if (rdmsr_safe(MSR_INTEL_PLATFORM_INFO, val) ||
+	if ((rc = rdmsr_safe(MSR_INTEL_PLATFORM_INFO, val)) == 0)
+		raw_msr_policy.plaform_info.cpuid_faulting =
+			val & MSR_PLATFORM_INFO_CPUID_FAULTING;
+
+	if (rc ||
 	    !(val & MSR_PLATFORM_INFO_CPUID_FAULTING) ||
 	    rdmsr_safe(MSR_INTEL_MISC_FEATURES_ENABLES,
 		       this_cpu(msr_misc_features)))
@@ -179,7 +179,7 @@ void ctxt_switch_levelling(const struct vcpu *next)
 		 */
 		set_cpuid_faulting(nextd && !is_control_domain(nextd) &&
 				   (is_pv_domain(nextd) ||
-				    next->arch.msr->
+				    next->arch.msrs->
 				    misc_features_enables.cpuid_faulting));
 		return;
 	}
@@ -345,6 +345,9 @@ static void __init early_cpu_detect(void)
 			hap_paddr_bits = PADDR_BITS;
 	}
 
+	if (c->x86_vendor != X86_VENDOR_AMD)
+		park_offline_cpus = opt_mce;
+
 	initialize_cpu_data(0);
 }
 
@@ -490,6 +493,9 @@ void identify_cpu(struct cpuinfo_x86 *c)
 		printk(" %08x", c->x86_capability[i]);
 	printk("\n");
 #endif
+
+	if (system_state == SYS_STATE_resume)
+		return;
 
 	/*
 	 * On SMP, boot_cpu_data holds the common feature set between
@@ -699,6 +705,7 @@ void __init early_cpu_init(void)
 	intel_cpu_init();
 	amd_init_cpu();
 	centaur_init_cpu();
+	shanghai_init_cpu();
 	early_cpu_detect();
 }
 
@@ -717,9 +724,9 @@ void load_system_tables(void)
 		stack_top = stack_bottom & ~(STACK_SIZE - 1);
 
 	struct tss_struct *tss = &this_cpu(init_tss);
-	struct desc_struct *gdt =
+	seg_desc_t *gdt =
 		this_cpu(gdt_table) - FIRST_RESERVED_GDT_ENTRY;
-	struct desc_struct *compat_gdt =
+	seg_desc_t *compat_gdt =
 		this_cpu(compat_gdt_table) - FIRST_RESERVED_GDT_ENTRY;
 
 	const struct desc_ptr gdtr = {
@@ -747,6 +754,7 @@ void load_system_tables(void)
 			[IST_MCE - 1] = stack_top + IST_MCE * PAGE_SIZE,
 			[IST_DF  - 1] = stack_top + IST_DF  * PAGE_SIZE,
 			[IST_NMI - 1] = stack_top + IST_NMI * PAGE_SIZE,
+			[IST_DB  - 1] = stack_top + IST_DB  * PAGE_SIZE,
 
 			[IST_MAX ... ARRAY_SIZE(tss->ist) - 1] =
 				0x8600111111111111ul,
@@ -766,14 +774,12 @@ void load_system_tables(void)
 		offsetof(struct tss_struct, __cacheline_filler) - 1,
 		SYS_DESC_tss_busy);
 
-	asm volatile ("lgdt %0"  : : "m"  (gdtr) );
-	asm volatile ("lidt %0"  : : "m"  (idtr) );
-	asm volatile ("ltr  %w0" : : "rm" (TSS_ENTRY << 3) );
-	asm volatile ("lldt %w0" : : "rm" (0) );
+	lgdt(&gdtr);
+	lidt(&idtr);
+	ltr(TSS_ENTRY << 3);
+	lldt(0);
 
-	set_ist(&idt_tables[cpu][TRAP_double_fault],  IST_DF);
-	set_ist(&idt_tables[cpu][TRAP_nmi],	      IST_NMI);
-	set_ist(&idt_tables[cpu][TRAP_machine_check], IST_MCE);
+	enable_each_ist(idt_tables[cpu]);
 
 	/*
 	 * Bottom-of-stack must be 16-byte aligned!
@@ -802,8 +808,7 @@ void cpu_init(void)
 	if (opt_cpu_info)
 		printk("Initializing CPU#%d\n", cpu);
 
-	if (cpu_has_pat)
-		wrmsrl(MSR_IA32_CR_PAT, host_pat);
+	wrmsrl(MSR_IA32_CR_PAT, XEN_MSR_PAT);
 
 	/* Install correct page table. */
 	write_ptbase(current);
@@ -811,10 +816,16 @@ void cpu_init(void)
 	/* Ensure FPU gets initialised for each domain. */
 	stts();
 
-	/* Clear all 6 debug registers: */
-#define CD(register) asm volatile ( "mov %0,%%db" #register : : "r"(0UL) );
-	CD(0); CD(1); CD(2); CD(3); /* no db4 and db5 */; CD(6); CD(7);
-#undef CD
+	/* Reset debug registers: */
+	write_debugreg(0, 0);
+	write_debugreg(1, 0);
+	write_debugreg(2, 0);
+	write_debugreg(3, 0);
+	write_debugreg(6, X86_DR6_DEFAULT);
+	write_debugreg(7, X86_DR7_DEFAULT);
+
+	/* Enable NMIs.  Our loader (e.g. Tboot) may have left them disabled. */
+	enable_nmis();
 }
 
 void cpu_uninit(unsigned int cpu)

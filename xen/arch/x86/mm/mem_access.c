@@ -23,11 +23,13 @@
 
 #include <xen/guest_access.h> /* copy_from_guest() */
 #include <xen/mem_access.h>
+#include <xen/nospec.h>
 #include <xen/vm_event.h>
 #include <xen/event.h>
 #include <public/vm_event.h>
 #include <asm/p2m.h>
 #include <asm/altp2m.h>
+#include <asm/hvm/emulate.h>
 #include <asm/vm_event.h>
 
 #include "mm-locks.h"
@@ -137,6 +139,7 @@ bool p2m_mem_access_emulate_check(struct vcpu *v,
     return violation;
 }
 
+#ifdef CONFIG_HVM
 bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
                           struct npfec npfec,
                           vm_event_request_t **req_ptr)
@@ -207,6 +210,14 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
             return true;
         }
     }
+    if ( vm_event_check_ring(d->vm_event_monitor) &&
+         d->arch.monitor.inguest_pagefault_disabled &&
+         npfec.kind != npfec_kind_with_gla ) /* don't send a mem_event */
+    {
+        hvm_emulate_one_vm_event(EMUL_KIND_NORMAL, TRAP_invalid_op, X86_EVENT_NO_EC);
+
+        return true;
+    }
 
     *req_ptr = NULL;
     req = xzalloc(vm_event_request_t);
@@ -217,16 +228,24 @@ bool p2m_mem_access_check(paddr_t gpa, unsigned long gla,
         req->reason = VM_EVENT_REASON_MEM_ACCESS;
         req->u.mem_access.gfn = gfn_x(gfn);
         req->u.mem_access.offset = gpa & ((1 << PAGE_SHIFT) - 1);
+
         if ( npfec.gla_valid )
         {
             req->u.mem_access.flags |= MEM_ACCESS_GLA_VALID;
             req->u.mem_access.gla = gla;
-
-            if ( npfec.kind == npfec_kind_with_gla )
-                req->u.mem_access.flags |= MEM_ACCESS_FAULT_WITH_GLA;
-            else if ( npfec.kind == npfec_kind_in_gpt )
-                req->u.mem_access.flags |= MEM_ACCESS_FAULT_IN_GPT;
         }
+
+        switch ( npfec.kind )
+        {
+        case npfec_kind_with_gla:
+            req->u.mem_access.flags |= MEM_ACCESS_FAULT_WITH_GLA;
+            break;
+
+        case npfec_kind_in_gpt:
+            req->u.mem_access.flags |= MEM_ACCESS_FAULT_IN_GPT;
+            break;
+        }
+
         req->u.mem_access.flags |= npfec.read_access    ? MEM_ACCESS_R : 0;
         req->u.mem_access.flags |= npfec.write_access   ? MEM_ACCESS_W : 0;
         req->u.mem_access.flags |= npfec.insn_fetch     ? MEM_ACCESS_X : 0;
@@ -273,9 +292,13 @@ int p2m_set_altp2m_mem_access(struct domain *d, struct p2m_domain *hp2m,
         }
     }
 
-    return ap2m->set_entry(ap2m, gfn, mfn, PAGE_ORDER_4K, t, a,
-                           current->domain != d);
+    /*
+     * Inherit the old suppress #VE bit value if it is already set, or set it
+     * to 1 otherwise
+     */
+    return ap2m->set_entry(ap2m, gfn, mfn, PAGE_ORDER_4K, t, a, -1);
 }
+#endif
 
 static int set_mem_access(struct domain *d, struct p2m_domain *p2m,
                           struct p2m_domain *ap2m, p2m_access_t a,
@@ -283,6 +306,7 @@ static int set_mem_access(struct domain *d, struct p2m_domain *p2m,
 {
     int rc = 0;
 
+#ifdef CONFIG_HVM
     if ( ap2m )
     {
         rc = p2m_set_altp2m_mem_access(d, p2m, ap2m, a, gfn);
@@ -291,6 +315,9 @@ static int set_mem_access(struct domain *d, struct p2m_domain *p2m,
             rc = 0;
     }
     else
+#else
+    ASSERT(!ap2m);
+#endif
     {
         mfn_t mfn;
         p2m_access_t _a;
@@ -325,6 +352,7 @@ static bool xenmem_access_to_p2m_access(struct p2m_domain *p2m,
     switch ( xaccess )
     {
     case 0 ... ARRAY_SIZE(memaccess) - 1:
+        xaccess = array_index_nospec(xaccess, ARRAY_SIZE(memaccess));
         *paccess = memaccess[xaccess];
         break;
     case XENMEM_access_default:
@@ -351,6 +379,7 @@ long p2m_set_mem_access(struct domain *d, gfn_t gfn, uint32_t nr,
     long rc = 0;
 
     /* altp2m view 0 is treated as the hostp2m */
+#ifdef CONFIG_HVM
     if ( altp2m_idx )
     {
         if ( altp2m_idx >= MAX_ALTP2M ||
@@ -359,6 +388,9 @@ long p2m_set_mem_access(struct domain *d, gfn_t gfn, uint32_t nr,
 
         ap2m = d->arch.altp2m_p2m[altp2m_idx];
     }
+#else
+    ASSERT(!altp2m_idx);
+#endif
 
     if ( !xenmem_access_to_p2m_access(p2m, access, &a) )
         return -EINVAL;
@@ -406,6 +438,7 @@ long p2m_set_mem_access_multi(struct domain *d,
     long rc = 0;
 
     /* altp2m view 0 is treated as the hostp2m */
+#ifdef CONFIG_HVM
     if ( altp2m_idx )
     {
         if ( altp2m_idx >= MAX_ALTP2M ||
@@ -414,6 +447,9 @@ long p2m_set_mem_access_multi(struct domain *d,
 
         ap2m = d->arch.altp2m_p2m[altp2m_idx];
     }
+#else
+    ASSERT(!altp2m_idx);
+#endif
 
     p2m_lock(p2m);
     if ( ap2m )
@@ -458,11 +494,56 @@ long p2m_set_mem_access_multi(struct domain *d,
     return rc;
 }
 
-int p2m_get_mem_access(struct domain *d, gfn_t gfn, xenmem_access_t *access)
+int p2m_get_mem_access(struct domain *d, gfn_t gfn, xenmem_access_t *access,
+                       unsigned int altp2m_idx)
 {
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
 
+#ifdef CONFIG_HVM
+    if ( !altp2m_active(d) )
+    {
+        if ( altp2m_idx )
+            return -EINVAL;
+    }
+    else
+    {
+        if ( altp2m_idx >= MAX_ALTP2M ||
+             d->arch.altp2m_eptp[altp2m_idx] == mfn_x(INVALID_MFN) )
+            return -EINVAL;
+
+        p2m = d->arch.altp2m_p2m[altp2m_idx];
+    }
+#else
+    ASSERT(!altp2m_idx);
+#endif
+
     return _p2m_get_mem_access(p2m, gfn, access);
+}
+
+void arch_p2m_set_access_required(struct domain *d, bool access_required)
+{
+    ASSERT(atomic_read(&d->pause_count));
+
+    p2m_get_hostp2m(d)->access_required = access_required;
+
+#ifdef CONFIG_HVM
+    if ( altp2m_active(d) )
+    {
+        unsigned int i;
+        for ( i = 0; i < MAX_ALTP2M; i++ )
+        {
+            struct p2m_domain *p2m = d->arch.altp2m_p2m[i];
+
+            if ( p2m )
+                p2m->access_required = access_required;
+        }
+    }
+#endif
+}
+
+bool p2m_mem_access_sanity_check(const struct domain *d)
+{
+    return is_hvm_domain(d) && cpu_has_vmx && hap_enabled(d);
 }
 
 /*

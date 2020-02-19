@@ -30,8 +30,9 @@
 #include <time.h>
 #include <xenstore.h>
 
+#include <xen-tools/libs.h>
+
 #define TEST_PATH "xenstore-test"
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define WRITE_BUFFERS_N    10
 #define WRITE_BUFFERS_SIZE 4000
 #define MAX_TA_LOOPS       100
@@ -65,7 +66,7 @@ static int call_test(struct test *tst, int iters, bool no_clock)
     char *stage = "?";
     struct timespec tp1, tp2;
     uint64_t nsec, nsec_min, nsec_max, nsec_sum;
-    int i, ret;
+    int i, ret = 0;
 
     nsec_min = -1;
     nsec_max = 0;
@@ -155,7 +156,7 @@ static int verify_node(char *node, char *data, unsigned int size)
     if ( !buf )
         return errno;
 
-    ret = (len == size && !memcmp(buf, data, len)) ? 0 : ENODATA;
+    ret = (len == size && !memcmp(buf, data, len)) ? 0 : ENOENT;
     free(buf);
 
     return ret;
@@ -237,10 +238,10 @@ static int test_dir_deinit(uintptr_t par)
             if ( dir[i][0] == 'a' + j && dir[i][1] == 0 )
                 break;
         if ( i == num )
-            rc = ENODATA;
+            rc = ENOENT;
     }
     if ( num != WRITE_BUFFERS_N )
-            rc = ENODATA;
+            rc = ENOENT;
     free(dir);
     return rc;
 }
@@ -320,14 +321,14 @@ static int test_ta2(uintptr_t par)
         buf = xs_read(xsh, t, paths[0], &len);
         if ( !buf )
             goto out;
-        errno = (len == 1 && buf[0] == 'b') ? 0 : ENODATA;
+        errno = (len == 1 && buf[0] == 'b') ? 0 : ENOENT;
         free(buf);
         if ( errno )
             goto out;
         buf = xs_read(xsh, XBT_NULL, paths[0], &len);
         if ( !buf )
             goto out;
-        errno = (len == 1 && buf[0] == 'a') ? 0 : ENODATA;
+        errno = (len == 1 && buf[0] == 'a') ? 0 : ENOENT;
         free(buf);
         if ( errno )
             goto out;
@@ -375,7 +376,7 @@ static int test_ta3(uintptr_t par)
     buf = xs_read(xsh, t, paths[0], &len);
     if ( !buf )
         goto out;
-    errno = (len == 1 && buf[0] == 'a') ? 0 : ENODATA;
+    errno = (len == 1 && buf[0] == 'a') ? 0 : ENOENT;
     free(buf);
     if ( errno )
         goto out;
@@ -384,12 +385,12 @@ static int test_ta3(uintptr_t par)
     buf = xs_read(xsh, t, paths[0], &len);
     if ( !buf )
         goto out;
-    errno = (len == 1 && buf[0] == 'c') ? 0 : ENODATA;
+    errno = (len == 1 && buf[0] == 'c') ? 0 : ENOENT;
     free(buf);
     if ( errno )
         goto out;
     if ( xs_transaction_end(xsh, t, false) || errno != EAGAIN )
-        return ENODATA;
+        return ENOENT;
     return 0;
 
  out:

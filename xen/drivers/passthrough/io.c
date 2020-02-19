@@ -434,12 +434,12 @@ int pt_irq_create_bind(
             if ( vcpu )
                 pirq_dpci->gmsi.posted = true;
         }
-        if ( dest_vcpu_id >= 0 )
-            hvm_migrate_pirqs(d->vcpu[dest_vcpu_id]);
+        if ( vcpu && iommu_enabled )
+            hvm_migrate_pirq(pirq_dpci, vcpu);
 
         /* Use interrupt posting if it is supported. */
         if ( iommu_intpost )
-            pi_update_irte(vcpu ? &vcpu->arch.hvm_vmx.pi_desc : NULL,
+            pi_update_irte(vcpu ? &vcpu->arch.hvm.vmx.pi_desc : NULL,
                            info, pirq_dpci->gmsi.gvec);
 
         if ( pt_irq_bind->u.msi.gflags & XEN_DOMCTL_VMSI_X86_UNMASKED )
@@ -645,7 +645,22 @@ int pt_irq_destroy_bind(
         }
         break;
     case PT_IRQ_TYPE_MSI:
+    {
+        unsigned long flags;
+        struct irq_desc *desc = domain_spin_lock_irq_desc(d, machine_gsi,
+                                                          &flags);
+
+        if ( !desc )
+            return -EINVAL;
+        /*
+         * Leave the MSI masked, so that the state when calling
+         * pt_irq_create_bind is consistent across bind/unbinds.
+         */
+        guest_mask_msi_irq(desc, true);
+        spin_unlock_irqrestore(&desc->lock, flags);
         break;
+    }
+
     default:
         return -EOPNOTSUPP;
     }
@@ -854,7 +869,8 @@ static int _hvm_dpci_msi_eoi(struct domain *d,
 
 void hvm_dpci_msi_eoi(struct domain *d, int vector)
 {
-    if ( !iommu_enabled || !hvm_domain_irq(d)->dpci )
+    if ( !iommu_enabled ||
+         (!hvm_domain_irq(d)->dpci && !is_hardware_domain(d)) )
        return;
 
     spin_lock(&d->event_lock);

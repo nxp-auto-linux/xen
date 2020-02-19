@@ -51,16 +51,19 @@
 #define GICH_V2_LR_PHYSICAL_SHIFT  10
 #define GICH_V2_LR_STATE_MASK      0x3
 #define GICH_V2_LR_STATE_SHIFT     28
+#define GICH_V2_LR_PENDING         (1U << 28)
+#define GICH_V2_LR_ACTIVE          (1U << 29)
 #define GICH_V2_LR_PRIORITY_SHIFT  23
 #define GICH_V2_LR_PRIORITY_MASK   0x1f
 #define GICH_V2_LR_HW_SHIFT        31
 #define GICH_V2_LR_HW_MASK         0x1
 #define GICH_V2_LR_GRP_SHIFT       30
 #define GICH_V2_LR_GRP_MASK        0x1
-#define GICH_V2_LR_MAINTENANCE_IRQ (1<<19)
-#define GICH_V2_LR_GRP1            (1<<30)
-#define GICH_V2_LR_HW              (1<<31)
-#define GICH_V2_LR_CPUID_SHIFT     9
+#define GICH_V2_LR_MAINTENANCE_IRQ (1U << 19)
+#define GICH_V2_LR_GRP1            (1U << 30)
+#define GICH_V2_LR_HW              (1U << GICH_V2_LR_HW_SHIFT)
+#define GICH_V2_LR_CPUID_SHIFT     10
+#define GICH_V2_LR_CPUID_MASK      0x7
 #define GICH_V2_VTR_NRLRGS         0x3f
 
 #define GICH_V2_VMCR_PRIORITY_MASK   0x1f
@@ -235,6 +238,59 @@ static unsigned int gicv2_read_irq(void)
     return (readl_gicc(GICC_IAR) & GICC_IA_IRQ);
 }
 
+static void gicv2_poke_irq(struct irq_desc *irqd, uint32_t offset)
+{
+    writel_gicd(1U << (irqd->irq % 32), offset + (irqd->irq / 32) * 4);
+}
+
+static bool gicv2_peek_irq(struct irq_desc *irqd, uint32_t offset)
+{
+    uint32_t reg;
+
+    reg = readl_gicd(offset + (irqd->irq / 32) * 4) & (1U << (irqd->irq % 32));
+
+    return reg;
+}
+
+/*
+ * This is forcing the active state of an interrupt, somewhat circumventing
+ * the normal interrupt flow and the GIC state machine. So use with care
+ * and only if you know what you are doing. For this reason we also have to
+ * tinker with the _IRQ_INPROGRESS bit here, since the normal IRQ handler
+ * will not be involved.
+ */
+static void gicv2_set_active_state(struct irq_desc *irqd, bool active)
+{
+    ASSERT(spin_is_locked(&irqd->lock));
+
+    if ( active )
+    {
+        set_bit(_IRQ_INPROGRESS, &irqd->status);
+        gicv2_poke_irq(irqd, GICD_ISACTIVER);
+    }
+    else
+    {
+        clear_bit(_IRQ_INPROGRESS, &irqd->status);
+        gicv2_poke_irq(irqd, GICD_ICACTIVER);
+    }
+}
+
+static void gicv2_set_pending_state(struct irq_desc *irqd, bool pending)
+{
+    ASSERT(spin_is_locked(&irqd->lock));
+
+    if ( pending )
+    {
+        /* The _IRQ_INPROGRESS bit will be set when the interrupt fires. */
+        gicv2_poke_irq(irqd, GICD_ISPENDR);
+    }
+    else
+    {
+        /* The _IRQ_INPROGRESS remains unchanged. */
+        gicv2_poke_irq(irqd, GICD_ICPENDR);
+    }
+}
+
 static void gicv2_set_irq_type(struct irq_desc *desc, unsigned int type)
 {
     uint32_t cfg, actual, edgebit;
@@ -297,6 +353,10 @@ static void __init gicv2_dist_init(void)
 
     type = readl_gicd(GICD_TYPER);
     nr_lines = 32 * ((type & GICD_TYPE_LINES) + 1);
+    /* Only 1020 interrupts are supported */
+    nr_lines = min(1020U, nr_lines);
+    gicv2_info.nr_lines = nr_lines;
+
     gic_cpus = 1 + ((type & GICD_TYPE_CPUS) >> 5);
     printk("GICv2: %d lines, %d cpu%s%s (IID %8.8x).\n",
            nr_lines, gic_cpus, (gic_cpus == 1) ? "" : "s",
@@ -319,10 +379,10 @@ static void __init gicv2_dist_init(void)
 
     /* Disable all global interrupts */
     for ( i = 32; i < nr_lines; i += 32 )
+    {
         writel_gicd(~0x0, GICD_ICENABLER + (i / 32) * 4);
-
-    /* Only 1020 interrupts are supported */
-    gicv2_info.nr_lines = min(1020U, nr_lines);
+        writel_gicd(~0x0, GICD_ICACTIVER + (i / 32) * 4);
+    }
 
     /* Turn on the distributor */
     writel_gicd(GICD_CTL_ENABLE, GICD_CTLR);
@@ -337,6 +397,7 @@ static void gicv2_cpu_init(void)
     /* The first 32 interrupts (PPI and SGI) are banked per-cpu, so
      * even though they are controlled with GICD registers, they must
      * be set up here with the other per-cpu state. */
+    writel_gicd(0xffffffff, GICD_ICACTIVER); /* Diactivate PPIs and SGIs */
     writel_gicd(0xffff0000, GICD_ICENABLER); /* Disable all PPI */
     writel_gicd(0x0000ffff, GICD_ISENABLER); /* Enable all SGI */
 
@@ -399,6 +460,12 @@ static void gicv2_send_SGI(enum gic_sgi sgi, enum gic_sgi_mode irqmode,
     unsigned int mask = 0;
     cpumask_t online_mask;
 
+    /*
+     * Ensure that stores to Normal memory are visible to the other CPUs
+     * before they observe us issuing the IPI.
+     */
+    dmb(ishst);
+
     switch ( irqmode )
     {
     case SGI_TARGET_OTHERS:
@@ -428,8 +495,8 @@ static void gicv2_disable_interface(void)
     spin_unlock(&gicv2.lock);
 }
 
-static void gicv2_update_lr(int lr, const struct pending_irq *p,
-                            unsigned int state)
+static void gicv2_update_lr(int lr, unsigned int virq, uint8_t priority,
+                            unsigned int hw_irq, unsigned int state)
 {
     uint32_t lr_reg;
 
@@ -437,12 +504,12 @@ static void gicv2_update_lr(int lr, const struct pending_irq *p,
     BUG_ON(lr < 0);
 
     lr_reg = (((state & GICH_V2_LR_STATE_MASK) << GICH_V2_LR_STATE_SHIFT)  |
-              ((GIC_PRI_TO_GUEST(p->priority) & GICH_V2_LR_PRIORITY_MASK)
-                                             << GICH_V2_LR_PRIORITY_SHIFT) |
-              ((p->irq & GICH_V2_LR_VIRTUAL_MASK) << GICH_V2_LR_VIRTUAL_SHIFT));
+              ((GIC_PRI_TO_GUEST(priority) & GICH_V2_LR_PRIORITY_MASK)
+                                          << GICH_V2_LR_PRIORITY_SHIFT) |
+              ((virq & GICH_V2_LR_VIRTUAL_MASK) << GICH_V2_LR_VIRTUAL_SHIFT));
 
-    if ( p->desc != NULL )
-        lr_reg |= GICH_V2_LR_HW | ((p->desc->irq & GICH_V2_LR_PHYSICAL_MASK )
+    if ( hw_irq != INVALID_IRQ )
+        lr_reg |= GICH_V2_LR_HW | ((hw_irq & GICH_V2_LR_PHYSICAL_MASK )
                                    << GICH_V2_LR_PHYSICAL_SHIFT);
 
     writel_gich(lr_reg, GICH_LR + lr * 4);
@@ -458,27 +525,59 @@ static void gicv2_read_lr(int lr, struct gic_lr *lr_reg)
     uint32_t lrv;
 
     lrv          = readl_gich(GICH_LR + lr * 4);
-    lr_reg->pirq = (lrv >> GICH_V2_LR_PHYSICAL_SHIFT) & GICH_V2_LR_PHYSICAL_MASK;
     lr_reg->virq = (lrv >> GICH_V2_LR_VIRTUAL_SHIFT) & GICH_V2_LR_VIRTUAL_MASK;
     lr_reg->priority = (lrv >> GICH_V2_LR_PRIORITY_SHIFT) & GICH_V2_LR_PRIORITY_MASK;
-    lr_reg->state     = (lrv >> GICH_V2_LR_STATE_SHIFT) & GICH_V2_LR_STATE_MASK;
-    lr_reg->hw_status = (lrv >> GICH_V2_LR_HW_SHIFT) & GICH_V2_LR_HW_MASK;
-    lr_reg->grp       = (lrv >> GICH_V2_LR_GRP_SHIFT) & GICH_V2_LR_GRP_MASK;
+    lr_reg->pending = lrv & GICH_V2_LR_PENDING;
+    lr_reg->active = lrv & GICH_V2_LR_ACTIVE;
+    lr_reg->hw_status = lrv & GICH_V2_LR_HW;
+
+    if ( lr_reg->hw_status )
+    {
+        lr_reg->hw.pirq = lrv >> GICH_V2_LR_PHYSICAL_SHIFT;
+        lr_reg->hw.pirq &= GICH_V2_LR_PHYSICAL_MASK;
+    }
+    else
+    {
+        lr_reg->virt.eoi = (lrv & GICH_V2_LR_MAINTENANCE_IRQ);
+        /*
+         * This is only valid for SGI, but it does not matter to always
+         * read it as it should be 0 by default.
+         */
+        lr_reg->virt.source = (lrv >> GICH_V2_LR_CPUID_SHIFT)
+            & GICH_V2_LR_CPUID_MASK;
+    }
 }
 
 static void gicv2_write_lr(int lr, const struct gic_lr *lr_reg)
 {
     uint32_t lrv = 0;
 
-    lrv = ( ((lr_reg->pirq & GICH_V2_LR_PHYSICAL_MASK) << GICH_V2_LR_PHYSICAL_SHIFT) |
-          ((lr_reg->virq & GICH_V2_LR_VIRTUAL_MASK) << GICH_V2_LR_VIRTUAL_SHIFT)   |
+    lrv = (((lr_reg->virq & GICH_V2_LR_VIRTUAL_MASK) << GICH_V2_LR_VIRTUAL_SHIFT)   |
           ((uint32_t)(lr_reg->priority & GICH_V2_LR_PRIORITY_MASK)
-                                      << GICH_V2_LR_PRIORITY_SHIFT) |
-          ((uint32_t)(lr_reg->state & GICH_V2_LR_STATE_MASK)
-                                   << GICH_V2_LR_STATE_SHIFT) |
-          ((uint32_t)(lr_reg->hw_status & GICH_V2_LR_HW_MASK)
-                                       << GICH_V2_LR_HW_SHIFT)  |
-          ((uint32_t)(lr_reg->grp & GICH_V2_LR_GRP_MASK) << GICH_V2_LR_GRP_SHIFT) );
+                                      << GICH_V2_LR_PRIORITY_SHIFT) );
+
+    if ( lr_reg->active )
+        lrv |= GICH_V2_LR_ACTIVE;
+
+    if ( lr_reg->pending )
+        lrv |= GICH_V2_LR_PENDING;
+
+    if ( lr_reg->hw_status )
+    {
+        lrv |= GICH_V2_LR_HW;
+        lrv |= lr_reg->hw.pirq << GICH_V2_LR_PHYSICAL_SHIFT;
+    }
+    else
+    {
+        if ( lr_reg->virt.eoi )
+            lrv |= GICH_V2_LR_MAINTENANCE_IRQ;
+        /*
+         * Source is only valid for SGIs, the caller should make sure
+         * the field virt.source is always 0 for non-SGI.
+         */
+        ASSERT(!lr_reg->virt.source || lr_reg->virq < NR_GIC_SGI);
+        lrv |= (uint32_t)lr_reg->virt.source << GICH_V2_LR_CPUID_SHIFT;
+    }
 
     writel_gich(lrv, GICH_LR + lr * 4);
 }
@@ -506,10 +605,14 @@ static unsigned int gicv2_read_apr(int apr_reg)
    return readl_gich(GICH_APR);
 }
 
+static bool gicv2_read_pending_state(struct irq_desc *irqd)
+{
+    return gicv2_peek_irq(irqd, GICD_ISPENDR);
+}
+
 static void gicv2_irq_enable(struct irq_desc *desc)
 {
     unsigned long flags;
-    int irq = desc->irq;
 
     ASSERT(spin_is_locked(&desc->lock));
 
@@ -517,20 +620,19 @@ static void gicv2_irq_enable(struct irq_desc *desc)
     clear_bit(_IRQ_DISABLED, &desc->status);
     dsb(sy);
     /* Enable routing */
-    writel_gicd((1u << (irq % 32)), GICD_ISENABLER + (irq / 32) * 4);
+    gicv2_poke_irq(desc, GICD_ISENABLER);
     spin_unlock_irqrestore(&gicv2.lock, flags);
 }
 
 static void gicv2_irq_disable(struct irq_desc *desc)
 {
     unsigned long flags;
-    int irq = desc->irq;
 
     ASSERT(spin_is_locked(&desc->lock));
 
     spin_lock_irqsave(&gicv2.lock, flags);
     /* Disable routing */
-    writel_gicd(1u << (irq % 32), GICD_ICENABLER + (irq / 32) * 4);
+    gicv2_poke_irq(desc, GICD_ICENABLER);
     set_bit(_IRQ_DISABLED, &desc->status);
     spin_unlock_irqrestore(&gicv2.lock, flags);
 }
@@ -850,7 +952,7 @@ static void gicv2_add_v2m_frame_to_list(paddr_t addr, paddr_t size,
 
         base = ioremap_nocache(addr, size);
         if ( !base )
-            panic("GICv2: Cannot remap v2m register frame");
+            panic("GICv2: Cannot remap v2m register frame\n");
 
         msi_typer = readl_relaxed(base + V2M_MSI_TYPER);
         spi_start = V2M_MSI_TYPER_BASE_SPI(msi_typer);
@@ -869,7 +971,7 @@ static void gicv2_add_v2m_frame_to_list(paddr_t addr, paddr_t size,
     /* Allocate an entry to record new v2m frame information. */
     v2m_data = xzalloc_bytes(sizeof(struct v2m_data));
     if ( !v2m_data )
-        panic("GICv2: Cannot allocate memory for v2m frame");
+        panic("GICv2: Cannot allocate memory for v2m frame\n");
 
     INIT_LIST_HEAD(&v2m_data->entry);
     v2m_data->addr = addr;
@@ -907,7 +1009,7 @@ static void gicv2_extension_dt_init(const struct dt_device_node *node)
 
         /* Get register frame resource from DT. */
         if ( dt_device_get_address(v2m, 0, &addr, &size) )
-            panic("GICv2: Cannot find a valid v2m frame address");
+            panic("GICv2: Cannot find a valid v2m frame address\n");
 
         /*
          * Check whether DT uses msi-base-spi and msi-num-spis properties to
@@ -933,23 +1035,23 @@ static void __init gicv2_dt_init(void)
 
     res = dt_device_get_address(node, 0, &dbase, NULL);
     if ( res )
-        panic("GICv2: Cannot find a valid address for the distributor");
+        panic("GICv2: Cannot find a valid address for the distributor\n");
 
     res = dt_device_get_address(node, 1, &cbase, &csize);
     if ( res )
-        panic("GICv2: Cannot find a valid address for the CPU");
+        panic("GICv2: Cannot find a valid address for the CPU\n");
 
     res = dt_device_get_address(node, 2, &hbase, NULL);
     if ( res )
-        panic("GICv2: Cannot find a valid address for the hypervisor");
+        panic("GICv2: Cannot find a valid address for the hypervisor\n");
 
     res = dt_device_get_address(node, 3, &vbase, &vsize);
     if ( res )
-        panic("GICv2: Cannot find a valid address for the virtual CPU");
+        panic("GICv2: Cannot find a valid address for the virtual CPU\n");
 
     res = platform_get_irq(node, 0);
     if ( res < 0 )
-        panic("GICv2: Cannot find the maintenance IRQ");
+        panic("GICv2: Cannot find the maintenance IRQ\n");
     gicv2_info.maintenance_irq = res;
 
     /* TODO: Add check on distributor */
@@ -1124,7 +1226,7 @@ static void __init gicv2_acpi_init(void)
     {
         const char *msg = acpi_format_exception(status);
 
-        panic("GICv2: Failed to get MADT table, %s", msg);
+        panic("GICv2: Failed to get MADT table, %s\n", msg);
     }
 
     /* Collect CPU base addresses */
@@ -1132,7 +1234,7 @@ static void __init gicv2_acpi_init(void)
                                gic_acpi_parse_madt_cpu, table,
                                ACPI_MADT_TYPE_GENERIC_INTERRUPT, 0);
     if ( count <= 0 )
-        panic("GICv2: No valid GICC entries exists");
+        panic("GICv2: No valid GICC entries exists\n");
 
     /*
      * Find distributor base address. We expect one distributor entry since
@@ -1142,7 +1244,7 @@ static void __init gicv2_acpi_init(void)
                                gic_acpi_parse_madt_distributor, table,
                                ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR, 0);
     if ( count <= 0 )
-        panic("GICv2: No valid GICD entries exists");
+        panic("GICv2: No valid GICD entries exists\n");
 }
 #else
 static void __init gicv2_acpi_init(void) { }
@@ -1172,7 +1274,7 @@ static int __init gicv2_init(void)
 
     if ( (dbase & ~PAGE_MASK) || (cbase & ~PAGE_MASK) ||
          (hbase & ~PAGE_MASK) || (vbase & ~PAGE_MASK) )
-        panic("GICv2 interfaces not page aligned");
+        panic("GICv2 interfaces not page aligned\n");
 
     gicv2.map_dbase = ioremap_nocache(dbase, PAGE_SIZE);
     if ( !gicv2.map_dbase )
@@ -1240,6 +1342,8 @@ const static struct gic_hw_operations gicv2_ops = {
     .eoi_irq             = gicv2_eoi_irq,
     .deactivate_irq      = gicv2_dir_irq,
     .read_irq            = gicv2_read_irq,
+    .set_active_state    = gicv2_set_active_state,
+    .set_pending_state   = gicv2_set_pending_state,
     .set_irq_type        = gicv2_set_irq_type,
     .set_irq_priority    = gicv2_set_irq_priority,
     .send_SGI            = gicv2_send_SGI,
@@ -1251,6 +1355,7 @@ const static struct gic_hw_operations gicv2_ops = {
     .write_lr            = gicv2_write_lr,
     .read_vmcr_priority  = gicv2_read_vmcr_priority,
     .read_apr            = gicv2_read_apr,
+    .read_pending_state  = gicv2_read_pending_state,
     .make_hwdom_dt_node  = gicv2_make_hwdom_dt_node,
     .make_hwdom_madt     = gicv2_make_hwdom_madt,
     .get_hwdom_extra_madt_size = gicv2_get_hwdom_extra_madt_size,

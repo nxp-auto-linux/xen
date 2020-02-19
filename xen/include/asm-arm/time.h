@@ -1,15 +1,17 @@
 #ifndef __ARM_TIME_H__
 #define __ARM_TIME_H__
 
+#include <asm/sysregs.h>
+
 #define DT_MATCH_TIMER                      \
     DT_MATCH_COMPATIBLE("arm,armv7-timer"), \
     DT_MATCH_COMPATIBLE("arm,armv8-timer")
 
-typedef unsigned long cycles_t;
+typedef uint64_t cycles_t;
 
 static inline cycles_t get_cycles (void)
 {
-        return 0;
+        return READ_SYSREG64(CNTPCT_EL0);
 }
 
 /* List of timer's IRQ */

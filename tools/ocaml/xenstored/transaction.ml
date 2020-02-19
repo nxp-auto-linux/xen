@@ -46,7 +46,7 @@ let test_coalesce oldroot currentroot optpath =
 	| Some path ->
 		let oldnode = Store.Path.get_node oldroot path
 		and currentnode = Store.Path.get_node currentroot path in
-		
+
 		match oldnode, currentnode with
 		| (Some oldnode), (Some currentnode) ->
 			if oldnode == currentnode then (
@@ -60,7 +60,7 @@ let test_coalesce oldroot currentroot optpath =
 			let pnode = Store.Path.get_node currentroot (Store.Path.get_parent path) in
 			match pnode with
 			| None       -> false (* ok it doesn't exists, just bail out. *)
-			| Some pnode -> true
+			| Some _     -> true
 			)
 		| _ ->
 			false
@@ -103,7 +103,7 @@ let oldest_short_running_transaction () =
 	let rec last = function
 		| [] -> None
 		| [x] -> Some x
-		| x :: xs -> last xs
+		| _ :: xs -> last xs
 	in last !short_running_txns
 
 let trim_short_running_transactions txn =
@@ -175,7 +175,7 @@ let rm t perm path =
 	set_write_lowpath t (Store.Path.get_parent path);
 	add_wop t Xenbus.Xb.Op.Rm path
 
-let ls t perm path =	
+let ls t perm path =
 	let r = Store.ls t.store perm path in
 	set_read_lowpath t path;
 	r
@@ -196,7 +196,7 @@ let commit ~con t =
 	let has_commited =
 	match t.ty with
 	| No                         -> true
-	| Full (id, oldstore, cstore) ->       (* "cstore" meaning current canonical store *)
+	| Full (_id, oldstore, cstore) ->       (* "cstore" meaning current canonical store *)
 		let commit_partial oldroot cstore store =
 			(* get the lowest path of the query and verify that it hasn't
 			   been modified by others transactions. *)
@@ -243,8 +243,8 @@ let commit ~con t =
 		in
 	if has_commited && has_write_ops then
 		Disk.write t.store;
-	if not has_commited 
+	if not has_commited
 	then Logging.conflict ~tid:(get_id t) ~con
-	else if not !has_coalesced 
+	else if not !has_coalesced
 	then Logging.commit ~tid:(get_id t) ~con;
 	has_commited

@@ -28,7 +28,7 @@ class xen
 # XENPF_microcode_update
     microcode
 # XEN_SYSCTL_physinfo, XEN_SYSCTL_cputopoinfo, XEN_SYSCTL_numainfo
-# XEN_SYSCTL_pcitopoinfo
+# XEN_SYSCTL_pcitopoinfo, XEN_SYSCTL_get_cpu_policy
     physinfo
 # XENPF_platform_quirk
     quirk
@@ -71,9 +71,9 @@ class xen
     tmem_op
 # XEN_SYSCTL_tmem_op command of tmem (part of sysctl)
     tmem_control
-# XEN_SYSCTL_scheduler_op with XEN_DOMCTL_SCHEDOP_getinfo, XEN_SYSCTL_sched_id
+# XEN_SYSCTL_scheduler_op with XEN_DOMCTL_SCHEDOP_getinfo, XEN_SYSCTL_sched_id, XEN_DOMCTL_SCHEDOP_getvcpuinfo
     getscheduler
-# XEN_SYSCTL_scheduler_op with XEN_DOMCTL_SCHEDOP_putinfo
+# XEN_SYSCTL_scheduler_op with XEN_DOMCTL_SCHEDOP_putinfo, XEN_DOMCTL_SCHEDOP_putvcpuinfo
     setscheduler
 }
 
@@ -85,8 +85,8 @@ class xen2
     resource_op
 # XEN_SYSCTL_psr_cmt_op
     psr_cmt_op
-# XEN_SYSCTL_psr_cat_op
-    psr_cat_op
+# XEN_SYSCTL_psr_alloc
+    psr_alloc
 # XENPF_get_symbol
     get_symbol
 # PMU control
@@ -99,8 +99,8 @@ class xen2
     get_cpu_featureset
 # XEN_SYSCTL_livepatch_op
     livepatch_op
-# XEN_SYSCTL_gcov_op
-    gcov_op
+# XEN_SYSCTL_coverage_op
+    coverage_op
 # XEN_SYSCTL_set_parameter
     set_parameter
 }
@@ -222,8 +222,6 @@ class domain2
     setscheduler
 # XENMEM_claim_pages
     setclaim
-# XEN_DOMCTL_set_max_evtchn
-    set_max_evtchn
 # XEN_DOMCTL_cacheflush
     cacheflush
 # Creation of the hardware domain when it is not dom0
@@ -246,10 +244,12 @@ class domain2
     mem_paging
 # XENMEM_sharing_op
     mem_sharing
-# XEN_DOMCTL_psr_cat_op
-    psr_cat_op
-# XEN_DOMCTL_set_gnttab_limits
-    set_gnttab_limits
+# XEN_DOMCTL_psr_alloc
+    psr_alloc
+# XENMEM_resource_map
+    resource_map
+# XEN_DOMCTL_get_cpu_policy
+    get_cpu_policy
 }
 
 # Similar to class domain, but primarily contains domctls related to HVM domains
@@ -264,8 +264,6 @@ class hvm
 # HVMOP_get_param
     getparam
     bind_irq
-# XEN_DOMCTL_pin_mem_cacheattr
-    cacheattr
 # HVMOP_get_mem_type,
 # HVMOP_set_mem_access, HVMOP_get_mem_access, HVMOP_pagetable_dying
     hvmctl
@@ -359,8 +357,6 @@ class mmu
     map_write
 # XEN_DOMCTL_getpageframeinfo3
     pageinfo
-# XEN_DOMCTL_getmemlist
-    pagelist
 # XENMEM_{increase,decrease}_reservation, XENMEM_populate_physmap
     adjust
 # XENMEM_{current,maximum}_reservation, XENMEM_maximum_gpfn
@@ -534,4 +530,20 @@ class version
     xen_commandline
 # Xen build id
     xen_build_id
+}
+
+# Class argo is used to describe the Argo interdomain communication system.
+class argo
+{
+    # Enable initialization of a domain's argo subsystem and
+    # permission to access the argo hypercall operations.
+    enable
+    # Domain requesting registration of a communication ring
+    # to receive messages from a specific other domain.
+    register_single_source
+    # Domain requesting registration of a communication ring
+    # to receive messages from any other domain.
+    register_any_source
+    # Domain sending a message to another domain.
+    send
 }

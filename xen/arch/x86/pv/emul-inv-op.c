@@ -41,32 +41,12 @@
 
 #include "emulate.h"
 
-static int emulate_invalid_rdtscp(struct cpu_user_regs *regs)
-{
-    char opcode[3];
-    unsigned long eip, rc;
-    struct vcpu *v = current;
-
-    eip = regs->rip;
-    if ( (rc = copy_from_user(opcode, (char *)eip, sizeof(opcode))) != 0 )
-    {
-        pv_inject_page_fault(0, eip + sizeof(opcode) - rc);
-        return EXCRET_fault_fixed;
-    }
-    if ( memcmp(opcode, "\xf\x1\xf9", sizeof(opcode)) )
-        return 0;
-    eip += sizeof(opcode);
-    pv_soft_rdtsc(v, regs, 1);
-    pv_emul_instruction_done(regs, eip);
-    return EXCRET_fault_fixed;
-}
-
 static int emulate_forced_invalid_op(struct cpu_user_regs *regs)
 {
     char sig[5], instr[2];
     unsigned long eip, rc;
     struct cpuid_leaf res;
-    const struct msr_vcpu_policy *vp = current->arch.msr;
+    const struct vcpu_msrs *msrs = current->arch.msrs;
 
     eip = regs->rip;
 
@@ -90,7 +70,7 @@ static int emulate_forced_invalid_op(struct cpu_user_regs *regs)
         return 0;
 
     /* If cpuid faulting is enabled and CPL>0 inject a #GP in place of #UD. */
-    if ( vp->misc_features_enables.cpuid_faulting &&
+    if ( msrs->misc_features_enables.cpuid_faulting &&
          !guest_kernel_mode(current, regs) )
     {
         regs->rip = eip;
@@ -116,7 +96,7 @@ static int emulate_forced_invalid_op(struct cpu_user_regs *regs)
 
 bool pv_emulate_invalid_op(struct cpu_user_regs *regs)
 {
-    return !emulate_invalid_rdtscp(regs) && !emulate_forced_invalid_op(regs);
+    return !emulate_forced_invalid_op(regs);
 }
 
 /*

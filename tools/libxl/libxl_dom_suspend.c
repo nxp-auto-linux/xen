@@ -34,6 +34,7 @@ int libxl__domain_suspend_init(libxl__egc *egc,
     libxl__ev_evtchn_init(&dsps->guest_evtchn);
     libxl__ev_xswatch_init(&dsps->guest_watch);
     libxl__ev_time_init(&dsps->guest_timeout);
+    libxl__ev_qmp_init(&dsps->qmp);
 
     if (type == LIBXL_DOMAIN_TYPE_INVALID) goto out;
     dsps->type = type;
@@ -68,10 +69,11 @@ out:
 
 /*----- callbacks, called by xc_domain_save -----*/
 
-int libxl__domain_suspend_device_model(libxl__gc *gc,
+void libxl__domain_suspend_device_model(libxl__egc *egc,
                                        libxl__domain_suspend_state *dsps)
 {
-    int ret = 0;
+    STATE_AO_GC(dsps->ao);
+    int rc = 0;
     uint32_t const domid = dsps->domid;
     const char *const filename = dsps->dm_savefile;
 
@@ -83,18 +85,19 @@ int libxl__domain_suspend_device_model(libxl__gc *gc,
         break;
     }
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
-        if (libxl__qmp_stop(gc, domid))
-            return ERROR_FAIL;
-        /* Save DM state into filename */
-        ret = libxl__qmp_save(gc, domid, filename);
-        if (ret)
-            unlink(filename);
-        break;
+        /* calls dsps->callback_device_model_done when done */
+        libxl__qmp_suspend_save(egc, dsps); /* must be last */
+        return;
     default:
-        return ERROR_INVAL;
+        rc = ERROR_INVAL;
+        goto out;
     }
 
-    return ret;
+out:
+    if (rc)
+        LOGD(ERROR, dsps->domid,
+             "failed to suspend device model, rc=%d", rc);
+    dsps->callback_device_model_done(egc, dsps, rc); /* must be last */
 }
 
 static void domain_suspend_common_wait_guest(libxl__egc *egc,
@@ -371,20 +374,15 @@ static void domain_suspend_common_guest_suspended(libxl__egc *egc,
                                          libxl__domain_suspend_state *dsps)
 {
     STATE_AO_GC(dsps->ao);
-    int rc;
 
     libxl__ev_evtchn_cancel(gc, &dsps->guest_evtchn);
     libxl__ev_xswatch_deregister(gc, &dsps->guest_watch);
     libxl__ev_time_deregister(gc, &dsps->guest_timeout);
 
     if (dsps->type == LIBXL_DOMAIN_TYPE_HVM) {
-        rc = libxl__domain_suspend_device_model(gc, dsps);
-        if (rc) {
-            LOGD(ERROR, dsps->domid,
-                 "libxl__domain_suspend_device_model failed ret=%d", rc);
-            domain_suspend_common_done(egc, dsps, rc);
-            return;
-        }
+        dsps->callback_device_model_done = domain_suspend_common_done;
+        libxl__domain_suspend_device_model(egc, dsps); /* must be last */
+        return;
     }
     domain_suspend_common_done(egc, dsps, 0);
 }
@@ -398,6 +396,7 @@ static void domain_suspend_common_done(libxl__egc *egc,
     libxl__ev_evtchn_cancel(gc, &dsps->guest_evtchn);
     libxl__ev_xswatch_deregister(gc, &dsps->guest_watch);
     libxl__ev_time_deregister(gc, &dsps->guest_timeout);
+    libxl__ev_qmp_dispose(gc, &dsps->qmp);
     dsps->callback_common_done(egc, dsps, rc);
 }
 

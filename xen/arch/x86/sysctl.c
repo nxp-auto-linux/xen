@@ -9,6 +9,7 @@
 #include <xen/types.h>
 #include <xen/lib.h>
 #include <xen/mm.h>
+#include <xen/nospec.h>
 #include <xen/guest_access.h>
 #include <xen/hypercall.h>
 #include <public/sysctl.h>
@@ -23,6 +24,7 @@
 #include <asm/hvm/hvm.h>
 #include <asm/hvm/support.h>
 #include <asm/processor.h>
+#include <asm/setup.h>
 #include <asm/smp.h>
 #include <asm/numa.h>
 #include <xen/nodemask.h>
@@ -30,6 +32,33 @@
 #include <xsm/xsm.h>
 #include <asm/psr.h>
 #include <asm/cpuid.h>
+
+const struct cpu_policy system_policies[] = {
+    [ XEN_SYSCTL_cpu_policy_raw ] = {
+        &raw_cpuid_policy,
+        &raw_msr_policy,
+    },
+    [ XEN_SYSCTL_cpu_policy_host ] = {
+        &host_cpuid_policy,
+        &host_msr_policy,
+    },
+    [ XEN_SYSCTL_cpu_policy_pv_max ] = {
+        &pv_max_cpuid_policy,
+        &pv_max_msr_policy,
+    },
+    [ XEN_SYSCTL_cpu_policy_hvm_max ] = {
+        &hvm_max_cpuid_policy,
+        &hvm_max_msr_policy,
+    },
+    [ XEN_SYSCTL_cpu_policy_pv_default ] = {
+        &pv_max_cpuid_policy,
+        &pv_max_msr_policy,
+    },
+    [ XEN_SYSCTL_cpu_policy_hvm_default ] = {
+        &hvm_max_cpuid_policy,
+        &hvm_max_msr_policy,
+    },
+};
 
 struct l3_cache_info {
     int ret;
@@ -48,14 +77,27 @@ static void l3_cache_get(void *arg)
 
 long cpu_up_helper(void *data)
 {
-    int cpu = (unsigned long)data;
+    unsigned int cpu = (unsigned long)data;
     int ret = cpu_up(cpu);
+
     if ( ret == -EBUSY )
     {
         /* On EBUSY, flush RCU work and have one more go. */
         rcu_barrier();
         ret = cpu_up(cpu);
     }
+
+    if ( !ret && !opt_smt &&
+         cpu_data[cpu].compute_unit_id == INVALID_CUID &&
+         cpumask_weight(per_cpu(cpu_sibling_mask, cpu)) > 1 )
+    {
+        ret = cpu_down_helper(data);
+        if ( ret )
+            printk("Could not re-offline CPU%u (%d)\n", cpu, ret);
+        else
+            ret = -EPERM;
+    }
+
     return ret;
 }
 
@@ -78,8 +120,10 @@ void arch_do_physinfo(struct xen_sysctl_physinfo *pi)
            min(sizeof(pi->hw_cap), sizeof(boot_cpu_data.x86_capability)));
     if ( hvm_enabled )
         pi->capabilities |= XEN_SYSCTL_PHYSCAP_hvm;
+    if ( IS_ENABLED(CONFIG_PV) )
+        pi->capabilities |= XEN_SYSCTL_PHYSCAP_pv;
     if ( iommu_enabled )
-        pi->capabilities |= XEN_SYSCTL_PHYSCAP_hvm_directio;
+        pi->capabilities |= XEN_SYSCTL_PHYSCAP_directio;
 }
 
 long arch_do_sysctl(
@@ -171,54 +215,69 @@ long arch_do_sysctl(
 
         break;
 
-    case XEN_SYSCTL_psr_cat_op:
-        switch ( sysctl->u.psr_cat_op.cmd )
-        {
-            uint32_t data[PSR_INFO_ARRAY_SIZE];
+    case XEN_SYSCTL_psr_alloc:
+    {
+        uint32_t data[PSR_INFO_ARRAY_SIZE] = { };
 
-        case XEN_SYSCTL_PSR_CAT_get_l3_info:
+        switch ( sysctl->u.psr_alloc.cmd )
         {
-            ret = psr_get_info(sysctl->u.psr_cat_op.target,
-                               PSR_CBM_TYPE_L3, data, ARRAY_SIZE(data));
+        case XEN_SYSCTL_PSR_get_l3_info:
+            ret = psr_get_info(sysctl->u.psr_alloc.target,
+                               PSR_TYPE_L3_CBM, data, ARRAY_SIZE(data));
             if ( ret )
                 break;
 
-            sysctl->u.psr_cat_op.u.cat_info.cos_max =
+            sysctl->u.psr_alloc.u.cat_info.cos_max =
                                       data[PSR_INFO_IDX_COS_MAX];
-            sysctl->u.psr_cat_op.u.cat_info.cbm_len =
+            sysctl->u.psr_alloc.u.cat_info.cbm_len =
                                       data[PSR_INFO_IDX_CAT_CBM_LEN];
-            sysctl->u.psr_cat_op.u.cat_info.flags =
-                                      data[PSR_INFO_IDX_CAT_FLAG];
+            sysctl->u.psr_alloc.u.cat_info.flags =
+                                      data[PSR_INFO_IDX_CAT_FLAGS];
 
-            if ( __copy_field_to_guest(u_sysctl, sysctl, u.psr_cat_op) )
+            if ( __copy_field_to_guest(u_sysctl, sysctl, u.psr_alloc) )
                 ret = -EFAULT;
             break;
-        }
 
-        case XEN_SYSCTL_PSR_CAT_get_l2_info:
-        {
-            ret = psr_get_info(sysctl->u.psr_cat_op.target,
-                               PSR_CBM_TYPE_L2, data, ARRAY_SIZE(data));
+        case XEN_SYSCTL_PSR_get_l2_info:
+            ret = psr_get_info(sysctl->u.psr_alloc.target,
+                               PSR_TYPE_L2_CBM, data, ARRAY_SIZE(data));
             if ( ret )
                 break;
 
-            sysctl->u.psr_cat_op.u.cat_info.cos_max =
+            sysctl->u.psr_alloc.u.cat_info.cos_max =
                                       data[PSR_INFO_IDX_COS_MAX];
-            sysctl->u.psr_cat_op.u.cat_info.cbm_len =
+            sysctl->u.psr_alloc.u.cat_info.cbm_len =
                                       data[PSR_INFO_IDX_CAT_CBM_LEN];
-            sysctl->u.psr_cat_op.u.cat_info.flags =
-                                      data[PSR_INFO_IDX_CAT_FLAG];
+            sysctl->u.psr_alloc.u.cat_info.flags =
+                                      data[PSR_INFO_IDX_CAT_FLAGS];
 
-            if ( __copy_field_to_guest(u_sysctl, sysctl, u.psr_cat_op) )
+            if ( __copy_field_to_guest(u_sysctl, sysctl, u.psr_alloc) )
                 ret = -EFAULT;
             break;
-        }
+
+        case XEN_SYSCTL_PSR_get_mba_info:
+            ret = psr_get_info(sysctl->u.psr_alloc.target,
+                               PSR_TYPE_MBA_THRTL, data, ARRAY_SIZE(data));
+            if ( ret )
+                break;
+
+            sysctl->u.psr_alloc.u.mba_info.cos_max =
+                                      data[PSR_INFO_IDX_COS_MAX];
+            sysctl->u.psr_alloc.u.mba_info.thrtl_max =
+                                      data[PSR_INFO_IDX_MBA_THRTL_MAX];
+            sysctl->u.psr_alloc.u.mba_info.flags =
+                                      data[PSR_INFO_IDX_MBA_FLAGS];
+
+            if ( __copy_field_to_guest(u_sysctl, sysctl, u.psr_alloc) )
+                ret = -EFAULT;
+            break;
 
         default:
             ret = -EOPNOTSUPP;
             break;
         }
         break;
+    }
 
     case XEN_SYSCTL_get_cpu_levelling_caps:
         sysctl->u.cpu_levelling_caps.caps = levelling_caps;
@@ -276,6 +335,53 @@ long arch_do_sysctl(
         /* Inform the caller if there was more data to provide. */
         if ( !ret && nr < FSCAPINTS )
             ret = -ENOBUFS;
+
+        break;
+    }
+
+    case XEN_SYSCTL_get_cpu_policy:
+    {
+        const struct cpu_policy *policy;
+
+        /* Reserved field set, or bad policy index? */
+        if ( sysctl->u.cpu_policy._rsvd ||
+             sysctl->u.cpu_policy.index >= ARRAY_SIZE(system_policies) )
+        {
+            ret = -EINVAL;
+            break;
+        }
+        policy = &system_policies[
+            array_index_nospec(sysctl->u.cpu_policy.index,
+                               ARRAY_SIZE(system_policies))];
+
+        /* Process the CPUID leaves. */
+        if ( guest_handle_is_null(sysctl->u.cpu_policy.cpuid_policy) )
+            sysctl->u.cpu_policy.nr_leaves = CPUID_MAX_SERIALISED_LEAVES;
+        else if ( (ret = x86_cpuid_copy_to_buffer(
+                       policy->cpuid,
+                       sysctl->u.cpu_policy.cpuid_policy,
+                       &sysctl->u.cpu_policy.nr_leaves)) )
+            break;
+
+        if ( __copy_field_to_guest(u_sysctl, sysctl,
+                                   u.cpu_policy.nr_leaves) )
+        {
+            ret = -EFAULT;
+            break;
+        }
+
+        /* Process the MSR entries. */
+        if ( guest_handle_is_null(sysctl->u.cpu_policy.msr_policy) )
+            sysctl->u.cpu_policy.nr_msrs = MSR_MAX_SERIALISED_ENTRIES;
+        else if ( (ret = x86_msr_copy_to_buffer(
+                       policy->msr,
+                       sysctl->u.cpu_policy.msr_policy,
+                       &sysctl->u.cpu_policy.nr_msrs)) )
+            break;
+
+        if ( __copy_field_to_guest(u_sysctl, sysctl,
+                                   u.cpu_policy.nr_msrs)  )
+            ret = -EFAULT;
 
         break;
     }

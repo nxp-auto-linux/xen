@@ -9,6 +9,7 @@
 #define __XEN_SCHED_IF_H__
 
 #include <xen/percpu.h>
+#include <xen/err.h>
 
 /* A global pointer to the initial cpupool (POOL0). */
 extern struct cpupool *cpupool0;
@@ -146,14 +147,14 @@ struct scheduler {
     void *       (*alloc_pdata)    (const struct scheduler *, int);
     void         (*init_pdata)     (const struct scheduler *, void *, int);
     void         (*deinit_pdata)   (const struct scheduler *, void *, int);
-    void         (*free_domdata)   (const struct scheduler *, void *);
+
+    /* Returns ERR_PTR(-err) for error, NULL for 'nothing needed'. */
     void *       (*alloc_domdata)  (const struct scheduler *, struct domain *);
+    /* Idempotent. */
+    void         (*free_domdata)   (const struct scheduler *, void *);
 
     void         (*switch_sched)   (struct scheduler *, unsigned int,
                                     void *, void *);
-
-    int          (*init_domain)    (const struct scheduler *, struct domain *);
-    void         (*destroy_domain) (const struct scheduler *, struct domain *);
 
     /* Activate / deactivate vcpus in a cpu pool */
     void         (*insert_vcpu)    (const struct scheduler *, struct vcpu *);
@@ -172,6 +173,9 @@ struct scheduler {
                                     unsigned int);
     int          (*adjust)         (const struct scheduler *, struct domain *,
                                     struct xen_domctl_scheduler_op *);
+    void         (*adjust_affinity)(const struct scheduler *, struct vcpu *,
+                                    const struct cpumask *,
+                                    const struct cpumask *);
     int          (*adjust_global)  (const struct scheduler *,
                                     struct xen_sysctl_scheduler_op *);
     void         (*dump_settings)  (const struct scheduler *);
@@ -180,6 +184,28 @@ struct scheduler {
     void         (*tick_suspend)    (const struct scheduler *, unsigned int);
     void         (*tick_resume)     (const struct scheduler *, unsigned int);
 };
+
+static inline void *sched_alloc_domdata(const struct scheduler *s,
+                                        struct domain *d)
+{
+    if ( s->alloc_domdata )
+        return s->alloc_domdata(s, d);
+    else
+        return NULL;
+}
+
+static inline void sched_free_domdata(const struct scheduler *s,
+                                      void *data)
+{
+    if ( s->free_domdata )
+        s->free_domdata(s, data);
+    else
+        /*
+         * Check that if there isn't a free_domdata hook, we haven't got any
+         * data we're expected to deal with.
+         */
+        ASSERT(!data);
+}
 
 #define REGISTER_SCHEDULER(x) static const struct scheduler *x##_entry \
   __used_section(".data.schedulers") = &x;
@@ -240,16 +266,13 @@ static inline cpumask_t* cpupool_domain_cpumask(struct domain *d)
  * Soft affinity only needs to be considered if:
  * * The cpus in the cpupool are not a subset of soft affinity
  * * The hard affinity is not a subset of soft affinity
- * * There is an overlap between the soft affinity and the mask which is
- *   currently being considered.
+ * * There is an overlap between the soft and hard affinity masks
  */
-static inline int has_soft_affinity(const struct vcpu *v,
-                                    const cpumask_t *mask)
+static inline int has_soft_affinity(const struct vcpu *v)
 {
-    return !cpumask_subset(cpupool_domain_cpumask(v->domain),
-                           v->cpu_soft_affinity) &&
-           !cpumask_subset(v->cpu_hard_affinity, v->cpu_soft_affinity) &&
-           cpumask_intersects(v->cpu_soft_affinity, mask);
+    return v->soft_aff_effective &&
+           !cpumask_subset(cpupool_domain_cpumask(v->domain),
+                           v->cpu_soft_affinity);
 }
 
 /*

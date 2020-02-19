@@ -1,11 +1,11 @@
-#################################
-__  __            _  _    _  ___
-\ \/ /___ _ __   | || |  / |/ _ \
- \  // _ \ '_ \  | || |_ | | | | |
- /  \  __/ | | | |__   _|| | |_| |
-/_/\_\___|_| |_|    |_|(_)_|\___/
+#################
+ _  _    _ ____
+| || |  / |___ \
+| || |_ | | __) |
+|__   _|| |/ __/
+   |_|(_)_|_____|
 
-#################################
+#################
 
 http://www.xen.org/
 
@@ -46,7 +46,7 @@ provided by your OS distributor:
         - GCC 4.8 or later
         - GNU Binutils 2.24 or later
     * Development install of zlib (e.g., zlib-dev)
-    * Development install of Python v2.3 or later (e.g., python-dev)
+    * Development install of Python 2, v2.4 or later (e.g., python-dev)
     * Development install of curses (e.g., libncurses-dev)
     * Development install of openssl (e.g., openssl-dev)
     * Development install of x11 (e.g. xorg-x11-dev)
@@ -73,7 +73,8 @@ disabled at compile time:
       ocaml-findlib). Required to build ocaml components which
       includes the alternative ocaml xenstored.
     * cmake (if building vtpm stub domains)
-    * markdown
+    * pandoc, transfig, pod2{man,html,text} for rendering various pieces of
+      documentation into alternative formats
     * figlet (for generating the traditional Xen start of day banner)
     * systemd daemon development files
     * Development install of libnl3 (e.g., libnl-3-200,
@@ -176,9 +177,15 @@ Python Runtime Libraries
 
 Various tools, such as pygrub, have the following runtime dependencies:
 
-    * Python 2.3 or later.
+    * Python 2, v2.4 or later.
           URL:    http://www.python.org/
           Debian: python
+
+Note that the build system expects `python` to be python2.  If your system
+has `python` pointing to python3 (as in the case of Arch Linux or Anaconda),
+you'll need to specify a path to a python2 binary when running configure:
+
+    PYTHON=/usr/bin/python2 ./configure
 
 Intel(R) Trusted Execution Technology Support
 =============================================
@@ -199,8 +206,3 @@ http://sourceforge.net/projects/tboot.  This project hosts the code in a
 mercurial repo at http://tboot.sourceforge.net/hg/tboot.hg and contains
 tarballs of the source.  Instructions in the tboot README describe how
 to modify grub.conf to use tboot to launch Xen.
-
-There are optional targets as part of Xen's top-level makefile that will
-download and build tboot: install-tboot, build-tboot, dist-tboot, clean-tboot.
-These will download the latest tar file from the SourceForge site using wget,
-then build/install/dist according to Xen's settings.

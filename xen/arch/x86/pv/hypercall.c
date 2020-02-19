@@ -21,6 +21,7 @@
 
 #include <xen/compiler.h>
 #include <xen/hypercall.h>
+#include <xen/nospec.h>
 #include <xen/trace.h>
 
 #define HYPERCALL(x)                                                \
@@ -32,7 +33,7 @@
 
 #define do_arch_1             paging_domctl_continuation
 
-static const hypercall_table_t pv_hypercall_table[] = {
+const hypercall_table_t pv_hypercall_table[] = {
     COMPAT_CALL(set_trap_table),
     HYPERCALL(mmu_update),
     COMPAT_CALL(set_gdt),
@@ -68,7 +69,6 @@ static const hypercall_table_t pv_hypercall_table[] = {
 #endif
     HYPERCALL(event_channel_op),
     COMPAT_CALL(physdev_op),
-    HYPERCALL(hvm_op),
     HYPERCALL(sysctl),
     HYPERCALL(domctl),
 #ifdef CONFIG_KEXEC
@@ -77,8 +77,14 @@ static const hypercall_table_t pv_hypercall_table[] = {
 #ifdef CONFIG_TMEM
     HYPERCALL(tmem_op),
 #endif
+#ifdef CONFIG_ARGO
+    COMPAT_CALL(argo_op),
+#endif
     HYPERCALL(xenpmu_op),
+#ifdef CONFIG_HVM
+    HYPERCALL(hvm_op),
     COMPAT_CALL(dm_op),
+#endif
     HYPERCALL(mca),
     HYPERCALL(arch_1),
 };
@@ -99,8 +105,15 @@ void pv_hypercall(struct cpu_user_regs *regs)
     BUILD_BUG_ON(ARRAY_SIZE(pv_hypercall_table) >
                  ARRAY_SIZE(hypercall_args_table));
 
-    if ( (eax >= ARRAY_SIZE(pv_hypercall_table)) ||
-         !pv_hypercall_table[eax].native )
+    if ( eax >= ARRAY_SIZE(pv_hypercall_table) )
+    {
+        regs->rax = -ENOSYS;
+        return;
+    }
+
+    eax = array_index_nospec(eax, ARRAY_SIZE(pv_hypercall_table));
+
+    if ( !pv_hypercall_table[eax].native )
     {
         regs->rax = -ENOSYS;
         return;
@@ -318,23 +331,6 @@ void hypercall_page_initialise_ring1_kernel(void *hypercall_page)
     *(u8  *)(p+ 1) = 0xb8;    /* mov  $__HYPERVISOR_iret,%eax */
     *(u32 *)(p+ 2) = __HYPERVISOR_iret;
     *(u16 *)(p+ 6) = (HYPERCALL_VECTOR << 8) | 0xcd; /* int  $xx */
-}
-
-void __init pv_hypercall_table_replace(unsigned int hypercall,
-                                       hypercall_fn_t * native,
-                                       hypercall_fn_t *compat)
-{
-#define HANDLER_POINTER(f) \
-    ((unsigned long *)__va(__pa(&pv_hypercall_table[hypercall].f)))
-    write_atomic(HANDLER_POINTER(native), (unsigned long)native);
-    write_atomic(HANDLER_POINTER(compat), (unsigned long)compat);
-#undef HANDLER_POINTER
-}
-
-hypercall_fn_t *pv_get_hypercall_handler(unsigned int hypercall, bool compat)
-{
-    return compat ? pv_hypercall_table[hypercall].compat
-                  : pv_hypercall_table[hypercall].native;
 }
 
 /*

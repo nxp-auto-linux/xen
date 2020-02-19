@@ -36,7 +36,7 @@
 #include <public/hvm/dm_op.h>
 
 struct hvm_ioreq_page {
-    unsigned long gfn;
+    gfn_t gfn;
     struct page_info *page;
     void *va;
 };
@@ -52,15 +52,11 @@ struct hvm_ioreq_vcpu {
 #define MAX_NR_IO_RANGES  256
 
 struct hvm_ioreq_server {
-    struct list_head       list_entry;
-    struct domain          *domain;
+    struct domain          *target, *emulator;
 
     /* Lock to serialize toolstack modifications */
     spinlock_t             lock;
 
-    /* Domain id of emulating domain */
-    domid_t                domid;
-    ioservid_t             id;
     struct hvm_ioreq_page  ioreq;
     struct list_head       ioreq_vcpu_list;
     struct hvm_ioreq_page  bufioreq;
@@ -70,7 +66,7 @@ struct hvm_ioreq_server {
     evtchn_port_t          bufioreq_evtchn;
     struct rangeset        *range[NR_IO_RANGE_TYPES];
     bool                   enabled;
-    bool                   bufioreq_atomic;
+    uint8_t                bufioreq_handling;
 };
 
 /*
@@ -84,36 +80,30 @@ struct hvm_ioreq_server {
  *     and actually has a physical device assigned .
  */
 struct hvm_pi_ops {
-    /* Hook into ctx_switch_from. */
-    void (*switch_from)(struct vcpu *v);
-
-    /* Hook into ctx_switch_to. */
-    void (*switch_to)(struct vcpu *v);
+    unsigned int flags;
 
     /*
      * Hook into arch_vcpu_block(), which is called
      * from vcpu_block() and vcpu_do_poll().
      */
     void (*vcpu_block)(struct vcpu *);
-
-    /* Hook into the vmentry path. */
-    void (*do_resume)(struct vcpu *v);
 };
+
+#define MAX_NR_IOREQ_SERVERS 8
 
 struct hvm_domain {
     /* Guest page range used for non-default ioreq servers */
     struct {
         unsigned long base;
-        unsigned long mask;
+        unsigned long mask; /* indexed by GFN minus base */
+        unsigned long legacy_mask; /* indexed by HVM param number */
     } ioreq_gfn;
 
     /* Lock protects all other values in the sub-struct and the default */
     struct {
-        spinlock_t       lock;
-        ioservid_t       id;
-        struct list_head list;
+        spinlock_t              lock;
+        struct hvm_ioreq_server *server[MAX_NR_IOREQ_SERVERS];
     } ioreq_server;
-    struct hvm_ioreq_server *default_ioreq_server;
 
     /* Cached CF8 for guest PCI config cycles */
     uint32_t                pci_cf8;
@@ -184,6 +174,13 @@ struct hvm_domain {
     /* List of guest to machine IO ports mapping. */
     struct list_head g2m_ioport_list;
 
+    /* List of MMCFG regions trapped by Xen. */
+    struct list_head mmcfg_regions;
+    rwlock_t mmcfg_lock;
+
+    /* List of MSI-X tables. */
+    struct list_head msix_tables;
+
     /* List of permanently write-mapped pages. */
     struct {
         spinlock_t lock;
@@ -198,7 +195,11 @@ struct hvm_domain {
     };
 };
 
-#define hap_enabled(d)  ((d)->arch.hvm_domain.hap_enabled)
+#ifdef CONFIG_HVM
+#define hap_enabled(d)  (is_hvm_domain(d) && (d)->arch.hvm.hap_enabled)
+#else
+#define hap_enabled(d)  ({(void)(d); false;})
+#endif
 
 #endif /* __ASM_X86_HVM_DOMAIN_H__ */
 

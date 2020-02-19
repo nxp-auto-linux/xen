@@ -18,6 +18,8 @@
  */
 
 #include <asm/platform.h>
+#include <asm/platforms/xilinx-zynqmp-eemi.h>
+#include <asm/smccc.h>
 
 static const char * const zynqmp_dt_compat[] __initconst =
 {
@@ -25,16 +27,30 @@ static const char * const zynqmp_dt_compat[] __initconst =
     NULL
 };
 
-static const struct dt_device_match zynqmp_blacklist_dev[] __initconst =
+static bool zynqmp_smc(struct cpu_user_regs *regs)
 {
-    /* Power management is not yet supported.  */
-    DT_MATCH_COMPATIBLE("xlnx,zynqmp-pm"),
-    { /* sentinel */ },
-};
+    /*
+     * ZynqMP firmware is based on SMCCC 1.1. If SMCCC 1.1 is not
+     * available something is wrong, don't try to handle it.
+     */
+    if ( !cpus_have_const_cap(ARM_SMCCC_1_1) )
+    {
+        static bool once = true;
 
-PLATFORM_START(xgene_storm, "Xilinx ZynqMP")
+        if ( once )
+        {
+            printk(XENLOG_WARNING "ZynqMP firmware Error: no SMCCC 1.1 "
+                   "support. Disabling firmware calls.");
+            once = false;
+        }
+        return false;
+    }
+    return zynqmp_eemi(regs);
+}
+
+PLATFORM_START(xilinx_zynqmp, "Xilinx ZynqMP")
     .compatible = zynqmp_dt_compat,
-    .blacklist_dev = zynqmp_blacklist_dev,
+    .smc = zynqmp_smc,
 PLATFORM_END
 
 /*

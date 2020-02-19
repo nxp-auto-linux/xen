@@ -20,8 +20,16 @@ config HAS_DEVICE_TREE
 config HAS_EX_TABLE
 	bool
 
-config HAS_MEM_ACCESS
+config MEM_ACCESS_ALWAYS_ON
 	bool
+
+config MEM_ACCESS
+	def_bool MEM_ACCESS_ALWAYS_ON
+	prompt "Memory Access and VM events" if !MEM_ACCESS_ALWAYS_ON
+	---help---
+
+	  Framework to configure memory access types for guests and receive
+	  related events in userspace.
 
 config HAS_MEM_PAGING
 	bool
@@ -44,6 +52,12 @@ config HAS_GDBSX
 config HAS_IOPORTS
 	bool
 
+config NEEDS_LIBELF
+	bool
+
+config NEEDS_LIST_SORT
+	bool
+
 config HAS_BUILD_ID
 	string
 	option env="XEN_HAS_BUILD_ID"
@@ -64,17 +78,19 @@ config KEXEC
 	  If unsure, say Y.
 
 config TMEM
-	def_bool y
-	prompt "Transcendent Memory Support" if EXPERT = "y"
+	bool "Transcendent Memory Support (deprecated)" if EXPERT = "y"
 	---help---
 	  Transcendent memory allows PV-aware guests to collaborate on memory
 	  usage. Guests can 'swap' their memory to the hypervisor or have an
 	  collective pool of memory shared across guests. The end result is
 	  less memory usage by guests allowing higher guest density.
 
-	  You also have to enable it on the Xen commandline by using tmem=1
+	  You also have to enable it on the Xen commandline by using tmem=1.
 
-	  If unsure, say Y.
+	  WARNING: This option (and its underlying code) is going to go away
+	  in a future Xen version.
+
+	  If unsure, say N.
 
 config XENOPROF
 	def_bool y
@@ -100,9 +116,9 @@ config XSM
 
 	  If unsure, say N.
 
-config FLASK
+config XSM_FLASK
 	def_bool y
-	prompt "FLux Advanced Security Kernel support" if EXPERT = "y"
+	prompt "FLux Advanced Security Kernel support"
 	depends on XSM
 	---help---
 	  Enables FLASK (FLux Advanced Security Kernel) as the access control
@@ -113,10 +129,10 @@ config FLASK
 
 	  If unsure, say Y.
 
-config FLASK_AVC_STATS
+config XSM_FLASK_AVC_STATS
 	def_bool y
 	prompt "Maintain statistics on the FLASK access vector cache" if EXPERT = "y"
-	depends on FLASK
+	depends on XSM_FLASK
 	---help---
 	  Maintain counters on the access vector cache that can be viewed using
 	  the FLASK_AVC_CACHESTATS sub-op of the xsm_op hypercall.  Disabling
@@ -124,10 +140,10 @@ config FLASK_AVC_STATS
 
 	  If unsure, say Y.
 
-config XSM_POLICY
-	bool "Compile Xen with a built-in security policy"
+config XSM_FLASK_POLICY
+	bool "Compile Xen with a built-in FLASK security policy"
 	default y if HAS_CHECKPOLICY = "y"
-	depends on XSM
+	depends on XSM_FLASK
 	---help---
 	  This includes a default XSM policy in the hypervisor so that the
 	  bootloader does not need to load a policy to get sane behavior from an
@@ -139,6 +155,32 @@ config XSM_POLICY
 	  available when compiling the hypervisor.
 
 	  If unsure, say Y.
+
+config XSM_SILO
+	def_bool y
+	prompt "SILO support"
+	depends on XSM
+	---help---
+	  Enables SILO as the access control mechanism used by the XSM framework.
+	  This is not the default module, add boot parameter xsm=silo to choose
+	  it. This will deny any unmediated communication channels (grant tables
+	  and event channels) between unprivileged VMs.
+
+	  If unsure, say Y.
+
+choice
+	prompt "Default XSM implementation"
+	depends on XSM
+	default XSM_FLASK_DEFAULT if XSM_FLASK
+	default XSM_SILO_DEFAULT if XSM_SILO
+	default XSM_DUMMY_DEFAULT
+	config XSM_DUMMY_DEFAULT
+		bool "Match non-XSM behavior"
+	config XSM_FLASK_DEFAULT
+		bool "FLux Advanced Security Kernel" if XSM_FLASK
+	config XSM_SILO_DEFAULT
+		bool "SILO" if XSM_SILO
+endchoice
 
 config LATE_HWDOM
 	bool "Dedicated hardware domain"
@@ -160,11 +202,31 @@ config LATE_HWDOM
 
 	  If unsure, say N.
 
+config ARGO
+	bool "Argo: hypervisor-mediated interdomain communication" if EXPERT = "y"
+	---help---
+	  Enables a hypercall for domains to ask the hypervisor to perform
+	  data transfer of messages between domains.
+
+	  This allows communication channels to be established that do not
+	  require any shared memory between domains; the hypervisor is the
+	  entity that each domain interacts with. The hypervisor is able to
+	  enforce Mandatory Access Control policy over the communication.
+
+	  If XSM_FLASK is enabled, XSM policy can govern which domains may
+	  communicate via the Argo system.
+
+	  This feature does nothing if the "argo" boot parameter is not present.
+	  Argo is disabled at runtime by default.
+
+	  If unsure, say N.
+
 menu "Schedulers"
 	visible if EXPERT = "y"
 
 config SCHED_CREDIT
-	def_bool y
+	bool "Credit scheduler support"
+	default y
 	---help---
 	  The traditional credit scheduler is a general purpose scheduler.
 
@@ -185,7 +247,7 @@ config SCHED_RTDS
 
 config SCHED_ARINC653
 	bool "ARINC653 scheduler support (EXPERIMENTAL)"
-	default y
+	default DEBUG
 	---help---
 	  The ARINC653 scheduler is a hard real-time scheduler for single
 	  cores, targeted for avionics, drones, and medical devices.
@@ -200,7 +262,7 @@ config SCHED_NULL
 
 choice
 	prompt "Default Scheduler?"
-	default SCHED_CREDIT_DEFAULT
+	default SCHED_CREDIT2_DEFAULT
 
 	config SCHED_CREDIT_DEFAULT
 		bool "Credit Scheduler" if SCHED_CREDIT
@@ -221,7 +283,7 @@ config SCHED_DEFAULT
 	default "rtds" if SCHED_RTDS_DEFAULT
 	default "arinc653" if SCHED_ARINC653_DEFAULT
 	default "null" if SCHED_NULL_DEFAULT
-	default "credit"
+	default "credit2"
 
 endmenu
 
@@ -282,4 +344,17 @@ config CMDLINE_OVERRIDE
 
 	  This is used to work around broken bootloaders. This should
 	  be set to 'N' under normal conditions.
+
+config DOM0_MEM
+	string "Default value for dom0_mem boot parameter"
+	default ""
+	---help---
+	  Sets a default value for dom0_mem, e.g. "512M".
+	  The specified string will be used for the dom0_mem parameter in
+	  case it was not specified on the command line.
+
+	  See docs/misc/xen-command-line.markdown for the supported syntax.
+
+	  Leave empty if you are not sure what to specify.
+
 endmenu

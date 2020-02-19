@@ -88,6 +88,9 @@ static bool __read_mostly using_pit;
 /* Boot timestamp, filled in head.S */
 u64 __initdata boot_tsc_stamp;
 
+/* Per-socket TSC_ADJUST values, for secondary cores/threads to sync to. */
+static uint64_t *__read_mostly tsc_adjust;
+
 /*
  * 32-bit division of integer dividend and integer divisor yielding
  * 32-bit fractional quotient.
@@ -798,7 +801,7 @@ static u64 __init init_platform_timer(void)
     }
 
     if ( rc <= 0 )
-        panic("Unable to find usable platform timer");
+        panic("Unable to find usable platform timer\n");
 
     printk("Platform timer is %s %s\n",
            freq_string(pts->frequency), pts->name);
@@ -914,7 +917,7 @@ static unsigned long get_cmos_time(void)
         cmos_rtc_probe = false;
     else if ( system_state < SYS_STATE_smp_boot && !cmos_rtc_probe )
         panic("System with no CMOS RTC advertised must be booted from EFI"
-              " (or with command line option \"cmos-rtc-probe\")");
+              " (or with command line option \"cmos-rtc-probe\")\n");
 
     for ( ; ; )
     {
@@ -959,7 +962,7 @@ static unsigned long get_cmos_time(void)
     }
 
     if ( unlikely(cmos_rtc_probe) )
-        panic("No CMOS RTC found - system must be booted from EFI");
+        panic("No CMOS RTC found - system must be booted from EFI\n");
 
     return mktime(rtc.year, rtc.mon, rtc.day, rtc.hour, rtc.min, rtc.sec);
 }
@@ -1039,9 +1042,9 @@ static void __update_vcpu_system_time(struct vcpu *v, int force)
 
         if ( is_hvm_domain(d) )
         {
-            struct pl_time *pl = v->domain->arch.hvm_domain.pl_time;
+            struct pl_time *pl = v->domain->arch.hvm.pl_time;
 
-            stime += pl->stime_offset + v->arch.hvm_vcpu.stime_offset;
+            stime += pl->stime_offset + v->arch.hvm.stime_offset;
             if ( stime >= 0 )
                 tsc_stamp = gtime_to_gtsc(d, stime);
             else
@@ -1081,7 +1084,7 @@ static void __update_vcpu_system_time(struct vcpu *v, int force)
         _u.flags |= XEN_PVCLOCK_TSC_STABLE_BIT;
 
     if ( is_hvm_domain(d) )
-        _u.tsc_timestamp += v->arch.hvm_vcpu.cache_tsc_offset;
+        _u.tsc_timestamp += v->arch.hvm.cache_tsc_offset;
 
     /* Don't bother unless timestamp record has changed or we are forced. */
     _u.version = u->version; /* make versions match for memcmp test */
@@ -1090,24 +1093,23 @@ static void __update_vcpu_system_time(struct vcpu *v, int force)
 
     /* 1. Update guest kernel version. */
     _u.version = u->version = version_update_begin(u->version);
-    wmb();
+    smp_wmb();
     /* 2. Update all other guest kernel fields. */
     *u = _u;
-    wmb();
+    smp_wmb();
     /* 3. Update guest kernel version. */
     u->version = version_update_end(u->version);
 
     if ( !update_secondary_system_time(v, &_u) && is_pv_domain(d) &&
          !is_pv_32bit_domain(d) && !(v->arch.flags & TF_kernel_mode) )
-        v->arch.pv_vcpu.pending_system_time = _u;
+        v->arch.pv.pending_system_time = _u;
 }
 
 bool update_secondary_system_time(struct vcpu *v,
                                   struct vcpu_time_info *u)
 {
     XEN_GUEST_HANDLE(vcpu_time_info_t) user_u = v->arch.time_info_guest;
-    struct guest_memory_policy policy =
-        { .smap_policy = SMAP_CHECK_ENABLED, .nested_guest_mode = false };
+    struct guest_memory_policy policy = { .nested_guest_mode = false };
 
     if ( guest_handle_is_null(user_u) )
         return true;
@@ -1120,10 +1122,10 @@ bool update_secondary_system_time(struct vcpu *v,
         update_guest_memory_policy(v, &policy);
         return false;
     }
-    wmb();
+    smp_wmb();
     /* 2. Update all other userspace fields. */
     __copy_to_guest(user_u, u, 1);
-    wmb();
+    smp_wmb();
     /* 3. Update userspace version. */
     u->version = version_update_end(u->version);
     __copy_field_to_guest(user_u, u, version);
@@ -1603,6 +1605,56 @@ void init_percpu_time(void)
     /* Initial estimate for TSC rate. */
     t->tsc_scale = per_cpu(cpu_time, 0).tsc_scale;
 
+    if ( tsc_adjust )
+    {
+        unsigned int socket = cpu_to_socket(smp_processor_id());
+        int64_t adj;
+
+        /* For now we don't want to come here for the BSP. */
+        ASSERT(system_state >= SYS_STATE_smp_boot);
+
+        rdmsrl(MSR_IA32_TSC_ADJUST, adj);
+
+        /*
+         * Check whether this CPU is the first in a package to come up. In
+         * this case do not check the boot value against another package
+         * because the new package might have been physically hotplugged,
+         * where TSC_ADJUST is expected to be different.
+         */
+        if ( cpumask_weight(socket_cpumask[socket]) == 1 )
+        {
+            /*
+             * On the boot CPU we just force the ADJUST value to 0 if it's non-
+             * zero (in early_time_init()). We don't do that on non-boot CPUs
+             * because physical hotplug should have set the ADJUST register to a
+             * value > 0, so the TSC is in sync with the already running CPUs.
+             *
+             * But we always force non-negative ADJUST values for now.
+             */
+            if ( adj < 0 )
+            {
+                printk(XENLOG_WARNING
+                       "TSC ADJUST set to -%lx on CPU%u - clearing\n",
+                       -adj, smp_processor_id());
+                wrmsrl(MSR_IA32_TSC_ADJUST, 0);
+                adj = 0;
+            }
+            tsc_adjust[socket] = adj;
+        }
+        else if ( adj != tsc_adjust[socket] )
+        {
+            static bool __read_mostly warned;
+
+            if ( !warned )
+            {
+                warned = true;
+                printk(XENLOG_WARNING
+                       "Differing TSC ADJUST values within socket(s) - fixing all\n");
+            }
+            wrmsrl(MSR_IA32_TSC_ADJUST, tsc_adjust[socket]);
+        }
+    }
+
     local_irq_save(flags);
     now = read_platform_stime(NULL);
     tsc = rdtsc_ordered();
@@ -1789,6 +1841,15 @@ int __init init_xen_time(void)
     /* Finish platform timer initialization. */
     try_platform_timer_tail(false);
 
+    /*
+     * Setup space to track per-socket TSC_ADJUST values. Don't fiddle with
+     * values if the TSC is not reported as invariant. Ignore allocation
+     * failure here - most systems won't need any adjustment anyway.
+     */
+    if ( boot_cpu_has(X86_FEATURE_TSC_ADJUST) &&
+         boot_cpu_has(X86_FEATURE_ITSC) )
+        tsc_adjust = xzalloc_array(uint64_t, nr_sockets);
+
     return 0;
 }
 
@@ -1798,6 +1859,19 @@ void __init early_time_init(void)
 {
     struct cpu_time *t = &this_cpu(cpu_time);
     u64 tmp;
+
+    if ( boot_cpu_has(X86_FEATURE_TSC_ADJUST) &&
+         boot_cpu_has(X86_FEATURE_ITSC) )
+    {
+        rdmsrl(MSR_IA32_TSC_ADJUST, tmp);
+        if ( tmp )
+        {
+            printk(XENLOG_WARNING
+                   "TSC ADJUST set to %lx on boot CPU - clearing\n", tmp);
+            wrmsrl(MSR_IA32_TSC_ADJUST, 0);
+            boot_tsc_stamp -= tmp;
+        }
+    }
 
     preinit_pit();
     tmp = init_platform_timer();
@@ -2024,7 +2098,7 @@ u64 gtsc_to_gtime(struct domain *d, u64 tsc)
     return time;
 }
 
-void pv_soft_rdtsc(struct vcpu *v, struct cpu_user_regs *regs, int rdtscp)
+uint64_t pv_soft_rdtsc(const struct vcpu *v, const struct cpu_user_regs *regs)
 {
     s_time_t now = get_s_time();
     struct domain *d = v->domain;
@@ -2045,11 +2119,7 @@ void pv_soft_rdtsc(struct vcpu *v, struct cpu_user_regs *regs, int rdtscp)
 
     spin_unlock(&d->arch.vtsc_lock);
 
-    msr_split(regs, gtime_to_gtsc(d, now));
-
-    if ( rdtscp )
-         regs->rcx =
-             (d->arch.tsc_mode == TSC_MODE_PVRDTSCP) ? d->arch.incarnation : 0;
+    return gtime_to_gtsc(d, now);
 }
 
 bool clocksource_is_tsc(void)
@@ -2095,21 +2165,6 @@ void tsc_get_info(struct domain *d, uint32_t *tsc_mode,
         *elapsed_nsec = scale_delta(tsc, &d->arch.vtsc_to_ns);
         *gtsc_khz = enable_tsc_scaling ? d->arch.tsc_khz : cpu_khz;
         break;
-    case TSC_MODE_PVRDTSCP:
-        if ( d->arch.vtsc )
-        {
-            *elapsed_nsec = get_s_time() - d->arch.vtsc_offset;
-            *gtsc_khz = cpu_khz;
-        }
-        else
-        {
-            tsc = rdtsc();
-            *elapsed_nsec = scale_delta(tsc, &this_cpu(cpu_time).tsc_scale) -
-                            d->arch.vtsc_offset;
-            *gtsc_khz = enable_tsc_scaling ? d->arch.tsc_khz
-                                           : 0 /* ignored by tsc_set_info */;
-        }
-        break;
     }
 
     if ( (int64_t)*elapsed_nsec < 0 )
@@ -2124,20 +2179,20 @@ void tsc_get_info(struct domain *d, uint32_t *tsc_mode,
  * only the last "sticks" and all are completed before the guest executes
  * an rdtsc instruction
  */
-void tsc_set_info(struct domain *d,
-                  uint32_t tsc_mode, uint64_t elapsed_nsec,
-                  uint32_t gtsc_khz, uint32_t incarnation)
+int tsc_set_info(struct domain *d,
+                 uint32_t tsc_mode, uint64_t elapsed_nsec,
+                 uint32_t gtsc_khz, uint32_t incarnation)
 {
-    if ( is_idle_domain(d) || is_hardware_domain(d) )
+    ASSERT(!is_system_domain(d));
+
+    if ( is_pv_domain(d) && is_hardware_domain(d) )
     {
         d->arch.vtsc = 0;
-        return;
+        return 0;
     }
 
-    switch ( d->arch.tsc_mode = tsc_mode )
+    switch ( tsc_mode )
     {
-        bool enable_tsc_scaling;
-
     case TSC_MODE_DEFAULT:
     case TSC_MODE_ALWAYS_EMULATE:
         d->arch.vtsc_offset = get_s_time() - elapsed_nsec;
@@ -2163,30 +2218,18 @@ void tsc_set_info(struct domain *d,
         d->arch.vtsc = 1;
         d->arch.ns_to_vtsc = scale_reciprocal(d->arch.vtsc_to_ns);
         break;
-    case TSC_MODE_PVRDTSCP:
-        d->arch.vtsc = !boot_cpu_has(X86_FEATURE_RDTSCP) ||
-                       !host_tsc_is_safe();
-        enable_tsc_scaling = is_hvm_domain(d) && !d->arch.vtsc &&
-                             hvm_get_tsc_scaling_ratio(gtsc_khz ?: cpu_khz);
-        d->arch.tsc_khz = (enable_tsc_scaling && gtsc_khz) ? gtsc_khz : cpu_khz;
-        set_time_scale(&d->arch.vtsc_to_ns, d->arch.tsc_khz * 1000 );
-        d->arch.ns_to_vtsc = scale_reciprocal(d->arch.vtsc_to_ns);
-        if ( d->arch.vtsc )
-            d->arch.vtsc_offset = get_s_time() - elapsed_nsec;
-        else {
-            /* when using native TSC, offset is nsec relative to power-on
-             * of physical machine */
-            d->arch.vtsc_offset = scale_delta(rdtsc(),
-                                              &this_cpu(cpu_time).tsc_scale) -
-                                  elapsed_nsec;
-        }
-        break;
+
+    default:
+        return -EINVAL;
     }
+
+    d->arch.tsc_mode = tsc_mode;
+
     d->arch.incarnation = incarnation + 1;
     if ( is_hvm_domain(d) )
     {
         if ( hvm_tsc_scaling_supported && !d->arch.vtsc )
-            d->arch.hvm_domain.tsc_scaling_ratio =
+            d->arch.hvm.tsc_scaling_ratio =
                 hvm_get_tsc_scaling_ratio(d->arch.tsc_khz);
 
         hvm_set_rdtsc_exiting(d, d->arch.vtsc);
@@ -2200,14 +2243,16 @@ void tsc_set_info(struct domain *d,
              * call set_tsc_offset() later from hvm_vcpu_reset_state() and they
              * will sync their TSC to BSP's sync_tsc.
              */
-            d->arch.hvm_domain.sync_tsc = rdtsc();
-            hvm_funcs.set_tsc_offset(d->vcpu[0],
-                                     d->vcpu[0]->arch.hvm_vcpu.cache_tsc_offset,
-                                     d->arch.hvm_domain.sync_tsc);
+            d->arch.hvm.sync_tsc = rdtsc();
+            hvm_set_tsc_offset(d->vcpu[0],
+                               d->vcpu[0]->arch.hvm.cache_tsc_offset,
+                               d->arch.hvm.sync_tsc);
         }
     }
 
     recalculate_cpuid_policy(d);
+
+    return 0;
 }
 
 /* vtsc may incur measurable performance degradation, diagnose with this */

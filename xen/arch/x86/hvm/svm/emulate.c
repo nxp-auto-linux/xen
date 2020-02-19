@@ -28,7 +28,7 @@
 
 static unsigned long svm_nextrip_insn_length(struct vcpu *v)
 {
-    struct vmcb_struct *vmcb = v->arch.hvm_svm.vmcb;
+    struct vmcb_struct *vmcb = v->arch.hvm.svm.vmcb;
 
     if ( !cpu_has_svm_nrips )
         return 0;
@@ -54,56 +54,30 @@ static unsigned long svm_nextrip_insn_length(struct vcpu *v)
     return vmcb->nextrip - vmcb->rip;
 }
 
-static const struct {
-    unsigned int opcode;
-    struct {
-        unsigned int rm:3;
-        unsigned int reg:3;
-        unsigned int mod:2;
-#define MODRM(mod, reg, rm) { rm, reg, mod }
-    } modrm;
-} opc_tab[INSTR_MAX_COUNT] = {
-    [INSTR_PAUSE]   = { X86EMUL_OPC_F3(0, 0x90) },
-    [INSTR_INT3]    = { X86EMUL_OPC(   0, 0xcc) },
-    [INSTR_HLT]     = { X86EMUL_OPC(   0, 0xf4) },
-    [INSTR_XSETBV]  = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 2, 1) },
-    [INSTR_VMRUN]   = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 0) },
-    [INSTR_VMCALL]  = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 1) },
-    [INSTR_VMLOAD]  = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 2) },
-    [INSTR_VMSAVE]  = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 3) },
-    [INSTR_STGI]    = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 4) },
-    [INSTR_CLGI]    = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 5) },
-    [INSTR_INVLPGA] = { X86EMUL_OPC(0x0f, 0x01), MODRM(3, 3, 7) },
-    [INSTR_INVD]    = { X86EMUL_OPC(0x0f, 0x08) },
-    [INSTR_WBINVD]  = { X86EMUL_OPC(0x0f, 0x09) },
-    [INSTR_WRMSR]   = { X86EMUL_OPC(0x0f, 0x30) },
-    [INSTR_RDTSC]   = { X86EMUL_OPC(0x0f, 0x31) },
-    [INSTR_RDMSR]   = { X86EMUL_OPC(0x0f, 0x32) },
-    [INSTR_CPUID]   = { X86EMUL_OPC(0x0f, 0xa2) },
-};
-
-int __get_instruction_length_from_list(struct vcpu *v,
-        const enum instruction_index *list, unsigned int list_count)
+/*
+ * Early processors with SVM didn't have the NextRIP feature, meaning that
+ * when we take a fault-style VMExit, we have to decode the instruction stream
+ * to calculate how many bytes to move %rip forwards by.
+ *
+ * In debug builds, always compare the hardware reported instruction length
+ * (if available) with the result from x86_decode_insn().
+ */
+unsigned int svm_get_insn_len(struct vcpu *v, unsigned int instr_enc)
 {
-    struct vmcb_struct *vmcb = v->arch.hvm_svm.vmcb;
     struct hvm_emulate_ctxt ctxt;
     struct x86_emulate_state *state;
-    unsigned long inst_len, j;
+    unsigned long nrip_len, emul_len;
+    unsigned int instr_opcode, instr_modrm;
     unsigned int modrm_rm, modrm_reg;
     int modrm_mod;
 
-    /*
-     * In debug builds, always use x86_decode_insn() and compare with
-     * hardware.
-     */
-#ifdef NDEBUG
-    if ( (inst_len = svm_nextrip_insn_length(v)) > MAX_INST_LEN )
-        gprintk(XENLOG_WARNING, "NRip reported inst_len %lu\n", inst_len);
-    else if ( inst_len != 0 )
-        return inst_len;
+    nrip_len = svm_nextrip_insn_length(v);
 
-    if ( vmcb->exitcode == VMEXIT_IOIO )
-        return vmcb->exitinfo2 - vmcb->rip;
+#ifdef NDEBUG
+    if ( nrip_len > MAX_INST_LEN )
+        gprintk(XENLOG_WARNING, "NRip reported inst_len %lu\n", nrip_len);
+    else if ( nrip_len != 0 )
+        return nrip_len;
 #endif
 
     ASSERT(v == current);
@@ -113,46 +87,31 @@ int __get_instruction_length_from_list(struct vcpu *v,
     if ( IS_ERR_OR_NULL(state) )
         return 0;
 
-    inst_len = x86_insn_length(state, &ctxt.ctxt);
+    emul_len = x86_insn_length(state, &ctxt.ctxt);
     modrm_mod = x86_insn_modrm(state, &modrm_rm, &modrm_reg);
     x86_emulate_free_state(state);
-#ifndef NDEBUG
-    if ( vmcb->exitcode == VMEXIT_IOIO )
-        j = vmcb->exitinfo2 - vmcb->rip;
-    else
-        j = svm_nextrip_insn_length(v);
-    if ( j && j != inst_len )
+
+    /* Extract components from instr_enc. */
+    instr_modrm  = instr_enc & 0xff;
+    instr_opcode = instr_enc >> 8;
+
+    if ( instr_opcode == ctxt.ctxt.opcode )
     {
-        gprintk(XENLOG_WARNING, "insn-len[%02x]=%lu (exp %lu)\n",
-                ctxt.ctxt.opcode, inst_len, j);
-        return j;
-    }
-#endif
+        if ( !instr_modrm )
+            return emul_len;
 
-    for ( j = 0; j < list_count; j++ )
-    {
-        unsigned int instr = list[j];
-
-        if ( instr >= ARRAY_SIZE(opc_tab) )
-        {
-            ASSERT_UNREACHABLE();
-            break;
-        }
-        if ( opc_tab[instr].opcode == ctxt.ctxt.opcode )
-        {
-            if ( !opc_tab[instr].modrm.mod )
-                return inst_len;
-
-            if ( modrm_mod == opc_tab[instr].modrm.mod &&
-                 (modrm_rm & 7) == opc_tab[instr].modrm.rm &&
-                 (modrm_reg & 7) == opc_tab[instr].modrm.reg )
-                return inst_len;
-        }
+        if ( modrm_mod       == MASK_EXTR(instr_modrm, 0300) &&
+             (modrm_reg & 7) == MASK_EXTR(instr_modrm, 0070) &&
+             (modrm_rm  & 7) == MASK_EXTR(instr_modrm, 0007) )
+            return emul_len;
     }
 
-    gdprintk(XENLOG_WARNING,
-             "%s: Mismatch between expected and actual instruction: "
-             "eip = %lx\n",  __func__, (unsigned long)vmcb->rip);
+    printk(XENLOG_G_WARNING
+           "Insn mismatch: Expected opcode %#x, modrm %#x, got nrip_len %lu, emul_len %lu\n",
+           instr_opcode, instr_modrm, nrip_len, emul_len);
+    hvm_dump_emulation_state(XENLOG_G_WARNING, "SVM Insn len",
+                             &ctxt, X86EMUL_UNHANDLEABLE);
+
     hvm_inject_hw_exception(TRAP_gp_fault, 0);
     return 0;
 }

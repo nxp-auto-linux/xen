@@ -9,6 +9,7 @@
 #include <asm/asm_defns.h>
 #include <asm/apicdef.h>
 #include <asm/page.h>
+#include <asm/processor.h>
 #include <asm/desc.h>
 #include <public/xen.h>
 #include <irq_vectors.h>
@@ -39,11 +40,17 @@ ENTRY(compat_test_all_events)
         leaq  irq_stat+IRQSTAT_softirq_pending(%rip),%rcx
         cmpl  $0,(%rcx,%rax,1)
         jne   compat_process_softirqs
-        testb $1,VCPU_mce_pending(%rbx)
-        jnz   compat_process_mce
+
+        /* Inject exception if pending. */
+        lea   VCPU_trap_bounce(%rbx), %rdx
+        testb $TBF_EXCEPTION, TRAPBOUNCE_flags(%rdx)
+        jnz   .Lcompat_process_trapbounce
+
+        cmpb  $0, VCPU_mce_pending(%rbx)
+        jne   compat_process_mce
 .Lcompat_test_guest_nmi:
-        testb $1,VCPU_nmi_pending(%rbx)
-        jnz   compat_process_nmi
+        cmpb  $0, VCPU_nmi_pending(%rbx)
+        jne   compat_process_nmi
 compat_test_guest_events:
         movq  VCPU_vcpu_info(%rbx),%rax
         movzwl COMPAT_VCPUINFO_upcall_pending(%rax),%eax
@@ -68,15 +75,24 @@ compat_process_softirqs:
         call  do_softirq
         jmp   compat_test_all_events
 
+        ALIGN
+/* %rbx: struct vcpu, %rdx: struct trap_bounce */
+.Lcompat_process_trapbounce:
+        sti
+.Lcompat_bounce_exception:
+        call  compat_create_bounce_frame
+        movb  $0, TRAPBOUNCE_flags(%rdx)
+        jmp   compat_test_all_events
+
 	ALIGN
 /* %rbx: struct vcpu */
 compat_process_mce:
         testb $1 << VCPU_TRAP_MCE,VCPU_async_exception_mask(%rbx)
         jnz   .Lcompat_test_guest_nmi
         sti
-        movb $0,VCPU_mce_pending(%rbx)
-        call set_guest_machinecheck_trapbounce
-        testl %eax,%eax
+        movb  $0, VCPU_mce_pending(%rbx)
+        call  set_guest_machinecheck_trapbounce
+        test  %al, %al
         jz    compat_test_all_events
         movzbl VCPU_async_exception_mask(%rbx),%edx # save mask for the
         movb %dl,VCPU_mce_old_mask(%rbx)            # iret hypercall
@@ -88,11 +104,11 @@ compat_process_mce:
 /* %rbx: struct vcpu */
 compat_process_nmi:
         testb $1 << VCPU_TRAP_NMI,VCPU_async_exception_mask(%rbx)
-        jnz  compat_test_guest_events
+        jnz   compat_test_guest_events
         sti
-        movb  $0,VCPU_nmi_pending(%rbx)
+        movb  $0, VCPU_nmi_pending(%rbx)
         call  set_guest_nmi_trapbounce
-        testl %eax,%eax
+        test  %al, %al
         jz    compat_test_all_events
         movzbl VCPU_async_exception_mask(%rbx),%edx # save mask for the
         movb %dl,VCPU_nmi_old_mask(%rbx)            # iret hypercall
@@ -109,13 +125,10 @@ ENTRY(compat_restore_all_guest)
         ASSERT_INTERRUPTS_DISABLED
         mov   $~(X86_EFLAGS_IOPL|X86_EFLAGS_NT|X86_EFLAGS_VM),%r11d
         and   UREGS_eflags(%rsp),%r11d
-.Lcr4_orig:
-        .skip .Lcr4_alt_end - .Lcr4_alt, 0x90
-.Lcr4_orig_end:
-        .pushsection .altinstr_replacement, "ax"
-.Lcr4_alt:
+
+.macro alt_cr4_pv32
         testb $3,UREGS_cs(%rsp)
-        jpe   .Lcr4_alt_end
+        jpe   2f
         mov   CPUINFO_cr4-CPUINFO_guest_cpu_user_regs(%rsp), %rax
         and   $~XEN_CR4_PV32_BITS, %rax
 1:
@@ -133,25 +146,20 @@ ENTRY(compat_restore_all_guest)
          */
         cmp   %rax, CPUINFO_cr4-CPUINFO_guest_cpu_user_regs(%rsp)
         jne   1b
-.Lcr4_alt_end:
-        .section .altinstructions, "a"
-        altinstruction_entry .Lcr4_orig, .Lcr4_orig, X86_FEATURE_ALWAYS, \
-                             (.Lcr4_orig_end - .Lcr4_orig), 0
-        altinstruction_entry .Lcr4_orig, .Lcr4_alt, X86_FEATURE_XEN_SMEP, \
-                             (.Lcr4_orig_end - .Lcr4_orig), \
-                             (.Lcr4_alt_end - .Lcr4_alt)
-        altinstruction_entry .Lcr4_orig, .Lcr4_alt, X86_FEATURE_XEN_SMAP, \
-                             (.Lcr4_orig_end - .Lcr4_orig), \
-                             (.Lcr4_alt_end - .Lcr4_alt)
-        .popsection
+2:
+.endm
+	ALTERNATIVE_2 "", \
+            alt_cr4_pv32, X86_FEATURE_XEN_SMEP, \
+            alt_cr4_pv32, X86_FEATURE_XEN_SMAP
+
         or    $X86_EFLAGS_IF,%r11
         mov   %r11d,UREGS_eflags(%rsp)
 
-        mov VCPU_arch_msr(%rbx), %rax
+        mov VCPU_arch_msrs(%rbx), %rax
         mov VCPUMSR_spec_ctrl_raw(%rax), %eax
 
         /* WARNING! `ret`, `call *`, `jmp *` not safe beyond this point. */
-        SPEC_CTRL_EXIT_TO_GUEST /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
+        SPEC_CTRL_EXIT_TO_PV    /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
 
         RESTORE_ALL adj=8 compat=1
 .Lft0:  iretq
@@ -189,15 +197,6 @@ ENTRY(cr4_pv32_restore)
         xor   %eax, %eax
         ret
 
-/* %rdx: trap_bounce, %rbx: struct vcpu */
-ENTRY(compat_post_handle_exception)
-        testb $TBF_EXCEPTION,TRAPBOUNCE_flags(%rdx)
-        jz    compat_test_all_events
-.Lcompat_bounce_exception:
-        call  compat_create_bounce_frame
-        movb  $0,TRAPBOUNCE_flags(%rdx)
-        jmp   compat_test_all_events
-
         .section .text.entry, "ax", @progbits
 
 /* See lstar_enter for entry register state. */
@@ -218,16 +217,16 @@ ENTRY(cstar_enter)
 
         GET_STACK_END(bx)
         mov   STACK_CPUINFO_FIELD(xen_cr3)(%rbx), %rcx
-        neg   %rcx
+        test  %rcx, %rcx
         jz    .Lcstar_cr3_okay
-        mov   %rcx, STACK_CPUINFO_FIELD(xen_cr3)(%rbx)
-        neg   %rcx
+        movb  $0, STACK_CPUINFO_FIELD(use_pv_cr3)(%rbx)
         mov   %rcx, %cr3
-        movq  $0, STACK_CPUINFO_FIELD(xen_cr3)(%rbx)
+        /* %r12 is still zero at this point. */
+        mov   %r12, STACK_CPUINFO_FIELD(xen_cr3)(%rbx)
 .Lcstar_cr3_okay:
         sti
 
-        __GET_CURRENT(bx)
+        movq  STACK_CPUINFO_FIELD(current_vcpu)(%rbx), %rbx
         movq  VCPU_domain(%rbx),%rcx
         cmpb  $0,DOMAIN_is_32bit_pv(%rcx)
         je    switch_to_kernel
@@ -247,7 +246,8 @@ UNLIKELY_START(z, compat_syscall_gpf)
         movq  VCPU_trap_ctxt(%rbx),%rdi
         movl  $TRAP_gp_fault,UREGS_entry_vector(%rsp)
         subl  $2,UREGS_rip(%rsp)
-        movl  $0,TRAPBOUNCE_error_code(%rdx)
+        /* %r12 is still zero at this point. */
+        mov   %r12d, TRAPBOUNCE_error_code(%rdx)
         movl  TRAP_gp_fault * TRAPINFO_sizeof + TRAPINFO_eip(%rdi),%eax
         movzwl TRAP_gp_fault * TRAPINFO_sizeof + TRAPINFO_cs(%rdi),%esi
         testb $4,TRAP_gp_fault * TRAPINFO_sizeof + TRAPINFO_flags(%rdi)

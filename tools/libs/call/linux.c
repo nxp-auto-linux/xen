@@ -56,15 +56,28 @@ int osdep_xencall_open(xencall_handle *xcall)
     }
 
     xcall->fd = fd;
+
+    /*
+     * Try the same for the hypercall buffer device.
+     */
+    fd = open("/dev/xen/hypercall", O_RDWR|O_CLOEXEC);
+    if ( fd == -1 && errno != ENOENT )
+    {
+        PERROR("Error on trying to open hypercall buffer device");
+        return -1;
+    }
+    xcall->buf_fd = fd;
+
     return 0;
 }
 
 int osdep_xencall_close(xencall_handle *xcall)
 {
-    int fd = xcall->fd;
-    if (fd == -1)
-        return 0;
-    return close(fd);
+    if ( xcall->buf_fd >= 0 )
+        close(xcall->buf_fd);
+    if ( xcall->fd >= 0 )
+        close(xcall->fd);
+    return 0;
 }
 
 int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall)
@@ -72,7 +85,23 @@ int osdep_hypercall(xencall_handle *xcall, privcmd_hypercall_t *hypercall)
     return ioctl(xcall->fd, IOCTL_PRIVCMD_HYPERCALL, hypercall);
 }
 
-void *osdep_alloc_pages(xencall_handle *xcall, size_t npages)
+static void *alloc_pages_bufdev(xencall_handle *xcall, size_t npages)
+{
+    void *p;
+
+    p = mmap(NULL, npages * PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED,
+             xcall->buf_fd, 0);
+    if ( p == MAP_FAILED )
+    {
+        PERROR("alloc_pages: mmap (,%zu*%lu,...) [bufdev] failed",
+               npages, (unsigned long)PAGE_SIZE);
+        p = NULL;
+    }
+
+    return p;
+}
+
+static void *alloc_pages_nobufdev(xencall_handle *xcall, size_t npages)
 {
     size_t size = npages * PAGE_SIZE;
     void *p;
@@ -82,7 +111,7 @@ void *osdep_alloc_pages(xencall_handle *xcall, size_t npages)
     p = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_LOCKED, -1, 0);
     if ( p == MAP_FAILED )
     {
-        PERROR("alloc_pages: mmap failed");
+        PERROR("alloc_pages: mmap(,%zu,...) [nobufdev] failed", size);
         return NULL;
     }
 
@@ -91,7 +120,8 @@ void *osdep_alloc_pages(xencall_handle *xcall, size_t npages)
     rc = madvise(p, npages * PAGE_SIZE, MADV_DONTFORK);
     if ( rc < 0 )
     {
-        PERROR("alloc_pages: madvise failed");
+        PERROR("alloc_pages: madvise (,%zu*%lu,) [nobufdev] failed",
+               npages, (unsigned long)PAGE_SIZE);
         goto out;
     }
 
@@ -116,15 +146,36 @@ out:
     return NULL;
 }
 
+void *osdep_alloc_pages(xencall_handle *xcall, size_t npages)
+{
+    void *p;
+
+    if ( xcall->buf_fd >= 0 )
+        p = alloc_pages_bufdev(xcall, npages);
+    else
+        p = alloc_pages_nobufdev(xcall, npages);
+
+    return p;
+}
+
 void osdep_free_pages(xencall_handle *xcall, void *ptr, size_t npages)
 {
     int saved_errno = errno;
-    /* Recover the VMA flags. Maybe it's not necessary */
-    madvise(ptr, npages * PAGE_SIZE, MADV_DOFORK);
+
+    if ( xcall->buf_fd < 0 )
+    {
+        /* Recover the VMA flags. Maybe it's not necessary */
+        madvise(ptr, npages * PAGE_SIZE, MADV_DOFORK);
+    }
 
     munmap(ptr, npages * PAGE_SIZE);
     /* We MUST propagate the hypercall errno, not unmap call's. */
     errno = saved_errno;
+}
+
+int xencall_buffers_never_fault(xencall_handle *xcall)
+{
+    return xcall->buf_fd >= 0;
 }
 
 /*

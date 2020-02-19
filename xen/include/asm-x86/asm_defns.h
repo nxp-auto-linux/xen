@@ -7,20 +7,21 @@
 #include <asm/asm-offsets.h>
 #endif
 #include <asm/bug.h>
-#include <asm/page.h>
-#include <asm/processor.h>
 #include <asm/percpu.h>
+#include <asm/x86-defns.h>
 #include <xen/stringify.h>
 #include <asm/cpufeature.h>
 #include <asm/alternative.h>
 
 #ifdef __ASSEMBLY__
-# include <asm/indirect_thunk_asm.h>
+#ifndef CONFIG_INDIRECT_THUNK
+.equ CONFIG_INDIRECT_THUNK, 0
+#endif
 #else
 asm ( "\t.equ CONFIG_INDIRECT_THUNK, "
       __stringify(IS_ENABLED(CONFIG_INDIRECT_THUNK)) );
-asm ( "\t.include \"asm/indirect_thunk_asm.h\"" );
 #endif
+#include <asm/indirect_thunk_asm.h>
 
 #ifndef __ASSEMBLY__
 void ret_from_intr(void);
@@ -68,7 +69,7 @@ void ret_from_intr(void);
 
 #ifdef __ASSEMBLY__
 
-#ifdef HAVE_GAS_QUOTED_SYM
+#ifdef HAVE_AS_QUOTED_SYM
 #define SUBSECTION_LBL(tag)                        \
         .ifndef .L.tag;                            \
         .equ .L.tag, 1;                            \
@@ -132,11 +133,9 @@ void ret_from_intr(void);
         GET_STACK_END(reg);                       \
         addq $STACK_CPUINFO_FIELD(field), %r##reg
 
-#define __GET_CURRENT(reg)                        \
-        movq STACK_CPUINFO_FIELD(current_vcpu)(%r##reg), %r##reg
 #define GET_CURRENT(reg)                          \
         GET_STACK_END(reg);                       \
-        __GET_CURRENT(reg)
+        movq STACK_CPUINFO_FIELD(current_vcpu)(%r##reg), %r##reg
 
 #ifndef NDEBUG
 #define ASSERT_NOT_IN_ATOMIC                                             \
@@ -151,7 +150,7 @@ void ret_from_intr(void);
 
 #else
 
-#ifdef HAVE_GAS_QUOTED_SYM
+#ifdef HAVE_AS_QUOTED_SYM
 #define SUBSECTION_LBL(tag)                                          \
         ".ifndef .L." #tag "\n\t"                                    \
         ".equ .L." #tag ", 1\n\t"                                    \
@@ -190,46 +189,32 @@ void ret_from_intr(void);
 #endif
 
 /* "Raw" instruction opcodes */
-#define __ASM_CLAC      .byte 0x0f,0x01,0xca
-#define __ASM_STAC      .byte 0x0f,0x01,0xcb
+#define __ASM_CLAC      ".byte 0x0f,0x01,0xca"
+#define __ASM_STAC      ".byte 0x0f,0x01,0xcb"
 
 #ifdef __ASSEMBLY__
-#define ASM_AC(op)                                                     \
-        661: ASM_NOP3;                                                 \
-        .pushsection .altinstr_replacement, "ax";                      \
-        662: __ASM_##op;                                               \
-        .popsection;                                                   \
-        .pushsection .altinstructions, "a";                            \
-        altinstruction_entry 661b, 661b, X86_FEATURE_ALWAYS, 3, 0;     \
-        altinstruction_entry 661b, 662b, X86_FEATURE_XEN_SMAP, 3, 3;       \
-        .popsection
-
-#define ASM_STAC ASM_AC(STAC)
-#define ASM_CLAC ASM_AC(CLAC)
-
-#define CR4_PV32_RESTORE                                           \
-        667: ASM_NOP5;                                             \
-        .pushsection .altinstr_replacement, "ax";                  \
-        668: call cr4_pv32_restore;                                \
-        .section .altinstructions, "a";                            \
-        altinstruction_entry 667b, 667b, X86_FEATURE_ALWAYS, 5, 0; \
-        altinstruction_entry 667b, 668b, X86_FEATURE_XEN_SMEP, 5, 5;   \
-        altinstruction_entry 667b, 668b, X86_FEATURE_XEN_SMAP, 5, 5;   \
-        .popsection
-
+.macro ASM_STAC
+    ALTERNATIVE "", __ASM_STAC, X86_FEATURE_XEN_SMAP
+.endm
+.macro ASM_CLAC
+    ALTERNATIVE "", __ASM_CLAC, X86_FEATURE_XEN_SMAP
+.endm
 #else
 static always_inline void clac(void)
 {
     /* Note: a barrier is implicit in alternative() */
-    alternative(ASM_NOP3, __stringify(__ASM_CLAC), X86_FEATURE_XEN_SMAP);
+    alternative("", __ASM_CLAC, X86_FEATURE_XEN_SMAP);
 }
 
 static always_inline void stac(void)
 {
     /* Note: a barrier is implicit in alternative() */
-    alternative(ASM_NOP3, __stringify(__ASM_STAC), X86_FEATURE_XEN_SMAP);
+    alternative("", __ASM_STAC, X86_FEATURE_XEN_SMAP);
 }
 #endif
+
+#undef __ASM_STAC
+#undef __ASM_CLAC
 
 #ifdef __ASSEMBLY__
 .macro SAVE_ALL op, compat=0
@@ -336,6 +321,17 @@ static always_inline void stac(void)
         subq  $-(UREGS_error_code-UREGS_r15+\adj), %rsp
 .endm
 
+#ifdef CONFIG_PV
+#define CR4_PV32_RESTORE                               \
+    ALTERNATIVE_2 "",                                  \
+        "call cr4_pv32_restore", X86_FEATURE_XEN_SMEP, \
+        "call cr4_pv32_restore", X86_FEATURE_XEN_SMAP
+#else
+#define CR4_PV32_RESTORE
+#endif
+
+#include <asm/spec_ctrl_asm.h>
+
 #endif
 
 #ifdef CONFIG_PERF_COUNTERS
@@ -377,7 +373,5 @@ static always_inline void stac(void)
 3:  desc                /* desc   */      ; \
 4:  .p2align 2                            ; \
     .popsection
-
-#include <asm/spec_ctrl_asm.h>
 
 #endif /* __X86_ASM_DEFNS_H__ */

@@ -24,7 +24,7 @@ DEFINE_XEN_GUEST_HANDLE(xsm_op_t);
 /* policy magic number (defined by XSM_MAGIC) */
 typedef u32 xsm_magic_t;
 
-#ifdef CONFIG_FLASK
+#ifdef CONFIG_XSM_FLASK
 #define XSM_MAGIC 0xf97cff8c
 #else
 #define XSM_MAGIC 0x0
@@ -97,9 +97,9 @@ struct xsm_operations {
 
     char *(*show_irq_sid) (int irq);
     int (*map_domain_pirq) (struct domain *d);
-    int (*map_domain_irq) (struct domain *d, int irq, void *data);
+    int (*map_domain_irq) (struct domain *d, int irq, const void *data);
     int (*unmap_domain_pirq) (struct domain *d);
-    int (*unmap_domain_irq) (struct domain *d, int irq, void *data);
+    int (*unmap_domain_irq) (struct domain *d, int irq, const void *data);
     int (*bind_pt_irq) (struct domain *d, struct xen_domctl_bind_pt_irq *bind);
     int (*unbind_pt_irq) (struct domain *d, struct xen_domctl_bind_pt_irq *bind);
     int (*irq_permission) (struct domain *d, int pirq, uint8_t allow);
@@ -143,7 +143,7 @@ struct xsm_operations {
 
     int (*vm_event_control) (struct domain *d, int mode, int op);
 
-#ifdef CONFIG_HAS_MEM_ACCESS
+#ifdef CONFIG_MEM_ACCESS
     int (*mem_access) (struct domain *d);
 #endif
 
@@ -180,6 +180,14 @@ struct xsm_operations {
     int (*dm_op) (struct domain *d);
 #endif
     int (*xen_version) (uint32_t cmd);
+    int (*domain_resource_map) (struct domain *d);
+#ifdef CONFIG_ARGO
+    int (*argo_enable) (const struct domain *d);
+    int (*argo_register_single_source) (const struct domain *d,
+                                        const struct domain *t);
+    int (*argo_register_any_source) (const struct domain *d);
+    int (*argo_send) (const struct domain *d, const struct domain *t);
+#endif
 };
 
 #ifdef CONFIG_XSM
@@ -581,7 +589,7 @@ static inline int xsm_vm_event_control (xsm_default_t def, struct domain *d, int
     return xsm_ops->vm_event_control(d, mode, op);
 }
 
-#ifdef CONFIG_HAS_MEM_ACCESS
+#ifdef CONFIG_MEM_ACCESS
 static inline int xsm_mem_access (xsm_default_t def, struct domain *d)
 {
     return xsm_ops->mem_access(d);
@@ -692,15 +700,42 @@ static inline int xsm_xen_version (xsm_default_t def, uint32_t op)
     return xsm_ops->xen_version(op);
 }
 
+static inline int xsm_domain_resource_map(xsm_default_t def, struct domain *d)
+{
+    return xsm_ops->domain_resource_map(d);
+}
+
+#ifdef CONFIG_ARGO
+static inline int xsm_argo_enable(const struct domain *d)
+{
+    return xsm_ops->argo_enable(d);
+}
+
+static inline int xsm_argo_register_single_source(const struct domain *d,
+                                                  const struct domain *t)
+{
+    return xsm_ops->argo_register_single_source(d, t);
+}
+
+static inline int xsm_argo_register_any_source(const struct domain *d)
+{
+    return xsm_ops->argo_register_any_source(d);
+}
+
+static inline int xsm_argo_send(const struct domain *d, const struct domain *t)
+{
+    return xsm_ops->argo_send(d, t);
+}
+
+#endif /* CONFIG_ARGO */
+
 #endif /* XSM_NO_WRAPPERS */
 
 #ifdef CONFIG_MULTIBOOT
 extern int xsm_multiboot_init(unsigned long *module_map,
-                              const multiboot_info_t *mbi,
-                              void *(*bootstrap_map)(const module_t *));
+                              const multiboot_info_t *mbi);
 extern int xsm_multiboot_policy_init(unsigned long *module_map,
                                      const multiboot_info_t *mbi,
-                                     void *(*bootstrap_map)(const module_t *),
                                      void **policy_buffer,
                                      size_t *policy_size);
 #endif
@@ -716,7 +751,7 @@ extern int register_xsm(struct xsm_operations *ops);
 extern struct xsm_operations dummy_xsm_ops;
 extern void xsm_fixup_ops(struct xsm_operations *ops);
 
-#ifdef CONFIG_FLASK
+#ifdef CONFIG_XSM_FLASK
 extern void flask_init(const void *policy_buffer, size_t policy_size);
 #else
 static inline void flask_init(const void *policy_buffer, size_t policy_size)
@@ -724,9 +759,15 @@ static inline void flask_init(const void *policy_buffer, size_t policy_size)
 }
 #endif
 
-#ifdef CONFIG_XSM_POLICY
-extern const unsigned char xsm_init_policy[];
-extern const unsigned int xsm_init_policy_size;
+#ifdef CONFIG_XSM_FLASK_POLICY
+extern const unsigned char xsm_flask_init_policy[];
+extern const unsigned int xsm_flask_init_policy_size;
+#endif
+
+#ifdef CONFIG_XSM_SILO
+extern void silo_init(void);
+#else
+static inline void silo_init(void) {}
 #endif
 
 #else /* CONFIG_XSM */
@@ -735,8 +776,7 @@ extern const unsigned int xsm_init_policy_size;
 
 #ifdef CONFIG_MULTIBOOT
 static inline int xsm_multiboot_init (unsigned long *module_map,
-                                      const multiboot_info_t *mbi,
-                                      void *(*bootstrap_map)(const module_t *))
+                                      const multiboot_info_t *mbi)
 {
     return 0;
 }

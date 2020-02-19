@@ -17,9 +17,11 @@
 #include <xen/event.h>
 #include <xen/guest_access.h>
 #include <xen/hypercall.h>
+#include <xen/nospec.h>
 #include <xen/sched.h>
 
 #include <asm/hap.h>
+#include <asm/hvm/cacheattr.h>
 #include <asm/hvm/ioreq.h>
 #include <asm/shadow.h>
 
@@ -187,14 +189,12 @@ static int modified_memory(struct domain *d,
             page = get_page_from_gfn(d, pfn, NULL, P2M_UNSHARE);
             if ( page )
             {
-                mfn_t gmfn = _mfn(page_to_mfn(page));
-
-                paging_mark_dirty(d, gmfn);
+                paging_mark_pfn_dirty(d, _pfn(pfn));
                 /*
                  * These are most probably not page tables any more
                  * don't take a long time and don't die either.
                  */
-                sh_remove_shadows(d, gmfn, 1, 0);
+                sh_remove_shadows(d, page_to_mfn(page), 1, 0);
                 put_page(page);
             }
         }
@@ -233,7 +233,7 @@ static int set_mem_type(struct domain *d,
                         struct xen_dm_op_set_mem_type *data)
 {
     xen_pfn_t last_pfn = data->first_pfn + data->nr - 1;
-    unsigned int iter = 0;
+    unsigned int iter = 0, mem_type;
     int rc = 0;
 
     /* Interface types to internal p2m types */
@@ -253,7 +253,9 @@ static int set_mem_type(struct domain *d,
          unlikely(data->mem_type == HVMMEM_unused) )
         return -EINVAL;
 
-    if ( data->mem_type  == HVMMEM_ioreq_server )
+    mem_type = array_index_nospec(data->mem_type, ARRAY_SIZE(memtype));
+
+    if ( mem_type == HVMMEM_ioreq_server )
     {
         unsigned int flags;
 
@@ -280,10 +282,10 @@ static int set_mem_type(struct domain *d,
 
         if ( p2m_is_shared(t) )
             rc = -EAGAIN;
-        else if ( !allow_p2m_type_change(t, memtype[data->mem_type]) )
+        else if ( !allow_p2m_type_change(t, memtype[mem_type]) )
             rc = -EINVAL;
         else
-            rc = p2m_change_type_one(d, pfn, t, memtype[data->mem_type]);
+            rc = p2m_change_type_one(d, pfn, t, memtype[mem_type]);
 
         put_gfn(d, pfn);
 
@@ -318,17 +320,17 @@ static int inject_event(struct domain *d,
     if ( data->vcpuid >= d->max_vcpus || !(v = d->vcpu[data->vcpuid]) )
         return -EINVAL;
 
-    if ( cmpxchg(&v->arch.hvm_vcpu.inject_event.vector,
+    if ( cmpxchg(&v->arch.hvm.inject_event.vector,
                  HVM_EVENT_VECTOR_UNSET, HVM_EVENT_VECTOR_UPDATING) !=
          HVM_EVENT_VECTOR_UNSET )
         return -EBUSY;
 
-    v->arch.hvm_vcpu.inject_event.type = data->type;
-    v->arch.hvm_vcpu.inject_event.insn_len = data->insn_len;
-    v->arch.hvm_vcpu.inject_event.error_code = data->error_code;
-    v->arch.hvm_vcpu.inject_event.cr2 = data->cr2;
+    v->arch.hvm.inject_event.type = data->type;
+    v->arch.hvm.inject_event.insn_len = data->insn_len;
+    v->arch.hvm.inject_event.error_code = data->error_code;
+    v->arch.hvm.inject_event.cr2 = data->cr2;
     smp_wmb();
-    v->arch.hvm_vcpu.inject_event.vector = data->vector;
+    v->arch.hvm.inject_event.vector = data->vector;
 
     return 0;
 }
@@ -358,6 +360,8 @@ static int dm_op(const struct dmop_args *op_args)
         [XEN_DMOP_inject_msi]                       = sizeof(struct xen_dm_op_inject_msi),
         [XEN_DMOP_map_mem_type_to_ioreq_server]     = sizeof(struct xen_dm_op_map_mem_type_to_ioreq_server),
         [XEN_DMOP_remote_shutdown]                  = sizeof(struct xen_dm_op_remote_shutdown),
+        [XEN_DMOP_relocate_memory]                  = sizeof(struct xen_dm_op_relocate_memory),
+        [XEN_DMOP_pin_memory_cacheattr]             = sizeof(struct xen_dm_op_pin_memory_cacheattr),
     };
 
     rc = rcu_lock_remote_domain_by_id(op_args->domid, &d);
@@ -386,6 +390,8 @@ static int dm_op(const struct dmop_args *op_args)
         goto out;
     }
 
+    op.op = array_index_nospec(op.op, ARRAY_SIZE(op_size));
+
     if ( op_args->buf[0].size < offset + op_size[op.op] )
         goto out;
 
@@ -401,7 +407,6 @@ static int dm_op(const struct dmop_args *op_args)
     {
     case XEN_DMOP_create_ioreq_server:
     {
-        struct domain *curr_d = current->domain;
         struct xen_dm_op_create_ioreq_server *data =
             &op.u.create_ioreq_server;
 
@@ -411,8 +416,8 @@ static int dm_op(const struct dmop_args *op_args)
         if ( data->pad[0] || data->pad[1] || data->pad[2] )
             break;
 
-        rc = hvm_create_ioreq_server(d, curr_d->domain_id, false,
-                                     data->handle_bufioreq, &data->id);
+        rc = hvm_create_ioreq_server(d, data->handle_bufioreq,
+                                     &data->id);
         break;
     }
 
@@ -420,16 +425,19 @@ static int dm_op(const struct dmop_args *op_args)
     {
         struct xen_dm_op_get_ioreq_server_info *data =
             &op.u.get_ioreq_server_info;
+        const uint16_t valid_flags = XEN_DMOP_no_gfns;
 
         const_op = false;
 
         rc = -EINVAL;
-        if ( data->pad )
+        if ( data->flags & ~valid_flags )
             break;
 
         rc = hvm_get_ioreq_server_info(d, data->id,
-                                       &data->ioreq_gfn,
-                                       &data->bufioreq_gfn,
+                                       (data->flags & XEN_DMOP_no_gfns) ?
+                                       NULL : &data->ioreq_gfn,
+                                       (data->flags & XEN_DMOP_no_gfns) ?
+                                       NULL : &data->bufioreq_gfn,
                                        &data->bufioreq_port);
         break;
     }
@@ -644,6 +652,53 @@ static int dm_op(const struct dmop_args *op_args)
         break;
     }
 
+    case XEN_DMOP_relocate_memory:
+    {
+        struct xen_dm_op_relocate_memory *data = &op.u.relocate_memory;
+        struct xen_add_to_physmap xatp = {
+            .domid = op_args->domid,
+            .size = data->size,
+            .space = XENMAPSPACE_gmfn_range,
+            .idx = data->src_gfn,
+            .gpfn = data->dst_gfn,
+        };
+
+        if ( data->pad )
+        {
+            rc = -EINVAL;
+            break;
+        }
+
+        rc = xenmem_add_to_physmap(d, &xatp, 0);
+        if ( rc == 0 && data->size != xatp.size )
+            rc = xatp.size;
+        if ( rc > 0 )
+        {
+            data->size -= rc;
+            data->src_gfn += rc;
+            data->dst_gfn += rc;
+            const_op = false;
+            rc = -ERESTART;
+        }
+        break;
+    }
+
+    case XEN_DMOP_pin_memory_cacheattr:
+    {
+        const struct xen_dm_op_pin_memory_cacheattr *data =
+            &op.u.pin_memory_cacheattr;
+
+        if ( data->pad )
+        {
+            rc = -EINVAL;
+            break;
+        }
+
+        rc = hvm_set_mem_pinned_cacheattr(d, data->start, data->end,
+                                          data->type);
+        break;
+    }
+
     default:
         rc = -EOPNOTSUPP;
         break;
@@ -674,6 +729,8 @@ CHECK_dm_op_set_mem_type;
 CHECK_dm_op_inject_event;
 CHECK_dm_op_inject_msi;
 CHECK_dm_op_remote_shutdown;
+CHECK_dm_op_relocate_memory;
+CHECK_dm_op_pin_memory_cacheattr;
 
 int compat_dm_op(domid_t domid,
                  unsigned int nr_bufs,
@@ -687,7 +744,7 @@ int compat_dm_op(domid_t domid,
         return -E2BIG;
 
     args.domid = domid;
-    args.nr_bufs = nr_bufs;
+    args.nr_bufs = array_index_nospec(nr_bufs, ARRAY_SIZE(args.buf) + 1);
 
     for ( i = 0; i < args.nr_bufs; i++ )
     {
@@ -724,7 +781,7 @@ long do_dm_op(domid_t domid,
         return -E2BIG;
 
     args.domid = domid;
-    args.nr_bufs = nr_bufs;
+    args.nr_bufs = array_index_nospec(nr_bufs, ARRAY_SIZE(args.buf) + 1);
 
     if ( copy_from_guest_offset(&args.buf[0], bufs, 0, args.nr_bufs) )
         return -EFAULT;

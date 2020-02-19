@@ -349,26 +349,17 @@ int vmce_wrmsr(uint32_t msr, uint64_t val)
     return ret;
 }
 
-static int vmce_save_vcpu_ctxt(struct domain *d, hvm_domain_context_t *h)
+#if CONFIG_HVM
+static int vmce_save_vcpu_ctxt(struct vcpu *v, hvm_domain_context_t *h)
 {
-    struct vcpu *v;
-    int err = 0;
+    struct hvm_vmce_vcpu ctxt = {
+        .caps = v->arch.vmce.mcg_cap,
+        .mci_ctl2_bank0 = v->arch.vmce.bank[0].mci_ctl2,
+        .mci_ctl2_bank1 = v->arch.vmce.bank[1].mci_ctl2,
+        .mcg_ext_ctl = v->arch.vmce.mcg_ext_ctl,
+    };
 
-    for_each_vcpu ( d, v )
-    {
-        struct hvm_vmce_vcpu ctxt = {
-            .caps = v->arch.vmce.mcg_cap,
-            .mci_ctl2_bank0 = v->arch.vmce.bank[0].mci_ctl2,
-            .mci_ctl2_bank1 = v->arch.vmce.bank[1].mci_ctl2,
-            .mcg_ext_ctl = v->arch.vmce.mcg_ext_ctl,
-        };
-
-        err = hvm_save_entry(VMCE_VCPU, v->vcpu_id, h, &ctxt);
-        if ( err )
-            break;
-    }
-
-    return err;
+    return hvm_save_entry(VMCE_VCPU, v->vcpu_id, h, &ctxt);
 }
 
 static int vmce_load_vcpu_ctxt(struct domain *d, hvm_domain_context_t *h)
@@ -392,6 +383,7 @@ static int vmce_load_vcpu_ctxt(struct domain *d, hvm_domain_context_t *h)
 
 HVM_REGISTER_SAVE_RESTORE(VMCE_VCPU, vmce_save_vcpu_ctxt,
                           vmce_load_vcpu_ctxt, 1, HVMSR_PER_VCPU);
+#endif
 
 /*
  * for Intel MCE, broadcast vMCE to all vcpus
@@ -540,7 +532,7 @@ int unmmap_broken_page(struct domain *d, mfn_t mfn, unsigned long gfn)
     r_mfn = get_gfn_query(d, gfn, &pt);
     if ( p2m_to_mask(pt) & P2M_UNMAP_TYPES)
     {
-        ASSERT(mfn_x(r_mfn) == mfn_x(mfn));
+        ASSERT(mfn_eq(r_mfn, mfn));
         rc = p2m_change_type_one(d, gfn, pt, p2m_ram_broken);
     }
     put_gfn(d, gfn);

@@ -29,9 +29,10 @@
 #include <xen/sched.h>
 #include <xen/event.h>
 #include <xen/acpi.h>
+#include <xen/cpu.h>
+#include <xen/notifier.h>
 #include <asm/system.h>
 #include <asm/time.h>
-#include <asm/gic.h>
 #include <asm/vgic.h>
 #include <asm/cpufeature.h>
 #include <asm/platform.h>
@@ -121,7 +122,7 @@ static void __init preinit_dt_xen_time(void)
 
     timer = dt_find_matching_node(NULL, timer_ids);
     if ( !timer )
-        panic("Unable to find a compatible timer in the device tree");
+        panic("Unable to find a compatible timer in the device tree\n");
 
     dt_device_set_used_by(timer, DOMID_XEN);
 
@@ -148,7 +149,7 @@ void __init preinit_xen_time(void)
 
     res = platform_init_time();
     if ( res )
-        panic("Timer: Cannot initialize platform timer");
+        panic("Timer: Cannot initialize platform timer\n");
 
     boot_count = READ_SYSREG64(CNTPCT_EL0);
 }
@@ -164,7 +165,7 @@ static void __init init_dt_xen_time(void)
         res = platform_get_irq(timer, i);
 
         if ( res < 0 )
-            panic("Timer: Unable to retrieve IRQ %u from the device tree", i);
+            panic("Timer: Unable to retrieve IRQ %u from the device tree\n", i);
         timer_irq[i] = res;
     }
 }
@@ -177,7 +178,7 @@ int __init init_xen_time(void)
 
     /* Check that this CPU supports the Generic Timer interface */
     if ( !cpu_has_gentimer )
-        panic("CPU does not support the Generic Timer v1 interface");
+        panic("CPU does not support the Generic Timer v1 interface\n");
 
     printk("Generic Timer IRQ: phys=%u hyp=%u virt=%u Freq: %lu KHz\n",
            timer_irq[TIMER_PHYS_NONSECURE_PPI],
@@ -261,7 +262,7 @@ static void vtimer_interrupt(int irq, void *dev_id, struct cpu_user_regs *regs)
 
     current->arch.virt_timer.ctl = READ_SYSREG32(CNTV_CTL_EL0);
     WRITE_SYSREG32(current->arch.virt_timer.ctl | CNTx_CTL_MASK, CNTV_CTL_EL0);
-    vgic_vcpu_inject_irq(current, current->arch.virt_timer.irq);
+    vgic_inject_irq(current->domain, current, current->arch.virt_timer.irq, true);
 }
 
 /*
@@ -313,6 +314,21 @@ void init_timer_interrupt(void)
     check_timer_irq_cfg(timer_irq[TIMER_PHYS_NONSECURE_PPI], "NS-physical");
 }
 
+/*
+ * Revert actions done in init_timer_interrupt that are required to properly
+ * disable this CPU.
+ */
+static void deinit_timer_interrupt(void)
+{
+    WRITE_SYSREG32(0, CNTP_CTL_EL0);    /* Disable physical timer */
+    WRITE_SYSREG32(0, CNTHP_CTL_EL2);   /* Disable hypervisor's timer */
+    isb();
+
+    release_irq(timer_irq[TIMER_HYP_PPI], NULL);
+    release_irq(timer_irq[TIMER_VIRT_PPI], NULL);
+    release_irq(timer_irq[TIMER_PHYS_NONSECURE_PPI], NULL);
+}
+
 /* Wait a set number of microseconds */
 void udelay(unsigned long usecs)
 {
@@ -340,6 +356,34 @@ void domain_set_time_offset(struct domain *d, int64_t time_offset_seconds)
     d->time_offset_seconds = time_offset_seconds;
     /* XXX update guest visible wallclock time */
 }
+
+static int cpu_time_callback(struct notifier_block *nfb,
+                             unsigned long action,
+                             void *hcpu)
+{
+    switch ( action )
+    {
+    case CPU_DYING:
+        deinit_timer_interrupt();
+        break;
+    default:
+        break;
+    }
+
+    return NOTIFY_DONE;
+}
+
+static struct notifier_block cpu_time_nfb = {
+    .notifier_call = cpu_time_callback,
+};
+
+static int __init cpu_time_notifier_init(void)
+{
+    register_cpu_notifier(&cpu_time_nfb);
+
+    return 0;
+}
+__initcall(cpu_time_notifier_init);
 
 /*
  * Local variables:

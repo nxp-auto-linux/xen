@@ -357,7 +357,7 @@ unsigned int __init arch_get_dma_bitsize(void)
              !(node_start_pfn(node) >> (32 - PAGE_SHIFT)) )
             break;
     if ( node >= MAX_NUMNODES )
-        panic("No node with memory below 4Gb");
+        panic("No node with memory below 4Gb\n");
 
     /*
      * Try to not reserve the whole node's memory for DMA, but dividing
@@ -372,14 +372,13 @@ static void dump_numa(unsigned char key)
 {
     s_time_t now = NOW();
     unsigned int i, j, n;
-    int err;
     struct domain *d;
     struct page_info *page;
     unsigned int page_num_node[MAX_NUMNODES];
     const struct vnuma_info *vnuma;
 
-    printk("'%c' pressed -> dumping numa info (now-0x%X:%08X)\n", key,
-           (u32)(now>>32), (u32)now);
+    printk("'%c' pressed -> dumping numa info (now = %"PRI_stime")\n", key,
+           now);
 
     for_each_online_node ( i )
     {
@@ -430,7 +429,7 @@ static void dump_numa(unsigned char key)
         spin_lock(&d->page_alloc_lock);
         page_list_for_each(page, &d->page_list)
         {
-            i = phys_to_nid((paddr_t)page_to_mfn(page) << PAGE_SHIFT);
+            i = phys_to_nid(page_to_maddr(page));
             page_num_node[i]++;
         }
         spin_unlock(&d->page_alloc_lock);
@@ -454,12 +453,10 @@ static void dump_numa(unsigned char key)
         {
             unsigned int start_cpu = ~0U;
 
-            err = snprintf(keyhandler_scratch, 12, "%3u",
-                    vnuma->vnode_to_pnode[i]);
-            if ( err < 0 || vnuma->vnode_to_pnode[i] == NUMA_NO_NODE )
-                strlcpy(keyhandler_scratch, "???", sizeof(keyhandler_scratch));
-
-            printk("       %3u: pnode %s,", i, keyhandler_scratch);
+            if ( vnuma->vnode_to_pnode[i] == NUMA_NO_NODE )
+                printk("       %3u: pnode ???,", i);
+            else
+                printk("       %3u: pnode %3u,", i, vnuma->vnode_to_pnode[i]);
 
             printk(" vcpus ");
 

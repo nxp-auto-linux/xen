@@ -23,8 +23,8 @@
 
 #define XBT_NULL 0
 
-#define XS_OPEN_READONLY	1UL<<0
-#define XS_OPEN_SOCKETONLY      1UL<<1
+#define XS_OPEN_READONLY	(1UL<<0)
+#define XS_OPEN_SOCKETONLY      (1UL<<1)
 
 /*
  * Setting XS_UNWATCH_FILTER arranges that after xs_unwatch, no
@@ -45,7 +45,7 @@
  *                                  xs_unwatch for the first watch
  *                                  has returned.
  */
-#define XS_UNWATCH_FILTER     1UL<<2
+#define XS_UNWATCH_FILTER     (1UL<<2)
 
 struct xs_handle;
 typedef uint32_t xs_transaction_t;
@@ -77,7 +77,7 @@ typedef uint32_t xs_transaction_t;
 struct xs_handle *xs_open(unsigned long flags);
 
 /* Close the connection to the xs daemon. */
-void xs_close(struct xs_handle *xsh);
+void xs_close(struct xs_handle *xsh /* NULL ok */);
 
 /* Connect to the xs daemon.
  * Returns a handle or NULL.
@@ -103,6 +103,7 @@ void xs_daemon_destroy_postfork(struct xs_handle *);
 /* Get contents of a directory.
  * Returns a malloced array: call free() on it after use.
  * Num indicates size.
+ * Returns NULL on failure.
  */
 char **xs_directory(struct xs_handle *h, xs_transaction_t t,
 		    const char *path, unsigned int *num);
@@ -110,6 +111,7 @@ char **xs_directory(struct xs_handle *h, xs_transaction_t t,
 /* Get the value of a single file, nul terminated.
  * Returns a malloced value: call free() on it after use.
  * len indicates length in bytes, not including terminator.
+ * Returns NULL on failure.
  */
 void *xs_read(struct xs_handle *h, xs_transaction_t t,
 	      const char *path, unsigned int *len);
@@ -196,8 +198,9 @@ int xs_fileno(struct xs_handle *h);
 char **xs_check_watch(struct xs_handle *h);
 
 /* Find out what node change was on (will block if nothing pending).
- * Returns array containing the path and token. Use XS_WATCH_* to access these
- * elements. Call free() after use.
+ * Returns array containing the path and token, or NULL.
+ * Use XS_WATCH_* to access these elements.
+ * Call free() after use.
  */
 char **xs_read_watch(struct xs_handle *h, unsigned int *num);
 

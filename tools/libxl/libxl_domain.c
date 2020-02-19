@@ -523,6 +523,40 @@ int libxl_domain_suspend(libxl_ctx *ctx, uint32_t domid, int fd, int flags,
     return AO_CREATE_FAIL(rc);
 }
 
+static void domain_suspend_empty_cb(libxl__egc *egc,
+                              libxl__domain_suspend_state *dss, int rc)
+{
+    STATE_AO_GC(dss->ao);
+    libxl__ao_complete(egc,ao,rc);
+}
+
+int libxl_domain_suspend_only(libxl_ctx *ctx, uint32_t domid,
+                              const libxl_asyncop_how *ao_how)
+{
+    AO_CREATE(ctx, domid, ao_how);
+    libxl__domain_suspend_state *dsps;
+    int rc;
+
+    libxl_domain_type type = libxl__domain_type(gc, domid);
+    if (type == LIBXL_DOMAIN_TYPE_INVALID) {
+        rc = ERROR_FAIL;
+        goto out_err;
+    }
+
+    GCNEW(dsps);
+    dsps->ao = ao;
+    dsps->domid = domid;
+    dsps->type = type;
+    rc = libxl__domain_suspend_init(egc, dsps, type);
+    if (rc < 0) goto out_err;
+    dsps->callback_common_done = domain_suspend_empty_cb;
+    libxl__domain_suspend(egc, dsps);
+    return AO_INPROGRESS;
+
+ out_err:
+    return AO_CREATE_FAIL(rc);
+}
+
 int libxl_domain_pause(libxl_ctx *ctx, uint32_t domid)
 {
     int ret;
@@ -974,6 +1008,10 @@ static void destroy_finish_check(libxl__egc *egc,
 }
 
 /* Callbacks for libxl__destroy_domid */
+static void dm_destroy_cb(libxl__egc *egc,
+                          libxl__destroy_devicemodel_state *ddms,
+                          int rc);
+
 static void devices_destroy_cb(libxl__egc *egc,
                                libxl__devices_remove_state *drs,
                                int rc);
@@ -1032,23 +1070,41 @@ void libxl__destroy_domid(libxl__egc *egc, libxl__destroy_domid_state *dis)
     if (rc < 0) {
         LOGEVD(ERROR, rc, domid, "xc_domain_pause failed");
     }
-    if (dm_present) {
-        if (libxl__destroy_device_model(gc, domid) < 0)
-            LOGD(ERROR, domid, "libxl__destroy_device_model failed");
 
-        libxl__qmp_cleanup(gc, domid);
+    if (dm_present) {
+        dis->ddms.ao = ao;
+        dis->ddms.domid = domid;
+        dis->ddms.callback = dm_destroy_cb;
+
+        libxl__destroy_device_model(egc, &dis->ddms);
+        return;
+    } else {
+        dm_destroy_cb(egc, &dis->ddms, 0);
+        return;
     }
-    dis->drs.ao = ao;
-    dis->drs.domid = domid;
-    dis->drs.callback = devices_destroy_cb;
-    dis->drs.force = 1;
-    libxl__devices_destroy(egc, &dis->drs);
-    return;
 
 out:
     assert(rc);
     dis->callback(egc, dis, rc);
     return;
+}
+
+static void dm_destroy_cb(libxl__egc *egc,
+                          libxl__destroy_devicemodel_state *ddms,
+                          int rc)
+{
+    libxl__destroy_domid_state *dis = CONTAINER_OF(ddms, *dis, ddms);
+    STATE_AO_GC(dis->ao);
+    uint32_t domid = dis->domid;
+
+    if (rc < 0)
+        LOGD(ERROR, domid, "libxl__destroy_device_model failed");
+
+    dis->drs.ao = ao;
+    dis->drs.domid = domid;
+    dis->drs.callback = devices_destroy_cb;
+    dis->drs.force = 1;
+    libxl__devices_destroy(egc, &dis->drs);
 }
 
 static void devices_destroy_cb(libxl__egc *egc,
@@ -1335,6 +1391,12 @@ int libxl_set_vcpuonline(libxl_ctx *ctx, uint32_t domid, libxl_bitmap *cpumap)
     }
 
     maxcpus = libxl_bitmap_count_set(cpumap);
+    if (maxcpus == 0)
+    {
+        LOGED(ERROR, domid, "Requested 0 VCPUs!");
+        rc = ERROR_FAIL;
+        goto out;
+    }
     if (maxcpus > info.vcpu_max_id + 1)
     {
         LOGED(ERROR, domid, "Requested %d VCPUs, however maxcpus is %d!",
@@ -1684,7 +1746,7 @@ int libxl_retrieve_domain_configuration(libxl_ctx *ctx, uint32_t domid,
             p = libxl__device_list(gc, dt, domid, &num);
             if (p == NULL) {
                 LOGD(DEBUG, domid, "No %s from xenstore",
-                     dt->type);
+                     libxl__device_kind_to_string(dt->type));
             }
             devs = libxl__device_type_get_ptr(dt, d_config);
 

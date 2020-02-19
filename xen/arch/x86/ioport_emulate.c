@@ -1,6 +1,6 @@
 /******************************************************************************
  * ioport_emulate.c
- * 
+ *
  * Handle I/O port access quirks of various platforms.
  */
 
@@ -8,33 +8,29 @@
 #include <xen/sched.h>
 #include <xen/dmi.h>
 
-static void ioemul_handle_proliant_quirk(
+static bool ioemul_handle_proliant_quirk(
     u8 opcode, char *io_emul_stub, struct cpu_user_regs *regs)
 {
+    static const char stub[] = {
+        0x9c,       /*    pushf           */
+        0xfa,       /*    cli             */
+        0xee,       /*    out %al, %dx    */
+        0xec,       /* 1: in %dx, %al     */
+        0xa8, 0x80, /*    test $0x80, %al */
+        0x75, 0xfb, /*    jnz 1b          */
+        0x9d,       /*    popf            */
+        0xc3,       /*    ret             */
+    };
     uint16_t port = regs->dx;
     uint8_t value = regs->al;
 
     if ( (opcode != 0xee) || (port != 0xcd4) || !(value & 0x80) )
-        return;
+        return false;
 
-    /*    pushf */
-    io_emul_stub[0] = 0x9c;
-    /*    cli */
-    io_emul_stub[1] = 0xfa;
-    /*    out %al,%dx */
-    io_emul_stub[2] = 0xee;
-    /* 1: in %dx,%al */
-    io_emul_stub[3] = 0xec;
-    /*    test $0x80,%al */
-    io_emul_stub[4] = 0xa8;
-    io_emul_stub[5] = 0x80;
-    /*    jnz 1b */
-    io_emul_stub[6] = 0x75;
-    io_emul_stub[7] = 0xfb;
-    /*    popf */
-    io_emul_stub[8] = 0x9d;
-    /*    ret */
-    io_emul_stub[9] = 0xc3;
+    memcpy(io_emul_stub, stub, sizeof(stub));
+    BUILD_BUG_ON(IOEMUL_QUIRK_STUB_BYTES < sizeof(stub));
+
+    return true;
 }
 
 static int __init proliant_quirk(struct dmi_system_id *d)

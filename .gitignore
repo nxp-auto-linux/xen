@@ -43,9 +43,10 @@ config/Paths.mk
 
 build-*
 dist/*
+docs/tmp.*
 docs/html/
-docs/man/xl.cfg.pod.5
-docs/man/xl.pod.1
+docs/man/xl.cfg.5.pod
+docs/man/xl.1.pod
 docs/man1/
 docs/man5/
 docs/man7/
@@ -168,10 +169,11 @@ tools/flask/utils/flask-set-bool
 tools/flask/utils/flask-label-pci
 tools/fuzz/libelf/afl-libelf-fuzzer
 tools/fuzz/x86_instruction_emulator/asm
-tools/fuzz/x86_instruction_emulator/x86_emulate
-tools/fuzz/x86_instruction_emulator/x86-emulate.[ch]
 tools/fuzz/x86_instruction_emulator/afl-harness
 tools/fuzz/x86_instruction_emulator/afl-harness-cov
+tools/fuzz/x86_instruction_emulator/wrappers.c
+tools/fuzz/x86_instruction_emulator/x86_emulate
+tools/fuzz/x86_instruction_emulator/x86-emulate.[ch]
 tools/helpers/_paths.h
 tools/helpers/init-xenstore-domain
 tools/helpers/xen-init-dom0
@@ -235,14 +237,19 @@ tools/python/build/*
 tools/security/secpol_tool
 tools/security/xen/*
 tools/security/xensec_tool
+tools/tests/depriv/depriv-fd-checker
 tools/tests/x86_emulator/*.bin
 tools/tests/x86_emulator/*.tmp
+tools/tests/x86_emulator/32/x86_emulate
+tools/tests/x86_emulator/3dnow*.[ch]
 tools/tests/x86_emulator/asm
 tools/tests/x86_emulator/avx*.[ch]
 tools/tests/x86_emulator/blowfish.h
+tools/tests/x86_emulator/fma*.[ch]
 tools/tests/x86_emulator/sse*.[ch]
 tools/tests/x86_emulator/test_x86_emulator
 tools/tests/x86_emulator/x86_emulate
+tools/tests/x86_emulator/xop*.[ch]
 tools/tests/xen-access/xen-access
 tools/tests/xenstore/xs-test
 tools/tests/regression/installed/*
@@ -250,6 +257,9 @@ tools/tests/regression/build/*
 tools/tests/regression/downloads/*
 tools/tests/mem-sharing/memshrtool
 tools/tests/mce-test/tools/xen-mceinj
+tools/tests/vpci/list.h
+tools/tests/vpci/vpci.[hc]
+tools/tests/vpci/test_vpci
 tools/xcutils/lsevtchn
 tools/xcutils/readnotes
 tools/xenbackendd/_paths.h
@@ -284,6 +294,7 @@ xen/.config.old
 xen/System.map
 xen/arch/arm/asm-offsets.s
 xen/arch/arm/xen.lds
+xen/arch/x86/asm-macros.i
 xen/arch/x86/asm-offsets.s
 xen/arch/x86/boot/mkelf32
 xen/arch/x86/xen.lds
@@ -293,7 +304,6 @@ xen/arch/x86/boot/*.bin
 xen/arch/x86/boot/*.lnk
 xen/arch/x86/efi.lds
 xen/arch/x86/efi/check.efi
-xen/arch/x86/efi/disabled
 xen/arch/x86/efi/mkreloc
 xen/arch/*/efi/boot.c
 xen/arch/*/efi/compat.c
@@ -302,7 +312,7 @@ xen/arch/*/efi/runtime.c
 xen/include/headers*.chk
 xen/include/asm
 xen/include/asm-*/asm-offsets.h
-xen/include/asm-x86/cpuid-autogen.h
+xen/include/asm-x86/asm-macros.h
 xen/include/compat/*
 xen/include/config/
 xen/include/generated/
@@ -310,6 +320,7 @@ xen/include/public/public
 xen/include/xen/*.new
 xen/include/xen/acm_policy.h
 xen/include/xen/compile.h
+xen/include/xen/lib/x86/cpuid-autogen.h
 xen/test/livepatch/config.h
 xen/test/livepatch/xen_bye_world.livepatch
 xen/test/livepatch/xen_hello_world.livepatch

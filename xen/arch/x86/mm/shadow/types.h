@@ -248,8 +248,6 @@ static inline shadow_l4e_t shadow_l4e_from_mfn(mfn_t mfn, u32 flags)
 #define sh_unhook_64b_mappings     INTERNAL_NAME(sh_unhook_64b_mappings)
 #define sh_paging_mode             INTERNAL_NAME(sh_paging_mode)
 #define sh_detach_old_tables       INTERNAL_NAME(sh_detach_old_tables)
-#define sh_x86_emulate_write       INTERNAL_NAME(sh_x86_emulate_write)
-#define sh_x86_emulate_cmpxchg     INTERNAL_NAME(sh_x86_emulate_cmpxchg)
 #define sh_audit_l1_table          INTERNAL_NAME(sh_audit_l1_table)
 #define sh_audit_fl1_table         INTERNAL_NAME(sh_audit_fl1_table)
 #define sh_audit_l2_table          INTERNAL_NAME(sh_audit_l2_table)
@@ -296,9 +294,9 @@ void sh_destroy_monitor_table(struct vcpu *v, mfn_t mmfn);
  */
 
 #define SH_L1E_MAGIC 0xffffffff00000001ULL
-static inline int sh_l1e_is_magic(shadow_l1e_t sl1e)
+static inline bool sh_l1e_is_magic(shadow_l1e_t sl1e)
 {
-    return ((sl1e.l1 & SH_L1E_MAGIC) == SH_L1E_MAGIC);
+    return (sl1e.l1 & SH_L1E_MAGIC) == SH_L1E_MAGIC;
 }
 
 /* Guest not present: a single magic value */
@@ -307,40 +305,41 @@ static inline shadow_l1e_t sh_l1e_gnp(void)
     return (shadow_l1e_t){ -1ULL };
 }
 
-static inline int sh_l1e_is_gnp(shadow_l1e_t sl1e)
+static inline bool sh_l1e_is_gnp(shadow_l1e_t sl1e)
 {
-    return (sl1e.l1 == sh_l1e_gnp().l1);
+    return sl1e.l1 == sh_l1e_gnp().l1;
 }
 
-/* MMIO: an invalid PTE that contains the GFN of the equivalent guest l1e.
+/*
+ * MMIO: an invalid PTE that contains the GFN of the equivalent guest l1e.
  * We store 28 bits of GFN in bits 4:32 of the entry.
  * The present bit is set, and the U/S and R/W bits are taken from the guest.
- * Bit 3 is always 0, to differentiate from gnp above.  */
+ * Bit 3 is always 0, to differentiate from gnp above.
+ */
 #define SH_L1E_MMIO_MAGIC       0xffffffff00000001ULL
 #define SH_L1E_MMIO_MAGIC_MASK  0xffffffff00000009ULL
 #define SH_L1E_MMIO_GFN_MASK    0x00000000fffffff0ULL
-#define SH_L1E_MMIO_GFN_SHIFT   4
 
 static inline shadow_l1e_t sh_l1e_mmio(gfn_t gfn, u32 gflags)
 {
     return (shadow_l1e_t) { (SH_L1E_MMIO_MAGIC
-                             | (gfn_x(gfn) << SH_L1E_MMIO_GFN_SHIFT)
+                             | MASK_INSR(gfn_x(gfn), SH_L1E_MMIO_GFN_MASK)
                              | (gflags & (_PAGE_USER|_PAGE_RW))) };
 }
 
-static inline int sh_l1e_is_mmio(shadow_l1e_t sl1e)
+static inline bool sh_l1e_is_mmio(shadow_l1e_t sl1e)
 {
-    return ((sl1e.l1 & SH_L1E_MMIO_MAGIC_MASK) == SH_L1E_MMIO_MAGIC);
+    return (sl1e.l1 & SH_L1E_MMIO_MAGIC_MASK) == SH_L1E_MMIO_MAGIC;
 }
 
 static inline gfn_t sh_l1e_mmio_get_gfn(shadow_l1e_t sl1e)
 {
-    return _gfn((sl1e.l1 & SH_L1E_MMIO_GFN_MASK) >> SH_L1E_MMIO_GFN_SHIFT);
+    return _gfn(MASK_EXTR(sl1e.l1, SH_L1E_MMIO_GFN_MASK));
 }
 
-static inline u32 sh_l1e_mmio_get_flags(shadow_l1e_t sl1e)
+static inline uint32_t sh_l1e_mmio_get_flags(shadow_l1e_t sl1e)
 {
-    return (u32)((sl1e.l1 & (_PAGE_USER|_PAGE_RW)));
+    return sl1e.l1 & (_PAGE_USER | _PAGE_RW);
 }
 
 #else

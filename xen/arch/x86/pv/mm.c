@@ -26,12 +26,6 @@
 
 #include "mm.h"
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 /*
  * Get a mapping of a PV guest's l1e for this linear address.  The return
  * pointer should be unmapped using unmap_domain_page().
@@ -93,7 +87,7 @@ bool pv_map_ldt_shadow_page(unsigned int offset)
     struct domain *currd = curr->domain;
     struct page_info *page;
     l1_pgentry_t gl1e, *pl1e;
-    unsigned long linear = curr->arch.pv_vcpu.ldt_base + offset;
+    unsigned long linear = curr->arch.pv.ldt_base + offset;
 
     BUG_ON(unlikely(in_irq()));
 
@@ -103,7 +97,7 @@ bool pv_map_ldt_shadow_page(unsigned int offset)
      * current vcpu, and vcpu_reset() will block until this vcpu has been
      * descheduled before continuing.
      */
-    ASSERT((offset >> 3) <= curr->arch.pv_vcpu.ldt_ents);
+    ASSERT((offset >> 3) <= curr->arch.pv.ldt_ents);
 
     if ( is_pv_32bit_domain(currd) )
         linear = (uint32_t)linear;
@@ -125,10 +119,16 @@ bool pv_map_ldt_shadow_page(unsigned int offset)
     pl1e = &pv_ldt_ptes(curr)[offset >> PAGE_SHIFT];
     l1e_add_flags(gl1e, _PAGE_RW);
 
-    spin_lock(&curr->arch.pv_vcpu.shadow_ldt_lock);
+#ifdef CONFIG_PV_LDT_PAGING
+    spin_lock(&curr->arch.pv.shadow_ldt_lock);
+#endif
+
     l1e_write(pl1e, gl1e);
-    curr->arch.pv_vcpu.shadow_ldt_mapcnt++;
-    spin_unlock(&curr->arch.pv_vcpu.shadow_ldt_lock);
+
+#ifdef CONFIG_PV_LDT_PAGING
+    curr->arch.pv.shadow_ldt_mapcnt++;
+    spin_unlock(&curr->arch.pv.shadow_ldt_lock);
+#endif
 
     return true;
 }

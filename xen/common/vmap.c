@@ -42,7 +42,7 @@ void __init vm_init_type(enum vmap_region type, void *start, void *end)
     bitmap_fill(vm_bitmap(type), vm_low[type]);
 
     /* Populate page tables for the bitmap if necessary. */
-    populate_pt_range(va, 0, vm_low[type] - nr);
+    populate_pt_range(va, vm_low[type] - nr);
 }
 
 static void *vm_alloc(unsigned int nr, unsigned int align,
@@ -208,7 +208,7 @@ void *__vmap(const mfn_t *mfn, unsigned int granularity,
 
     for ( ; va && nr--; ++mfn, cur += PAGE_SIZE * granularity )
     {
-        if ( map_pages_to_xen(cur, mfn_x(*mfn), granularity, flags) )
+        if ( map_pages_to_xen(cur, *mfn, granularity, flags) )
         {
             vunmap(va);
             va = NULL;
@@ -234,7 +234,7 @@ void vunmap(const void *va)
 #ifndef _PAGE_NONE
     destroy_xen_mappings(addr, addr + PAGE_SIZE * pages);
 #else /* Avoid tearing down intermediate page tables. */
-    map_pages_to_xen(addr, 0, pages, _PAGE_NONE);
+    map_pages_to_xen(addr, INVALID_MFN, pages, _PAGE_NONE);
 #endif
     vm_free(va);
 }
@@ -258,7 +258,7 @@ static void *vmalloc_type(size_t size, enum vmap_region type)
         pg = alloc_domheap_page(NULL, 0);
         if ( pg == NULL )
             goto error;
-        mfn[i] = _mfn(page_to_mfn(pg));
+        mfn[i] = page_to_mfn(pg);
     }
 
     va = __vmap(mfn, 1, pages, 1, PAGE_HYPERVISOR, type);
@@ -270,7 +270,7 @@ static void *vmalloc_type(size_t size, enum vmap_region type)
 
  error:
     while ( i-- )
-        free_domheap_page(mfn_to_page(mfn_x(mfn[i])));
+        free_domheap_page(mfn_to_page(mfn[i]));
     xfree(mfn);
     return NULL;
 }

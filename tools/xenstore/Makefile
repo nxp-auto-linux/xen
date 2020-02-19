@@ -15,9 +15,6 @@ CFLAGS += $(CFLAGS_libxentoolcore)
 CFLAGS += -DXEN_LIB_STORED="\"$(XEN_LIB_STORED)\""
 CFLAGS += -DXEN_RUN_STORED="\"$(XEN_RUN_STORED)\""
 
-CFLAGS-$(CONFIG_SYSTEMD)  += $(SYSTEMD_CFLAGS)
-LDFLAGS-$(CONFIG_SYSTEMD) += $(SYSTEMD_LIBS)
-
 CFLAGS  += $(CFLAGS-y)
 LDFLAGS += $(LDFLAGS-y)
 
@@ -74,6 +71,11 @@ xenstored_probes.o: xenstored_solaris.o
 CFLAGS += -DHAVE_DTRACE=1
 endif
 
+ifeq ($(CONFIG_SYSTEMD),y)
+$(XENSTORED_OBJS): CFLAGS += $(SYSTEMD_CFLAGS)
+xenstored: LDFLAGS += $(SYSTEMD_LIBS)
+endif
+
 $(XENSTORED_OBJS): CFLAGS += $(CFLAGS_libxengnttab)
 
 xenstored: $(XENSTORED_OBJS)
@@ -100,6 +102,12 @@ libxenstore.so.$(MAJOR): libxenstore.so.$(MAJOR).$(MINOR)
 	ln -sf $< $@
 
 xs.opic: CFLAGS += -DUSE_PTHREAD
+ifeq ($(CONFIG_Linux),y)
+xs.opic: CFLAGS += -DUSE_DLSYM
+libxenstore.so.$(MAJOR).$(MINOR): APPEND_LDFLAGS += -ldl
+else
+PKG_CONFIG_REMOVE += -ldl
+endif
 
 libxenstore.so.$(MAJOR).$(MINOR): xs.opic xs_lib.opic
 	$(CC) $(LDFLAGS) $(PTHREAD_LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenstore.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(LDLIBS_libxentoolcore) $(SOCKET_LIBS) $(PTHREAD_LIBS) $(APPEND_LDFLAGS)

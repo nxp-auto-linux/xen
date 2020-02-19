@@ -98,7 +98,7 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
     {
         /*
          * Only makes sense for vector-based callback, else HVM-IRQ logic
-         * calls back into itself and deadlocks on hvm_domain.irq_lock.
+         * calls back into itself and deadlocks on hvm.irq_lock.
          */
         if ( !is_hvm_pv_evtchn_domain(d) )
             return -EINVAL;
@@ -122,9 +122,6 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
         break;
 
     case MAP_PIRQ_TYPE_MSI:
-        if ( !msi->table_base )
-            msi->entry_nr = 1;
-        /* fallthrough */
     case MAP_PIRQ_TYPE_MULTI_MSI:
         ret = allocate_and_map_msi_pirq(d, *index, pirq_p, type, msi);
         break;
@@ -242,7 +239,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         }
 
         if ( cmpxchg(&currd->arch.pirq_eoi_map_mfn,
-                     0, page_to_mfn(page)) != 0 )
+                     0, mfn_x(page_to_mfn(page))) != 0 )
         {
             put_page_and_type(page);
             ret = -EBUSY;
@@ -415,7 +412,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( set_iopl.iopl > 3 )
             break;
         ret = 0;
-        curr->arch.pv_vcpu.iopl = MASK_INSR(set_iopl.iopl, X86_EFLAGS_IOPL);
+        curr->arch.pv.iopl = MASK_INSR(set_iopl.iopl, X86_EFLAGS_IOPL);
         break;
     }
 
@@ -432,12 +429,11 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
             break;
         ret = 0;
 #ifndef COMPAT
-        curr->arch.pv_vcpu.iobmp = set_iobitmap.bitmap;
+        curr->arch.pv.iobmp = set_iobitmap.bitmap;
 #else
-        guest_from_compat_handle(curr->arch.pv_vcpu.iobmp,
-                                 set_iobitmap.bitmap);
+        guest_from_compat_handle(curr->arch.pv.iobmp, set_iobitmap.bitmap);
 #endif
-        curr->arch.pv_vcpu.iobmp_limit = set_iobitmap.nr_ports;
+        curr->arch.pv.iobmp_limit = set_iobitmap.nr_ports;
         break;
     }
 
@@ -560,6 +556,17 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 
         ret = pci_mmcfg_reserved(info.address, info.segment,
                                  info.start_bus, info.end_bus, info.flags);
+        if ( !ret && has_vpci(currd) )
+        {
+            /*
+             * For HVM (PVH) domains try to add the newly found MMCFG to the
+             * domain.
+             */
+            ret = register_vpci_mmcfg_handler(currd, info.address,
+                                              info.start_bus, info.end_bus,
+                                              info.segment);
+        }
+
         break;
     }
 

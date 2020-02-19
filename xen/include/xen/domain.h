@@ -13,9 +13,12 @@ typedef union {
     struct compat_vcpu_guest_context *cmp;
 } vcpu_guest_context_u __attribute__((__transparent_union__));
 
-struct vcpu *alloc_vcpu(
+struct vcpu *vcpu_create(
     struct domain *d, unsigned int vcpu_id, unsigned int cpu_id);
+
+unsigned int dom0_max_vcpus(void);
 struct vcpu *alloc_dom0_vcpu0(struct domain *dom0);
+
 int vcpu_reset(struct vcpu *);
 int vcpu_up(struct vcpu *v);
 
@@ -33,7 +36,7 @@ struct domain *alloc_domain_struct(void);
 void free_domain_struct(struct domain *d);
 
 /* Allocate/free a VCPU structure. */
-struct vcpu *alloc_vcpu_struct(void);
+struct vcpu *alloc_vcpu_struct(const struct domain *d);
 void free_vcpu_struct(struct vcpu *v);
 
 /* Allocate/free a PIRQ structure. */
@@ -44,19 +47,20 @@ void free_pirq_struct(void *);
 
 /*
  * Initialise/destroy arch-specific details of a VCPU.
- *  - vcpu_initialise() is called after the basic generic fields of the
+ *  - arch_vcpu_create() is called after the basic generic fields of the
  *    VCPU structure are initialised. Many operations can be applied to the
  *    VCPU at this point (e.g., vcpu_pause()).
- *  - vcpu_destroy() is called only if vcpu_initialise() previously succeeded.
+ *  - arch_vcpu_destroy() is called only if arch_vcpu_create() previously
+ *    succeeded.
  */
-int  vcpu_initialise(struct vcpu *v);
-void vcpu_destroy(struct vcpu *v);
+int  arch_vcpu_create(struct vcpu *v);
+void arch_vcpu_destroy(struct vcpu *v);
 
 int map_vcpu_info(struct vcpu *v, unsigned long gfn, unsigned offset);
 void unmap_vcpu_info(struct vcpu *v);
 
-int arch_domain_create(struct domain *d, unsigned int domcr_flags,
-                       struct xen_arch_domainconfig *config);
+int arch_domain_create(struct domain *d,
+                       struct xen_domctl_createdomain *config);
 
 void arch_domain_destroy(struct domain *d);
 
@@ -65,6 +69,10 @@ void arch_domain_pause(struct domain *d);
 void arch_domain_unpause(struct domain *d);
 
 int arch_domain_soft_reset(struct domain *d);
+
+void arch_domain_creation_finished(struct domain *d);
+
+void arch_p2m_set_access_required(struct domain *d, bool access_required);
 
 int arch_set_info_guest(struct vcpu *, vcpu_guest_context_u);
 void arch_get_info_guest(struct vcpu *, vcpu_guest_context_u);
@@ -82,7 +90,6 @@ void arch_dump_domain_info(struct domain *d);
 
 int arch_vcpu_reset(struct vcpu *);
 
-extern spinlock_t vcpu_alloc_lock;
 bool_t domctl_lock_acquire(void);
 void domctl_lock_release(void);
 

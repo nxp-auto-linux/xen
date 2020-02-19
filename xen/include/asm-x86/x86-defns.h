@@ -43,6 +43,13 @@
 #define X86_CR0_PG              0x80000000 /* Paging                   (RW) */
 
 /*
+ * Intel CPU flags in CR3
+ */
+#define X86_CR3_NOFLUSH    (_AC(1, ULL) << 63)
+#define X86_CR3_ADDR_MASK  (PAGE_MASK & PADDR_MASK)
+#define X86_CR3_PCID_MASK  _AC(0x0fff, ULL) /* Mask for PCID */
+
+/*
  * Intel CPU features in CR4
  */
 #define X86_CR4_VME        0x00000001 /* enable vm86 extensions */
@@ -65,5 +72,39 @@
 #define X86_CR4_SMEP       0x00100000 /* enable SMEP */
 #define X86_CR4_SMAP       0x00200000 /* enable SMAP */
 #define X86_CR4_PKE        0x00400000 /* enable PKE */
+
+/*
+ * XSTATE component flags in XCR0
+ */
+#define X86_XCR0_FP_POS           0
+#define X86_XCR0_FP               (1ULL << X86_XCR0_FP_POS)
+#define X86_XCR0_SSE_POS          1
+#define X86_XCR0_SSE              (1ULL << X86_XCR0_SSE_POS)
+#define X86_XCR0_YMM_POS          2
+#define X86_XCR0_YMM              (1ULL << X86_XCR0_YMM_POS)
+#define X86_XCR0_BNDREGS_POS      3
+#define X86_XCR0_BNDREGS          (1ULL << X86_XCR0_BNDREGS_POS)
+#define X86_XCR0_BNDCSR_POS       4
+#define X86_XCR0_BNDCSR           (1ULL << X86_XCR0_BNDCSR_POS)
+#define X86_XCR0_OPMASK_POS       5
+#define X86_XCR0_OPMASK           (1ULL << X86_XCR0_OPMASK_POS)
+#define X86_XCR0_ZMM_POS          6
+#define X86_XCR0_ZMM              (1ULL << X86_XCR0_ZMM_POS)
+#define X86_XCR0_HI_ZMM_POS       7
+#define X86_XCR0_HI_ZMM           (1ULL << X86_XCR0_HI_ZMM_POS)
+#define X86_XCR0_PKRU_POS         9
+#define X86_XCR0_PKRU             (1ULL << X86_XCR0_PKRU_POS)
+#define X86_XCR0_LWP_POS          62
+#define X86_XCR0_LWP              (1ULL << X86_XCR0_LWP_POS)
+
+/*
+ * Debug status flags in DR6.
+ */
+#define X86_DR6_DEFAULT         0xffff0ff0  /* Default %dr6 value. */
+
+/*
+ * Debug control flags in DR7.
+ */
+#define X86_DR7_DEFAULT         0x00000400  /* Default %dr7 value. */
 
 #endif	/* __XEN_X86_DEFNS_H__ */

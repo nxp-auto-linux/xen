@@ -97,20 +97,16 @@
                           X86_EFLAGS_NT|X86_EFLAGS_DF|X86_EFLAGS_IF|    \
                           X86_EFLAGS_TF)
 
+/*
+ * Host IA32_CR_PAT value to cover all memory types.  This is not the default
+ * MSR_PAT value, and is an ABI with PV guests.
+ */
+#define XEN_MSR_PAT 0x050100070406ul
+
 #ifndef __ASSEMBLY__
 
 struct domain;
 struct vcpu;
-
-/*
- * Default implementation of macro that returns current
- * instruction pointer ("program counter").
- */
-#define current_text_addr() ({                      \
-    void *pc;                                       \
-    asm ( "leaq 1f(%%rip),%0\n1:" : "=r" (pc) );    \
-    pc;                                             \
-})
 
 struct x86_cpu_id {
     uint16_t vendor;
@@ -155,7 +151,6 @@ extern bool probe_cpuid_faulting(void);
 extern void ctxt_switch_levelling(const struct vcpu *next);
 extern void (*ctxt_switch_masking)(const struct vcpu *next);
 
-extern u64 host_pat;
 extern bool_t opt_cpu_info;
 extern u32 cpuid_ext_features;
 extern u64 trampoline_misc_enable_off;
@@ -268,12 +263,6 @@ static always_inline unsigned int cpuid_count_ebx(
     return ebx;
 }
 
-static always_inline void cpuid_count_leaf(uint32_t leaf, uint32_t subleaf,
-                                           struct cpuid_leaf *data)
-{
-    cpuid_count(leaf, subleaf, &data->a, &data->b, &data->c, &data->d);
-}
-
 static inline unsigned long read_cr0(void)
 {
     unsigned long cr0;
@@ -293,6 +282,21 @@ static inline unsigned long read_cr2(void)
     return cr2;
 }
 
+static inline void write_cr3(unsigned long val)
+{
+    asm volatile ( "mov %0, %%cr3" : : "r" (val) : "memory" );
+}
+
+static inline unsigned long cr3_pa(unsigned long cr3)
+{
+    return cr3 & X86_CR3_ADDR_MASK;
+}
+
+static inline unsigned long cr3_pcid(unsigned long cr3)
+{
+    return cr3 & X86_CR3_PCID_MASK;
+}
+
 static inline unsigned long read_cr4(void)
 {
     return get_cpu_info()->cr4;
@@ -300,8 +304,31 @@ static inline unsigned long read_cr4(void)
 
 static inline void write_cr4(unsigned long val)
 {
-    get_cpu_info()->cr4 = val;
-    asm volatile ( "mov %0,%%cr4" : : "r" (val) );
+    struct cpu_info *info = get_cpu_info();
+
+    /* No global pages in case of PCIDs enabled! */
+    ASSERT(!(val & X86_CR4_PGE) || !(val & X86_CR4_PCIDE));
+
+    /*
+     * On hardware supporting FSGSBASE, the value in %cr4 is the kernel's
+     * choice for 64bit PV guests, which impacts whether Xen can use the
+     * instructions.
+     *
+     * The {rd,wr}{fs,gs}base() helpers use info->cr4 to work out whether it
+     * is safe to execute the {RD,WR}{FS,GS}BASE instruction, falling back to
+     * the MSR path if not.  Some users require interrupt safety.
+     *
+     * If FSGSBASE is currently or about to become clear, reflect this in
+     * info->cr4 before updating %cr4, so an interrupt which hits in the
+     * middle won't observe FSGSBASE set in info->cr4 but clear in %cr4.
+     */
+    info->cr4 = val & (info->cr4 | ~X86_CR4_FSGSBASE);
+
+    asm volatile ( "mov %[val], %%cr4"
+                   : "+m" (info->cr4) /* Force ordering without a barrier. */
+                   : [val] "r" (val) );
+
+    info->cr4 = val;
 }
 
 /* Clear and set 'TS' bit respectively */
@@ -327,12 +354,6 @@ static always_inline void set_in_cr4 (unsigned long mask)
 {
     mmu_cr4_features |= mask;
     write_cr4(read_cr4() | mask);
-}
-
-static always_inline void clear_in_cr4 (unsigned long mask)
-{
-    mmu_cr4_features &= ~mask;
-    write_cr4(read_cr4() & ~mask);
 }
 
 static inline unsigned int read_pkru(void)
@@ -375,37 +396,6 @@ static inline bool_t read_pkru_wd(uint32_t pkru, unsigned int pkey)
     return (pkru >> (pkey * PKRU_ATTRS + PKRU_WRITE)) & 1;
 }
 
-/*
- *      NSC/Cyrix CPU configuration register indexes
- */
-
-#define CX86_PCR0 0x20
-#define CX86_GCR  0xb8
-#define CX86_CCR0 0xc0
-#define CX86_CCR1 0xc1
-#define CX86_CCR2 0xc2
-#define CX86_CCR3 0xc3
-#define CX86_CCR4 0xe8
-#define CX86_CCR5 0xe9
-#define CX86_CCR6 0xea
-#define CX86_CCR7 0xeb
-#define CX86_PCR1 0xf0
-#define CX86_DIR0 0xfe
-#define CX86_DIR1 0xff
-#define CX86_ARR_BASE 0xc4
-#define CX86_RCR_BASE 0xdc
-
-/*
- *      NSC/Cyrix CPU indexed register access macros
- */
-
-#define getCx86(reg) ({ outb((reg), 0x22); inb(0x23); })
-
-#define setCx86(reg, data) do { \
-    outb((reg), 0x22); \
-    outb((data), 0x23); \
-} while (0)
-
 static always_inline void __monitor(const void *eax, unsigned long ecx,
                                     unsigned long edx)
 {
@@ -445,18 +435,33 @@ struct __packed __cacheline_aligned tss_struct {
 #define IST_DF   1UL
 #define IST_NMI  2UL
 #define IST_MCE  3UL
-#define IST_MAX  3UL
+#define IST_DB   4UL
+#define IST_MAX  4UL
 
-/* Set the interrupt stack table used by a particular interrupt
- * descriptor table entry. */
-static always_inline void set_ist(idt_entry_t *idt, unsigned long ist)
+/* Set the Interrupt Stack Table used by a particular IDT entry. */
+static inline void set_ist(idt_entry_t *idt, unsigned int ist)
 {
-    idt_entry_t new = *idt;
-
     /* IST is a 3 bit field, 32 bits into the IDT entry. */
     ASSERT(ist <= IST_MAX);
-    new.a = (idt->a & ~(7UL << 32)) | (ist << 32);
-    _write_gate_lower(idt, &new);
+
+    /* Typically used on a live idt.  Disuade any clever optimisations. */
+    ACCESS_ONCE(idt->ist) = ist;
+}
+
+static inline void enable_each_ist(idt_entry_t *idt)
+{
+    set_ist(&idt[TRAP_double_fault],  IST_DF);
+    set_ist(&idt[TRAP_nmi],           IST_NMI);
+    set_ist(&idt[TRAP_machine_check], IST_MCE);
+    set_ist(&idt[TRAP_debug],         IST_DB);
+}
+
+static inline void disable_each_ist(idt_entry_t *idt)
+{
+    set_ist(&idt[TRAP_double_fault],  IST_NONE);
+    set_ist(&idt[TRAP_nmi],           IST_NONE);
+    set_ist(&idt[TRAP_machine_check], IST_NONE);
+    set_ist(&idt[TRAP_debug],         IST_NONE);
 }
 
 #define IDT_ENTRIES 256
@@ -465,8 +470,6 @@ extern idt_entry_t *idt_tables[];
 
 DECLARE_PER_CPU(struct tss_struct, init_tss);
 DECLARE_PER_CPU(root_pgentry_t *, root_pgt);
-
-extern void init_int80_direct_trap(struct vcpu *v);
 
 extern void write_ptbase(struct vcpu *v);
 
@@ -478,6 +481,7 @@ static always_inline void rep_nop(void)
 
 #define cpu_relax() rep_nop()
 
+void show_code(const struct cpu_user_regs *regs);
 void show_stack(const struct cpu_user_regs *regs);
 void show_stack_overflow(unsigned int cpu, const struct cpu_user_regs *regs);
 void show_registers(const struct cpu_user_regs *regs);
@@ -527,8 +531,23 @@ DECLARE_TRAP_HANDLER(entry_int82);
 #undef DECLARE_TRAP_HANDLER
 
 void trap_nop(void);
-void enable_nmis(void);
-void do_reserved_trap(struct cpu_user_regs *regs);
+
+static inline void enable_nmis(void)
+{
+    unsigned long tmp;
+
+    asm volatile ( "mov %%rsp, %[tmp]     \n\t"
+                   "push %[ss]            \n\t"
+                   "push %[tmp]           \n\t"
+                   "pushf                 \n\t"
+                   "push %[cs]            \n\t"
+                   "lea 1f(%%rip), %[tmp] \n\t"
+                   "push %[tmp]           \n\t"
+                   "iretq; 1:             \n\t"
+                   : [tmp] "=&r" (tmp)
+                   : [ss] "i" (__HYPERVISOR_DS),
+                     [cs] "i" (__HYPERVISOR_CS) );
+}
 
 void sysenter_entry(void);
 void sysenter_eflags_saved(void);
@@ -549,8 +568,8 @@ unsigned long alloc_stub_page(unsigned int cpu, unsigned long *mfn);
 
 void cpuid_hypervisor_leaves(const struct vcpu *v, uint32_t leaf,
                              uint32_t subleaf, struct cpuid_leaf *res);
-int rdmsr_hypervisor_regs(uint32_t idx, uint64_t *val);
-int wrmsr_hypervisor_regs(uint32_t idx, uint64_t val);
+int guest_rdmsr_xen(const struct vcpu *v, uint32_t idx, uint64_t *val);
+int guest_wrmsr_xen(struct vcpu *v, uint32_t idx, uint64_t val);
 
 void microcode_set_module(unsigned int);
 int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len);

@@ -1,23 +1,24 @@
 subdir-$(CONFIG_ARM_32) += arm32
 subdir-$(CONFIG_ARM_64) += arm64
-subdir-y += platforms
 subdir-$(CONFIG_ARM_64) += efi
 subdir-$(CONFIG_ACPI) += acpi
+ifneq ($(CONFIG_NO_PLAT),y)
+subdir-y += platforms
+endif
 
 obj-$(CONFIG_HAS_ALTERNATIVE) += alternative.o
 obj-y += bootfdt.init.o
-obj-y += cpu.o
 obj-y += cpuerrata.o
 obj-y += cpufeature.o
 obj-y += decode.o
 obj-y += device.o
 obj-y += domain.o
-obj-y += domain_build.o
+obj-y += domain_build.init.o
 obj-y += domctl.o
 obj-$(EARLY_PRINTK) += early_printk.o
 obj-y += gic.o
 obj-y += gic-v2.o
-obj-$(CONFIG_HAS_GICV3) += gic-v3.o
+obj-$(CONFIG_GICV3) += gic-v3.o
 obj-$(CONFIG_HAS_ITS) += gic-v3-its.o
 obj-$(CONFIG_HAS_ITS) += gic-v3-lpi.o
 obj-y += guestcopy.o
@@ -25,7 +26,7 @@ obj-y += guest_walk.o
 obj-y += hvm.o
 obj-y += io.o
 obj-y += irq.o
-obj-y += kernel.o
+obj-y += kernel.init.o
 obj-$(CONFIG_LIVEPATCH) += livepatch.o
 obj-y += mem_access.o
 obj-y += mm.o
@@ -39,17 +40,20 @@ obj-y += processor.o
 obj-y += psci.o
 obj-y += setup.o
 obj-y += shutdown.o
-obj-y += smc.o
 obj-y += smp.o
 obj-y += smpboot.o
 obj-y += sysctl.o
 obj-y += time.o
 obj-y += traps.o
 obj-y += vcpreg.o
+subdir-$(CONFIG_NEW_VGIC) += vgic
+ifneq ($(CONFIG_NEW_VGIC),y)
+obj-y += gic-vgic.o
 obj-y += vgic.o
 obj-y += vgic-v2.o
-obj-$(CONFIG_HAS_GICV3) += vgic-v3.o
+obj-$(CONFIG_GICV3) += vgic-v3.o
 obj-$(CONFIG_HAS_ITS) += vgic-v3-its.o
+endif
 obj-y += vm_event.o
 obj-y += vtimer.o
 obj-$(CONFIG_SBSA_VUART_CONSOLE) += vpl011.o
@@ -96,10 +100,7 @@ prelink.o: $(ALL_OBJS)
 	$(LD) $(LDFLAGS) -r -o $@ $^
 endif
 
-$(BASEDIR)/common/symbols-dummy.o:
-	$(MAKE) -f $(BASEDIR)/Rules.mk -C $(BASEDIR)/common symbols-dummy.o
-
-$(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
+$(TARGET)-syms: prelink.o xen.lds
 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
 	$(NM) -pa --format=sysv $(@D)/.$(@F).0 \

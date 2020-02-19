@@ -148,21 +148,20 @@ static void dump_cpu(void)
            "            dr0 0x%16.16llx     dr1 0x%16.16llx\n"
            "            dr2 0x%16.16llx     dr3 0x%16.16llx\n"
            "            dr6 0x%16.16llx     dr7 0x%16.16llx\n"
-           "             cs 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             ds 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             es 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             fs 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             gs 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             ss 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "             tr 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "           ldtr 0x%8.8x (0x%16.16llx + 0x%8.8x / 0x%5.5x)\n"
-           "           idtr            (0x%16.16llx + 0x%8.8x)\n"
-           "           gdtr            (0x%16.16llx + 0x%8.8x)\n"
+           "             cs %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             es %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             ds %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             fs %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             gs %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             ss %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.8" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "             tr %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.4" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "           ldtr %#6.4" PRIx32 " (%#18.8" PRIx64 " + %#10.4" PRIx32 " / %#7.4" PRIx32 ")\n"
+           "           idtr        (%#18.8" PRIx64 " + %#10.4" PRIx32 ")\n"
+           "           gdtr        (%#18.8" PRIx64 " + %#10.4" PRIx32 ")\n"
            "    sysenter cs 0x%8.8llx  eip 0x%16.16llx  esp 0x%16.16llx\n"
-           "      shadow gs 0x%16.16llx\n"
-           "      MSR flags 0x%16.16llx  lstar 0x%16.16llx\n"
-           "           star 0x%16.16llx  cstar 0x%16.16llx\n"
-           "         sfmask 0x%16.16llx   efer 0x%16.16llx\n"
+           "      shadow gs %#18.16" PRIx64 "   efer %#18.8" PRIx64 "\n"
+           "          lstar %#18.16" PRIx64 "  cstar %#18.16" PRIx64 "\n"
+           "           star %#18.16" PRIx64 " sfmask %#18.8" PRIx64 "\n"
            "            tsc 0x%16.16llx\n"
            "          event 0x%8.8lx error 0x%8.8lx\n",
            (unsigned long long) c.rax, (unsigned long long) c.rbx,
@@ -179,30 +178,27 @@ static void dump_cpu(void)
            (unsigned long long) c.dr0, (unsigned long long) c.dr1,
            (unsigned long long) c.dr2, (unsigned long long) c.dr3,
            (unsigned long long) c.dr6, (unsigned long long) c.dr7,
-           c.cs_sel, (unsigned long long) c.cs_base, c.cs_limit, c.cs_arbytes,
-           c.ds_sel, (unsigned long long) c.ds_base, c.ds_limit, c.ds_arbytes,
-           c.es_sel, (unsigned long long) c.es_base, c.es_limit, c.es_arbytes,
-           c.fs_sel, (unsigned long long) c.fs_base, c.fs_limit, c.fs_arbytes,
-           c.gs_sel, (unsigned long long) c.gs_base, c.gs_limit, c.gs_arbytes,
-           c.ss_sel, (unsigned long long) c.ss_base, c.ss_limit, c.ss_arbytes,
-           c.tr_sel, (unsigned long long) c.tr_base, c.tr_limit, c.tr_arbytes,
-           c.ldtr_sel, (unsigned long long) c.ldtr_base,
-           c.ldtr_limit, c.ldtr_arbytes,
-           (unsigned long long) c.idtr_base, c.idtr_limit, 
-           (unsigned long long) c.gdtr_base, c.gdtr_limit, 
+           c.cs_sel, c.cs_base, c.cs_limit, c.cs_arbytes,
+           c.ds_sel, c.ds_base, c.ds_limit, c.ds_arbytes,
+           c.es_sel, c.es_base, c.es_limit, c.es_arbytes,
+           c.fs_sel, c.fs_base, c.fs_limit, c.fs_arbytes,
+           c.gs_sel, c.gs_base, c.gs_limit, c.gs_arbytes,
+           c.ss_sel, c.ss_base, c.ss_limit, c.ss_arbytes,
+           c.tr_sel, c.tr_base, c.tr_limit, c.tr_arbytes,
+           c.ldtr_sel, c.ldtr_base, c.ldtr_limit, c.ldtr_arbytes,
+           c.idtr_base, c.idtr_limit,
+           c.gdtr_base, c.gdtr_limit,
            (unsigned long long) c.sysenter_cs, 
            (unsigned long long) c.sysenter_eip, 
            (unsigned long long) c.sysenter_esp,
-           (unsigned long long) c.shadow_gs,
-           (unsigned long long) c.msr_flags,
-           (unsigned long long) c.msr_lstar,
-           (unsigned long long) c.msr_star,
-           (unsigned long long) c.msr_cstar,
-           (unsigned long long) c.msr_syscall_mask,
-           (unsigned long long) c.msr_efer,
+           c.shadow_gs, c.msr_efer,
+           c.msr_lstar, c.msr_cstar,
+           c.msr_star, c.msr_syscall_mask,
            (unsigned long long) c.tsc,
            (unsigned long) c.pending_event, (unsigned long) c.error_code);
-    dump_fpu(&c.fpu_regs);
+
+    if ( c.flags & XEN_X86_FPU_INITIALISED )
+        dump_fpu(&c.fpu_regs);
 }
 
 
@@ -254,9 +250,9 @@ static void dump_lapic_regs(void)
     printf("    LAPIC registers:\n");
     for ( i = 0 ; i < 0x400 ; i += 32 )
     {
-        printf("          0x%4.4x: 0x%16.16llx   0x%4.4x: 0x%16.16llx\n",
-               i, *(unsigned long long *)&r.data[i], 
-               i + 16, *(unsigned long long *)&r.data[i + 16]);        
+        printf("          0x%03x: 0x%08" PRIx32 "   0x%03x: 0x%08" PRIx32 "\n",
+               i, *(uint32_t *)&r.data[i],
+               i + 16, *(uint32_t *)&r.data[i + 16]);
     }
 }
 
@@ -320,23 +316,20 @@ static void dump_rtc(void)
 
 static void dump_hpet(void)
 {
-    int i;
     HVM_SAVE_TYPE(HPET) h;
+    unsigned int i;
+
     READ(h);
-    printf("    HPET: capability %#llx config %#llx\n",
-           (unsigned long long) h.capability,
-           (unsigned long long) h.config);
-    printf("          isr %#llx counter %#llx\n",
-           (unsigned long long) h.isr,
-           (unsigned long long) h.mc64);
+    printf("    HPET: capability %#" PRIx64 " config %#" PRIx64 "\n",
+           h.capability, h.config);
+    printf("          isr %#" PRIx64 " counter %#" PRIx64 "\n",
+           h.isr, h.mc64);
     for ( i = 0; i < HPET_TIMER_NUM; i++ )
     {
-        printf("          timer%i config %#llx cmp %#llx\n", i,
-               (unsigned long long) h.timers[i].config,
-               (unsigned long long) h.timers[i].cmp);
-        printf("          timer%i period %#llx fsb %#llx\n", i, 
-               (unsigned long long) h.period[i],
-               (unsigned long long) h.timers[i].fsb);
+        printf("          timer%u config %#18.16" PRIx64 " cmp %#18.8" PRIx64 "\n",
+               i, h.timers[i].config, h.timers[i].cmp);
+        printf("          timer%u period %#18.8" PRIx64 " fsb %#18.8" PRIx64 "\n",
+               i, h.period[i], h.timers[i].fsb);
     }
 }
 
@@ -351,19 +344,17 @@ static void dump_pmtimer(void)
 static void dump_mtrr(void)
 {
     HVM_SAVE_TYPE(MTRR) p;
-    int i;
+    unsigned int i;
+
     READ(p);
-    printf("    MTRR: PAT 0x%llx, cap 0x%llx, default 0x%llx\n", 
-           (unsigned long long) p.msr_pat_cr,
-           (unsigned long long) p.msr_mtrr_cap,
-           (unsigned long long) p.msr_mtrr_def_type);
+    printf("    MTRR: PAT %#" PRIx64 ", cap %#" PRIx64 ", default %#" PRIx64 "\n",
+           p.msr_pat_cr, p.msr_mtrr_cap, p.msr_mtrr_def_type);
     for ( i = 0 ; i < MTRR_VCNT ; i++ )
-        printf("          var %i 0x%16.16llx 0x%16.16llx\n", i,
-               (unsigned long long) p.msr_mtrr_var[2 * i], 
-               (unsigned long long) p.msr_mtrr_var[2 * i + 1]);
+        printf("          var %u %#18.13" PRIx64 " %#18.13" PRIx64 "\n", i,
+               p.msr_mtrr_var[2 * i], p.msr_mtrr_var[2 * i + 1]);
     for ( i = 0 ; i < NUM_FIXED_MSR ; i++ )
-        printf("          fixed %.2i 0x%16.16llx\n", i,
-               (unsigned long long) p.msr_mtrr_fixed[i]);
+        printf("          fixed %02x %#18.16" PRIx64 "\n",
+               i, p.msr_mtrr_fixed[i]);
 }
 
 static void dump_viridian_domain(void)
@@ -379,9 +370,9 @@ static void dump_viridian_vcpu(void)
 {
     HVM_SAVE_TYPE(VIRIDIAN_VCPU) p;
     READ(p);
-    printf("    VIRIDIAN_VCPU: vp_assist_msr 0x%llx, vp_assist_vector 0x%x\n",
-	   (unsigned long long) p.vp_assist_msr,
-	   p.vp_assist_vector);
+    printf("    VIRIDIAN_VCPU: vp_assist_msr 0x%llx, apic_assist_pending %s\n",
+           (unsigned long long) p.vp_assist_msr,
+           p.apic_assist_pending ? "true" : "false");
 }
 
 static void dump_vmce_vcpu(void)
@@ -477,4 +468,14 @@ int main(int argc, char **argv)
     } while ( desc.typecode != HVM_SAVE_CODE(END) && off < len );
 
     return 0;
-} 
+}
+
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

@@ -29,12 +29,6 @@
 #include <asm/shared.h>
 #include <asm/traps.h>
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 void do_entry_int82(struct cpu_user_regs *regs)
 {
     if ( unlikely(untrusted_msi) )
@@ -69,8 +63,8 @@ void pv_inject_event(const struct x86_event *event)
     else
         ASSERT(error_code == X86_EVENT_NO_EC);
 
-    tb = &curr->arch.pv_vcpu.trap_bounce;
-    ti = &curr->arch.pv_vcpu.trap_ctxt[vector];
+    tb = &curr->arch.pv.trap_bounce;
+    ti = &curr->arch.pv.trap_ctxt[vector];
 
     tb->flags = TBF_EXCEPTION;
     tb->cs    = ti->cs;
@@ -79,7 +73,7 @@ void pv_inject_event(const struct x86_event *event)
     if ( event->type == X86_EVENTTYPE_HW_EXCEPTION &&
          vector == TRAP_page_fault )
     {
-        curr->arch.pv_vcpu.ctrlreg[2] = event->cr2;
+        curr->arch.pv.ctrlreg[2] = event->cr2;
         arch_set_cr2(curr, event->cr2);
 
         /* Re-set error_code.user flag appropriately for the guest. */
@@ -119,7 +113,7 @@ void pv_inject_event(const struct x86_event *event)
 bool set_guest_machinecheck_trapbounce(void)
 {
     struct vcpu *curr = current;
-    struct trap_bounce *tb = &curr->arch.pv_vcpu.trap_bounce;
+    struct trap_bounce *tb = &curr->arch.pv.trap_bounce;
 
     pv_inject_hw_exception(TRAP_machine_check, X86_EVENT_NO_EC);
     tb->flags &= ~TBF_EXCEPTION; /* not needed for MCE delivery path */
@@ -134,26 +128,12 @@ bool set_guest_machinecheck_trapbounce(void)
 bool set_guest_nmi_trapbounce(void)
 {
     struct vcpu *curr = current;
-    struct trap_bounce *tb = &curr->arch.pv_vcpu.trap_bounce;
+    struct trap_bounce *tb = &curr->arch.pv.trap_bounce;
 
     pv_inject_hw_exception(TRAP_nmi, X86_EVENT_NO_EC);
     tb->flags &= ~TBF_EXCEPTION; /* not needed for NMI delivery path */
 
     return !null_trap_bounce(curr, tb);
-}
-
-void init_int80_direct_trap(struct vcpu *v)
-{
-    struct trap_info *ti = &v->arch.pv_vcpu.trap_ctxt[0x80];
-    struct trap_bounce *tb = &v->arch.pv_vcpu.int80_bounce;
-
-    tb->cs  = ti->cs;
-    tb->eip = ti->address;
-
-    if ( null_trap_bounce(v, tb) )
-        tb->flags = 0;
-    else
-        tb->flags = TBF_EXCEPTION | (TI_GET_IF(ti) ? TBF_INTERRUPT : 0);
 }
 
 struct softirq_trap {

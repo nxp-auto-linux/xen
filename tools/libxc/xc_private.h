@@ -40,6 +40,8 @@
 
 #include <xen/sys/privcmd.h>
 
+#include <xen-tools/libs.h>
+
 #if defined(HAVE_VALGRIND_MEMCHECK_H) && !defined(NDEBUG) && !defined(__MINIOS__)
 /* Compile in Valgrind client requests? */
 #include <valgrind/memcheck.h>
@@ -73,11 +75,6 @@ struct iovec {
 #define PAGE_SIZE               XC_PAGE_SIZE
 #define PAGE_MASK               XC_PAGE_MASK
 
-#ifndef ARRAY_SIZE /* MiniOS leaks ARRAY_SIZE into our namespace as part of a
-                    * stubdom build.  It shouldn't... */
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
-#endif
-
 /*
 ** Define max dirty page cache to permit during save/restore -- need to balance 
 ** keeping cache usage down with CPU impact of invalidating too often.
@@ -102,9 +99,6 @@ struct xc_interface_core {
     /* Device model */
     xendevicemodel_handle *dmod;
 };
-
-int osdep_privcmd_open(xc_interface *xch);
-int osdep_privcmd_close(xc_interface *xch);
 
 void *osdep_alloc_hypercall_buffer(xc_interface *xch, int npages);
 void osdep_free_hypercall_buffer(xc_interface *xch, void *ptr, int npages);
@@ -254,9 +248,13 @@ out1:
     return ret;
 }
 
-static inline int do_domctl(xc_interface *xch, struct xen_domctl *domctl)
+static inline int do_domctl_maybe_retry_efault(xc_interface *xch,
+                                               struct xen_domctl *domctl,
+                                               unsigned int retries)
 {
     int ret = -1;
+    unsigned int retry_cnt = 0;
+
     DECLARE_HYPERCALL_BOUNCE(domctl, sizeof(*domctl), XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
 
     domctl->interface_version = XEN_DOMCTL_INTERFACE_VERSION;
@@ -267,8 +265,11 @@ static inline int do_domctl(xc_interface *xch, struct xen_domctl *domctl)
         goto out1;
     }
 
-    ret = xencall1(xch->xcall, __HYPERVISOR_domctl,
-                   HYPERCALL_BUFFER_AS_ARG(domctl));
+    do {
+        ret = xencall1(xch->xcall, __HYPERVISOR_domctl,
+                       HYPERCALL_BUFFER_AS_ARG(domctl));
+    } while ( ret < 0 && errno == EFAULT && retry_cnt++ < retries );
+
     if ( ret < 0 )
     {
         if ( errno == EACCES )
@@ -279,6 +280,18 @@ static inline int do_domctl(xc_interface *xch, struct xen_domctl *domctl)
     xc_hypercall_bounce_post(xch, domctl);
  out1:
     return ret;
+}
+
+static inline int do_domctl(xc_interface *xch, struct xen_domctl *domctl)
+{
+    return do_domctl_maybe_retry_efault(xch, domctl, 0);
+}
+
+static inline int do_domctl_retry_efault(xc_interface *xch, struct xen_domctl *domctl)
+{
+    unsigned int retries = xencall_buffers_never_fault(xch->xcall) ? 0 : 2;
+
+    return do_domctl_maybe_retry_efault(xch, domctl, retries);
 }
 
 static inline int do_sysctl(xc_interface *xch, struct xen_sysctl *sysctl)
@@ -391,22 +404,6 @@ int xc_ffs8(uint8_t x);
 int xc_ffs16(uint16_t x);
 int xc_ffs32(uint32_t x);
 int xc_ffs64(uint64_t x);
-
-#define min(X, Y) ({                             \
-            const typeof (X) _x = (X);           \
-            const typeof (Y) _y = (Y);           \
-            (void) (&_x == &_y);                 \
-            (_x < _y) ? _x : _y; })
-#define max(X, Y) ({                             \
-            const typeof (X) _x = (X);           \
-            const typeof (Y) _y = (Y);           \
-            (void) (&_x == &_y);                 \
-            (_x > _y) ? _x : _y; })
-
-#define min_t(type,x,y) \
-        ({ type __x = (x); type __y = (y); __x < __y ? __x: __y; })
-#define max_t(type,x,y) \
-        ({ type __x = (x); type __y = (y); __x > __y ? __x: __y; })
 
 #define DOMPRINTF(fmt, args...) xc_dom_printf(dom->xch, fmt, ## args)
 #define DOMPRINTF_CALLED(xch) xc_dom_printf((xch), "%s: called", __FUNCTION__)

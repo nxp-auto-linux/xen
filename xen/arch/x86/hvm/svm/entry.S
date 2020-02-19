@@ -43,7 +43,7 @@ ENTRY(svm_asm_do_resume)
         lea  irq_stat+IRQSTAT_softirq_pending(%rip),%rdx
         xor  %ecx,%ecx
         shl  $IRQSTAT_shift,%eax
-        CLGI
+        cli
         cmp  %ecx,(%rdx,%rax,1)
         jne  .Lsvm_process_softirqs
 
@@ -57,33 +57,18 @@ UNLIKELY_START(ne, nsvm_hap)
          * Someone shot down our nested p2m table; go round again
          * and nsvm_vcpu_switch() will fix it for us.
          */
-        STGI
+        sti
         jmp  .Lsvm_do_resume
 __UNLIKELY_END(nsvm_hap)
 
-        call svm_asid_handle_vmrun
+        mov  %rsp, %rdi
+        call svm_vmenter_helper
 
-        cmpb $0,tb_init_done(%rip)
-UNLIKELY_START(nz, svm_trace)
-        call svm_trace_vmentry
-UNLIKELY_END(svm_trace)
-
-        mov  VCPU_svm_vmcb(%rbx),%rcx
-        mov  UREGS_rax(%rsp),%rax
-        mov  %rax,VMCB_rax(%rcx)
-        mov  UREGS_rip(%rsp),%rax
-        mov  %rax,VMCB_rip(%rcx)
-        mov  UREGS_rsp(%rsp),%rax
-        mov  %rax,VMCB_rsp(%rcx)
-        mov  UREGS_eflags(%rsp),%rax
-        or   $X86_EFLAGS_MBS,%rax
-        mov  %rax,VMCB_rflags(%rcx)
-
-        mov VCPU_arch_msr(%rbx), %rax
+        mov VCPU_arch_msrs(%rbx), %rax
         mov VCPUMSR_spec_ctrl_raw(%rax), %eax
 
         /* WARNING! `ret`, `call *`, `jmp *` not safe beyond this point. */
-        SPEC_CTRL_EXIT_TO_GUEST /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
+        SPEC_CTRL_EXIT_TO_HVM   /* Req: a=spec_ctrl %rsp=regs/cpuinfo, Clob: cd */
 
         pop  %r15
         pop  %r14
@@ -102,25 +87,16 @@ UNLIKELY_END(svm_trace)
         pop  %rsi
         pop  %rdi
 
+        CLGI
+        sti
         VMRUN
 
         SAVE_ALL
 
         GET_CURRENT(bx)
 
-        SPEC_CTRL_ENTRY_FROM_VMEXIT /* Req: b=curr %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_HVM    /* Req: b=curr %rsp=regs/cpuinfo, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
-
-        mov  VCPU_svm_vmcb(%rbx),%rcx
-        movb $0,VCPU_svm_vmcb_in_sync(%rbx)
-        mov  VMCB_rax(%rcx),%rax
-        mov  %rax,UREGS_rax(%rsp)
-        mov  VMCB_rip(%rcx),%rax
-        mov  %rax,UREGS_rip(%rsp)
-        mov  VMCB_rsp(%rcx),%rax
-        mov  %rax,UREGS_rsp(%rsp)
-        mov  VMCB_rflags(%rcx),%rax
-        mov  %rax,UREGS_eflags(%rsp)
 
         STGI
 GLOBAL(svm_stgi_label)
@@ -129,6 +105,6 @@ GLOBAL(svm_stgi_label)
         jmp  .Lsvm_do_resume
 
 .Lsvm_process_softirqs:
-        STGI
+        sti
         call do_softirq
         jmp  .Lsvm_do_resume

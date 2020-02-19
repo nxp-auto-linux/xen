@@ -256,6 +256,9 @@ bool_t rangeset_contains_range(
 
     ASSERT(s <= e);
 
+    if ( !r )
+        return false;
+
     read_lock(&r->lock);
     x = find_range(r, s);
     contains = (x && (x->e >= e));
@@ -271,6 +274,9 @@ bool_t rangeset_overlaps_range(
     bool_t overlaps;
 
     ASSERT(s <= e);
+
+    if ( !r )
+        return false;
 
     read_lock(&r->lock);
     x = find_range(r, e);
@@ -348,6 +354,46 @@ int rangeset_claim_range(struct rangeset *r, unsigned long size,
     *s = start;
 
     return 0;
+}
+
+int rangeset_consume_ranges(struct rangeset *r,
+                            int (*cb)(unsigned long s, unsigned long e, void *,
+                                      unsigned long *c),
+                            void *ctxt)
+{
+    int rc = 0;
+
+    write_lock(&r->lock);
+    while ( !rangeset_is_empty(r) )
+    {
+        unsigned long consumed = 0;
+        struct range *x = first_range(r);
+
+        rc = cb(x->s, x->e, ctxt, &consumed);
+
+        ASSERT(consumed <= x->e - x->s + 1);
+        x->s += consumed;
+        if ( x->s > x->e )
+            destroy_range(r, x);
+
+        if ( rc )
+            break;
+    }
+    write_unlock(&r->lock);
+
+    return rc;
+}
+
+static int merge(unsigned long s, unsigned long e, void *data)
+{
+    struct rangeset *r = data;
+
+    return rangeset_add_range(r, s, e);
+}
+
+int rangeset_merge(struct rangeset *r1, struct rangeset *r2)
+{
+    return rangeset_report_ranges(r2, 0, ~0ul, merge, r1);
 }
 
 int rangeset_add_singleton(
@@ -447,6 +493,9 @@ void rangeset_domain_destroy(
     struct domain *d)
 {
     struct rangeset *r;
+
+    if ( list_head_is_null(&d->rangesets) )
+        return;
 
     while ( !list_empty(&d->rangesets) )
     {

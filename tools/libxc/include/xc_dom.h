@@ -99,7 +99,7 @@ struct xc_dom_image {
     struct xc_dom_seg p2m_seg;
     struct xc_dom_seg pgtables_seg;
     struct xc_dom_seg devicetree_seg;
-    struct xc_dom_seg start_info_seg; /* HVMlite only */
+    struct xc_dom_seg start_info_seg;
     xen_pfn_t start_info_pfn;
     xen_pfn_t console_pfn;
     xen_pfn_t xenstore_pfn;
@@ -224,7 +224,15 @@ struct xc_dom_image {
     /* Extra SMBIOS structures passed to HVMLOADER */
     struct xc_hvm_firmware_module smbios_module;
 
+#if defined(__i386__) || defined(__x86_64__)
+    struct e820entry *e820;
+    unsigned int e820_entries;
+#endif
+
     xen_pfn_t vuart_gfn;
+
+    /* Number of vCPUs */
+    unsigned int max_vcpus;
 };
 
 /* --- pluggable kernel loader ------------------------------------- */
@@ -298,7 +306,6 @@ int xc_dom_mem_init(struct xc_dom_image *dom, unsigned int mem_mb);
 int xc_dom_kernel_check_size(struct xc_dom_image *dom, size_t sz);
 int xc_dom_kernel_max_size(struct xc_dom_image *dom, size_t sz);
 
-int xc_dom_module_check_size(struct xc_dom_image *dom, size_t sz);
 int xc_dom_module_max_size(struct xc_dom_image *dom, size_t sz);
 
 int xc_dom_devicetree_max_size(struct xc_dom_image *dom, size_t sz);
@@ -333,14 +340,10 @@ void *xc_dom_boot_domU_map(struct xc_dom_image *dom, xen_pfn_t pfn,
 int xc_dom_boot_image(struct xc_dom_image *dom);
 int xc_dom_compat_check(struct xc_dom_image *dom);
 int xc_dom_gnttab_init(struct xc_dom_image *dom);
-int xc_dom_gnttab_hvm_seed(xc_interface *xch, uint32_t domid,
-                           xen_pfn_t console_gmfn,
-                           xen_pfn_t xenstore_gmfn,
-                           uint32_t console_domid,
-                           uint32_t xenstore_domid);
-int xc_dom_gnttab_seed(xc_interface *xch, uint32_t domid,
-                       xen_pfn_t console_gmfn,
-                       xen_pfn_t xenstore_gmfn,
+int xc_dom_gnttab_seed(xc_interface *xch, uint32_t guest_domid,
+                       bool is_hvm,
+                       xen_pfn_t console_gfn,
+                       xen_pfn_t xenstore_gfn,
                        uint32_t console_domid,
                        uint32_t xenstore_domid);
 bool xc_dom_translated(const struct xc_dom_image *dom);

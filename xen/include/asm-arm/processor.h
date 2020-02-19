@@ -52,6 +52,7 @@
 #define ARM_CPU_PART_CORTEX_A72     0xD08
 #define ARM_CPU_PART_CORTEX_A73     0xD09
 #define ARM_CPU_PART_CORTEX_A75     0xD0A
+#define ARM_CPU_PART_CORTEX_A76     0xD0B
 
 #define MIDR_CORTEX_A12 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A12)
 #define MIDR_CORTEX_A17 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A17)
@@ -61,6 +62,7 @@
 #define MIDR_CORTEX_A72 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A72)
 #define MIDR_CORTEX_A73 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A73)
 #define MIDR_CORTEX_A75 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A75)
+#define MIDR_CORTEX_A76 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A76)
 
 /* MPIDR Multiprocessor Affinity Register */
 #define _MPIDR_UP           (30)
@@ -350,344 +352,10 @@
 
 #ifndef __ASSEMBLY__
 
-struct cpuinfo_arm {
-    union {
-        uint32_t bits;
-        struct {
-            unsigned long revision:4;
-            unsigned long part_number:12;
-            unsigned long architecture:4;
-            unsigned long variant:4;
-            unsigned long implementer:8;
-        };
-    } midr;
-    union {
-        register_t bits;
-        struct {
-            unsigned long aff0:8;
-            unsigned long aff1:8;
-            unsigned long aff2:8;
-            unsigned long mt:1; /* Multi-thread, iff MP == 1 */
-            unsigned long __res0:5;
-            unsigned long up:1; /* UP system, iff MP == 1 */
-            unsigned long mp:1; /* MP extensions */
-
-#ifdef CONFIG_ARM_64
-            unsigned long aff3:8;
-            unsigned long __res1:24;
-#endif
-        };
-    } mpidr;
-
-#ifdef CONFIG_ARM_64
-    /* 64-bit CPUID registers. */
-    union {
-        uint64_t bits[2];
-        struct {
-            unsigned long el0:4;
-            unsigned long el1:4;
-            unsigned long el2:4;
-            unsigned long el3:4;
-            unsigned long fp:4;   /* Floating Point */
-            unsigned long simd:4; /* Advanced SIMD */
-            unsigned long gic:4;  /* GIC support */
-            unsigned long __res0:28;
-            unsigned long csv2:4;
-            unsigned long __res1:4;
-        };
-    } pfr64;
-
-    struct {
-        uint64_t bits[2];
-    } dbg64;
-
-    struct {
-        uint64_t bits[2];
-    } aux64;
-
-    union {
-        uint64_t bits[2];
-        struct {
-            unsigned long pa_range:4;
-            unsigned long asid_bits:4;
-            unsigned long bigend:4;
-            unsigned long secure_ns:4;
-            unsigned long bigend_el0:4;
-            unsigned long tgranule_16K:4;
-            unsigned long tgranule_64K:4;
-            unsigned long tgranule_4K:4;
-            unsigned long __res0:32;
-
-            unsigned long hafdbs:4;
-            unsigned long vmid_bits:4;
-            unsigned long vh:4;
-            unsigned long hpds:4;
-            unsigned long lo:4;
-            unsigned long pan:4;
-            unsigned long __res1:8;
-            unsigned long __res2:32;
-        };
-    } mm64;
-
-    struct {
-        uint64_t bits[2];
-    } isa64;
-
-#endif
-
-    /*
-     * 32-bit CPUID registers. On ARMv8 these describe the properties
-     * when running in 32-bit mode.
-     */
-    union {
-        uint32_t bits[2];
-        struct {
-            unsigned long arm:4;
-            unsigned long thumb:4;
-            unsigned long jazelle:4;
-            unsigned long thumbee:4;
-            unsigned long __res0:16;
-
-            unsigned long progmodel:4;
-            unsigned long security:4;
-            unsigned long mprofile:4;
-            unsigned long virt:4;
-            unsigned long gentimer:4;
-            unsigned long __res1:12;
-        };
-    } pfr32;
-
-    struct {
-        uint32_t bits[1];
-    } dbg32;
-
-    struct {
-        uint32_t bits[1];
-    } aux32;
-
-    struct {
-        uint32_t bits[4];
-    } mm32;
-
-    struct {
-        uint32_t bits[6];
-    } isa32;
-};
-
-/*
- * capabilities of CPUs
- */
-
-extern struct cpuinfo_arm boot_cpu_data;
-
-extern void identify_cpu(struct cpuinfo_arm *);
-
-extern struct cpuinfo_arm cpu_data[];
-#define current_cpu_data cpu_data[smp_processor_id()]
-
 extern register_t __cpu_logical_map[];
 #define cpu_logical_map(cpu) __cpu_logical_map[cpu]
 
-/* HSR data abort size definition */
-enum dabt_size {
-    DABT_BYTE        = 0,
-    DABT_HALF_WORD   = 1,
-    DABT_WORD        = 2,
-    DABT_DOUBLE_WORD = 3,
-};
-
-union hsr {
-    uint32_t bits;
-    struct {
-        unsigned long iss:25;  /* Instruction Specific Syndrome */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    };
-
-    /* Common to all conditional exception classes (0x0N, except 0x00). */
-    struct hsr_cond {
-        unsigned long iss:20;  /* Instruction Specific Syndrome */
-        unsigned long cc:4;    /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } cond;
-
-    struct hsr_wfi_wfe {
-        unsigned long ti:1;    /* Trapped instruction */
-        unsigned long sbzp:19;
-        unsigned long cc:4;    /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } wfi_wfe;
-
-    /* reg, reg0, reg1 are 4 bits on AArch32, the fifth bit is sbzp. */
-    struct hsr_cp32 {
-        unsigned long read:1;  /* Direction */
-        unsigned long crm:4;   /* CRm */
-        unsigned long reg:5;   /* Rt */
-        unsigned long crn:4;   /* CRn */
-        unsigned long op1:3;   /* Op1 */
-        unsigned long op2:3;   /* Op2 */
-        unsigned long cc:4;    /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } cp32; /* HSR_EC_CP15_32, CP14_32, CP10 */
-
-    struct hsr_cp64 {
-        unsigned long read:1;   /* Direction */
-        unsigned long crm:4;    /* CRm */
-        unsigned long reg1:5;   /* Rt1 */
-        unsigned long reg2:5;   /* Rt2 */
-        unsigned long sbzp2:1;
-        unsigned long op1:4;    /* Op1 */
-        unsigned long cc:4;     /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;    /* Instruction length */
-        unsigned long ec:6;     /* Exception Class */
-    } cp64; /* HSR_EC_CP15_64, HSR_EC_CP14_64 */
-
-     struct hsr_cp {
-        unsigned long coproc:4; /* Number of coproc accessed */
-        unsigned long sbz0p:1;
-        unsigned long tas:1;    /* Trapped Advanced SIMD */
-        unsigned long res0:14;
-        unsigned long cc:4;     /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;    /* Instruction length */
-        unsigned long ec:6;     /* Exception Class */
-    } cp; /* HSR_EC_CP */
-
-    /*
-     * This encoding is valid only for ARMv8 (ARM DDI 0487B.a, pages D7-2271 and
-     * G6-4957). On ARMv7, encoding ISS for EC=0x13 is defined as UNK/SBZP
-     * (ARM DDI 0406C.c page B3-1431). UNK/SBZP means that hardware implements
-     * this field as Read-As-Zero. ARMv8 is backwards compatible with ARMv7:
-     * reading CCKNOWNPASS on ARMv7 will return 0, which means that condition
-     * check was passed or instruction was unconditional.
-     */
-    struct hsr_smc32 {
-        unsigned long res0:19;  /* Reserved */
-        unsigned long ccknownpass:1; /* Instruction passed conditional check */
-        unsigned long cc:4;    /* Condition Code */
-        unsigned long ccvalid:1;/* CC Valid */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } smc32; /* HSR_EC_SMC32 */
-
-#ifdef CONFIG_ARM_64
-    struct hsr_sysreg {
-        unsigned long read:1;   /* Direction */
-        unsigned long crm:4;    /* CRm */
-        unsigned long reg:5;    /* Rt */
-        unsigned long crn:4;    /* CRn */
-        unsigned long op1:3;    /* Op1 */
-        unsigned long op2:3;    /* Op2 */
-        unsigned long op0:2;    /* Op0 */
-        unsigned long res0:3;
-        unsigned long len:1;    /* Instruction length */
-        unsigned long ec:6;
-    } sysreg; /* HSR_EC_SYSREG */
 #endif
-
-    struct hsr_iabt {
-        unsigned long ifsc:6;  /* Instruction fault status code */
-        unsigned long res0:1;  /* RES0 */
-        unsigned long s1ptw:1; /* Stage 2 fault during stage 1 translation */
-        unsigned long res1:1;  /* RES0 */
-        unsigned long eat:1;   /* External abort type */
-        unsigned long fnv:1;   /* FAR not Valid */
-        unsigned long res2:14;
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } iabt; /* HSR_EC_INSTR_ABORT_* */
-
-    struct hsr_dabt {
-        unsigned long dfsc:6;  /* Data Fault Status Code */
-        unsigned long write:1; /* Write / not Read */
-        unsigned long s1ptw:1; /* Stage 2 fault during stage 1 translation */
-        unsigned long cache:1; /* Cache Maintenance */
-        unsigned long eat:1;   /* External Abort Type */
-        unsigned long fnv:1;   /* FAR not Valid */
-#ifdef CONFIG_ARM_32
-        unsigned long sbzp0:5;
-#else
-        unsigned long sbzp0:3;
-        unsigned long ar:1;    /* Acquire Release */
-        unsigned long sf:1;    /* Sixty Four bit register */
-#endif
-        unsigned long reg:5;   /* Register */
-        unsigned long sign:1;  /* Sign extend */
-        unsigned long size:2;  /* Access Size */
-        unsigned long valid:1; /* Syndrome Valid */
-        unsigned long len:1;   /* Instruction length */
-        unsigned long ec:6;    /* Exception Class */
-    } dabt; /* HSR_EC_DATA_ABORT_* */
-
-    /* Contain the common bits between DABT and IABT */
-    struct hsr_xabt {
-        unsigned long fsc:6;    /* Fault status code */
-        unsigned long pad1:1;   /* Not common */
-        unsigned long s1ptw:1;  /* Stage 2 fault during stage 1 translation */
-        unsigned long pad2:1;   /* Not common */
-        unsigned long eat:1;    /* External abort type */
-        unsigned long fnv:1;    /* FAR not Valid */
-        unsigned long pad3:14;  /* Not common */
-        unsigned long len:1;    /* Instruction length */
-        unsigned long ec:6;     /* Exception Class */
-    } xabt;
-
-#ifdef CONFIG_ARM_64
-    struct hsr_brk {
-        unsigned long comment:16;   /* Comment */
-        unsigned long res0:9;
-        unsigned long len:1;        /* Instruction length */
-        unsigned long ec:6;         /* Exception Class */
-    } brk;
-#endif
-
-
-};
-#endif
-
-/* HSR.EC == HSR_CP{15,14,10}_32 */
-#define HSR_CP32_OP2_MASK (0x000e0000)
-#define HSR_CP32_OP2_SHIFT (17)
-#define HSR_CP32_OP1_MASK (0x0001c000)
-#define HSR_CP32_OP1_SHIFT (14)
-#define HSR_CP32_CRN_MASK (0x00003c00)
-#define HSR_CP32_CRN_SHIFT (10)
-#define HSR_CP32_CRM_MASK (0x0000001e)
-#define HSR_CP32_CRM_SHIFT (1)
-#define HSR_CP32_REGS_MASK (HSR_CP32_OP1_MASK|HSR_CP32_OP2_MASK|\
-                            HSR_CP32_CRN_MASK|HSR_CP32_CRM_MASK)
-
-/* HSR.EC == HSR_CP{15,14}_64 */
-#define HSR_CP64_OP1_MASK (0x000f0000)
-#define HSR_CP64_OP1_SHIFT (16)
-#define HSR_CP64_CRM_MASK (0x0000001e)
-#define HSR_CP64_CRM_SHIFT (1)
-#define HSR_CP64_REGS_MASK (HSR_CP64_OP1_MASK|HSR_CP64_CRM_MASK)
-
-/* HSR.EC == HSR_SYSREG */
-#define HSR_SYSREG_OP0_MASK (0x00300000)
-#define HSR_SYSREG_OP0_SHIFT (20)
-#define HSR_SYSREG_OP1_MASK (0x0001c000)
-#define HSR_SYSREG_OP1_SHIFT (14)
-#define HSR_SYSREG_CRN_MASK (0x00003c00)
-#define HSR_SYSREG_CRN_SHIFT (10)
-#define HSR_SYSREG_CRM_MASK (0x0000001e)
-#define HSR_SYSREG_CRM_SHIFT (1)
-#define HSR_SYSREG_OP2_MASK (0x000e0000)
-#define HSR_SYSREG_OP2_SHIFT (17)
-#define HSR_SYSREG_REGS_MASK (HSR_SYSREG_OP0_MASK|HSR_SYSREG_OP1_MASK|\
-                              HSR_SYSREG_CRN_MASK|HSR_SYSREG_CRM_MASK|\
-                              HSR_SYSREG_OP2_MASK)
-
-/* HSR.EC == HSR_{HVC32, HVC64, SMC64, SVC32, SVC64} */
-#define HSR_XXC_IMM_MASK     (0xffff)
 
 /* Physical Address Register */
 #define PAR_F           (_AC(1,U)<<0)
@@ -787,14 +455,10 @@ union hsr {
 #endif
 
 #ifndef __ASSEMBLY__
-extern uint32_t hyp_traps_vector[];
-
-void init_traps(void);
-
 void panic_PAR(uint64_t par);
 
-void show_execution_state(struct cpu_user_regs *regs);
-void show_registers(struct cpu_user_regs *regs);
+void show_execution_state(const struct cpu_user_regs *regs);
+void show_registers(const struct cpu_user_regs *regs);
 //#define dump_execution_state() run_in_exception_handler(show_execution_state)
 #define dump_execution_state() WARN()
 
@@ -804,32 +468,17 @@ void show_registers(struct cpu_user_regs *regs);
 #define cpu_to_core(_cpu)   (0)
 #define cpu_to_socket(_cpu) (0)
 
-void noreturn do_unexpected_trap(const char *msg, struct cpu_user_regs *regs);
-
 struct vcpu;
 void vcpu_regs_hyp_to_user(const struct vcpu *vcpu,
                            struct vcpu_guest_core_regs *regs);
 void vcpu_regs_user_to_hyp(struct vcpu *vcpu,
                            const struct vcpu_guest_core_regs *regs);
 
-int call_smc(register_t function_id, register_t arg0, register_t arg1,
-             register_t arg2);
-
 void do_trap_hyp_serror(struct cpu_user_regs *regs);
 
 void do_trap_guest_serror(struct cpu_user_regs *regs);
 
 register_t get_default_hcr_flags(void);
-
-/* Functions for pending virtual abort checking window. */
-void abort_guest_exit_start(void);
-void abort_guest_exit_end(void);
-
-#define VABORT_GEN_BY_GUEST(r)  \
-( \
-    ( (unsigned long)abort_guest_exit_start == (r)->pc ) || \
-    ( (unsigned long)abort_guest_exit_end == (r)->pc ) \
-)
 
 /*
  * Synchronize SError unless the feature is selected.
@@ -841,6 +490,24 @@ void abort_guest_exit_end(void);
         asm volatile(ALTERNATIVE("dsb sy; isb",                   \
                                  "nop; nop", feat)                \
                                  : : : "memory");                 \
+    } while (0)
+
+/*
+ * Clear/Set flags in HCR_EL2 for a given vCPU. It only supports the current
+ * vCPU for now.
+ */
+#define vcpu_hcr_clear_flags(v, flags)              \
+    do {                                            \
+        ASSERT((v) == current);                     \
+        (v)->arch.hcr_el2 &= ~(flags);              \
+        WRITE_SYSREG((v)->arch.hcr_el2, HCR_EL2);   \
+    } while (0)
+
+#define vcpu_hcr_set_flags(v, flags)                \
+    do {                                            \
+        ASSERT((v) == current);                     \
+        (v)->arch.hcr_el2 |= (flags);               \
+        WRITE_SYSREG((v)->arch.hcr_el2, HCR_EL2);   \
     } while (0)
 
 #endif /* __ASSEMBLY__ */

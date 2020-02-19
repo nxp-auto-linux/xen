@@ -39,6 +39,9 @@ typedef u8 mtrr_type;
 #define MTRR_PHYSBASE_SHIFT      12
 /* Number of variable range MSR pairs we emulate for HVM guests: */
 #define MTRR_VCNT                8
+/* Maximum number of variable range MSR pairs if FE is supported. */
+#define MTRR_VCNT_MAX            ((MSR_MTRRfix64K_00000 - \
+                                   MSR_IA32_MTRR_PHYSBASE(0)) / 2)
 
 struct mtrr_var_range {
 	uint64_t base;
@@ -50,8 +53,9 @@ struct mtrr_var_range {
 struct mtrr_state {
 	struct mtrr_var_range *var_ranges;
 	mtrr_type fixed_ranges[NUM_FIXED_RANGES];
-	unsigned char enabled;
-	unsigned char have_fixed;
+	bool enabled;
+	bool fixed_enabled;
+	bool have_fixed;
 	mtrr_type def_type;
 
 	u64       mtrr_cap;
@@ -88,10 +92,15 @@ extern bool_t mtrr_fix_range_msr_set(struct domain *, struct mtrr_state *,
                                      uint32_t row, uint64_t msr_content);
 extern bool_t mtrr_def_type_msr_set(struct domain *, struct mtrr_state *,
                                     uint64_t msr_content);
+#ifdef CONFIG_HVM
 extern void memory_type_changed(struct domain *);
+#else
+static inline void memory_type_changed(struct domain *d) {}
+#endif
+
 extern bool_t pat_msr_set(uint64_t *pat, uint64_t msr);
 
-bool_t is_var_mtrr_overlapped(const struct mtrr_state *m);
-bool_t mtrr_pat_not_equal(struct vcpu *vd, struct vcpu *vs);
+bool is_var_mtrr_overlapped(const struct mtrr_state *m);
+bool mtrr_pat_not_equal(const struct vcpu *vd, const struct vcpu *vs);
 
 #endif /* __ASM_X86_MTRR_H__ */

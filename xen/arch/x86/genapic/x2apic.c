@@ -106,12 +106,12 @@ static void send_IPI_mask_x2apic_phys(const cpumask_t *cpumask, int vector)
      * CPU is seen by notified remote CPUs. The WRMSR contained within
      * apic_icr_write() can otherwise be executed early.
      * 
-     * The reason mb() is sufficient here is subtle: the register arguments
+     * The reason smp_mb() is sufficient here is subtle: the register arguments
      * to WRMSR must depend on a memory read executed after the barrier. This
      * is guaranteed by cpu_physical_id(), which reads from a global array (and
      * so cannot be hoisted above the barrier even by a clever compiler).
      */
-    mb();
+    smp_mb();
 
     local_irq_save(flags);
 
@@ -135,7 +135,7 @@ static void send_IPI_mask_x2apic_cluster(const cpumask_t *cpumask, int vector)
     const cpumask_t *cluster_cpus;
     unsigned long flags;
 
-    mb(); /* See above for an explanation. */
+    smp_mb(); /* See above for an explanation. */
 
     local_irq_save(flags);
 
@@ -163,26 +163,24 @@ static void send_IPI_mask_x2apic_cluster(const cpumask_t *cpumask, int vector)
     local_irq_restore(flags);
 }
 
-static const struct genapic apic_x2apic_phys = {
+static const struct genapic __initconstrel apic_x2apic_phys = {
     APIC_INIT("x2apic_phys", NULL),
     .int_delivery_mode = dest_Fixed,
     .int_dest_mode = 0 /* physical delivery */,
     .init_apic_ldr = init_apic_ldr_x2apic_phys,
     .clustered_apic_check = clustered_apic_check_x2apic,
-    .target_cpus = target_cpus_all,
     .vector_allocation_cpumask = vector_allocation_cpumask_phys,
     .cpu_mask_to_apicid = cpu_mask_to_apicid_phys,
     .send_IPI_mask = send_IPI_mask_x2apic_phys,
     .send_IPI_self = send_IPI_self_x2apic
 };
 
-static const struct genapic apic_x2apic_cluster = {
+static const struct genapic __initconstrel apic_x2apic_cluster = {
     APIC_INIT("x2apic_cluster", NULL),
     .int_delivery_mode = dest_LowestPrio,
     .int_dest_mode = 1 /* logical delivery */,
     .init_apic_ldr = init_apic_ldr_x2apic_cluster,
     .clustered_apic_check = clustered_apic_check_x2apic,
-    .target_cpus = target_cpus_all,
     .vector_allocation_cpumask = vector_allocation_cpumask_x2apic_cluster,
     .cpu_mask_to_apicid = cpu_mask_to_apicid_x2apic_cluster,
     .send_IPI_mask = send_IPI_mask_x2apic_cluster,
@@ -201,18 +199,21 @@ static int update_clusterinfo(
         if ( !cluster_cpus_spare )
             cluster_cpus_spare = xzalloc(cpumask_t);
         if ( !cluster_cpus_spare ||
-             !alloc_cpumask_var(&per_cpu(scratch_mask, cpu)) )
+             !cond_alloc_cpumask_var(&per_cpu(scratch_mask, cpu)) )
             err = -ENOMEM;
         break;
     case CPU_UP_CANCELED:
     case CPU_DEAD:
+    case CPU_REMOVE:
+        if ( park_offline_cpus == (action != CPU_REMOVE) )
+            break;
         if ( per_cpu(cluster_cpus, cpu) )
         {
             cpumask_clear_cpu(cpu, per_cpu(cluster_cpus, cpu));
             if ( cpumask_empty(per_cpu(cluster_cpus, cpu)) )
-                xfree(per_cpu(cluster_cpus, cpu));
+                XFREE(per_cpu(cluster_cpus, cpu));
         }
-        free_cpumask_var(per_cpu(scratch_mask, cpu));
+        FREE_CPUMASK_VAR(per_cpu(scratch_mask, cpu));
         break;
     }
 
@@ -253,11 +254,11 @@ void __init check_x2apic_preenabled(void)
         return;
 
     /* Check whether x2apic mode was already enabled by the BIOS. */
-    rdmsr(MSR_IA32_APICBASE, lo, hi);
-    if ( lo & MSR_IA32_APICBASE_EXTD )
+    rdmsr(MSR_APIC_BASE, lo, hi);
+    if ( lo & APIC_BASE_EXTD )
     {
         printk("x2APIC mode is already enabled by BIOS.\n");
         x2apic_enabled = 1;
-        genapic = apic_x2apic_probe();
+        genapic = *apic_x2apic_probe();
     }
 }

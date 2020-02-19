@@ -36,10 +36,13 @@ bool hvm_monitor_cr(unsigned int index, unsigned long value, unsigned long old)
     struct arch_domain *ad = &curr->domain->arch;
     unsigned int ctrlreg_bitmask = monitor_ctrlreg_bitmask(index);
 
+    if ( index == VM_EVENT_X86_CR3 && hvm_pcid_enabled(curr) )
+        value &= ~X86_CR3_NOFLUSH; /* Clear the noflush bit. */
+
     if ( (ad->monitor.write_ctrlreg_enabled & ctrlreg_bitmask) &&
          (!(ad->monitor.write_ctrlreg_onchangeonly & ctrlreg_bitmask) ||
           value != old) &&
-         (!((value ^ old) & ad->monitor.write_ctrlreg_mask[index])) )
+         ((value ^ old) & ~ad->monitor.write_ctrlreg_mask[index]) )
     {
         bool sync = ad->monitor.write_ctrlreg_sync & ctrlreg_bitmask;
 
@@ -74,16 +77,19 @@ bool hvm_monitor_emul_unimplemented(void)
         monitor_traps(curr, true, &req) == 1;
 }
 
-void hvm_monitor_msr(unsigned int msr, uint64_t value)
+void hvm_monitor_msr(unsigned int msr, uint64_t new_value, uint64_t old_value)
 {
     struct vcpu *curr = current;
 
-    if ( monitored_msr(curr->domain, msr) )
+    if ( monitored_msr(curr->domain, msr) &&
+         (!monitored_msr_onchangeonly(curr->domain, msr) ||
+           new_value != old_value) )
     {
         vm_event_request_t req = {
             .reason = VM_EVENT_REASON_MOV_TO_MSR,
             .u.mov_to_msr.msr = msr,
-            .u.mov_to_msr.value = value,
+            .u.mov_to_msr.new_value = new_value,
+            .u.mov_to_msr.old_value = old_value
         };
 
         monitor_traps(curr, 1, &req);
@@ -130,6 +136,11 @@ static inline unsigned long gfn_of_rip(unsigned long rip)
 int hvm_monitor_debug(unsigned long rip, enum hvm_monitor_debug_type type,
                       unsigned long trap_type, unsigned long insn_length)
 {
+   /*
+    * rc < 0 error in monitor/vm_event, crash
+    * !rc    continue normally
+    * rc > 0 paused waiting for response, work here is done
+    */
     struct vcpu *curr = current;
     struct arch_domain *ad = &curr->domain->arch;
     vm_event_request_t req = {};

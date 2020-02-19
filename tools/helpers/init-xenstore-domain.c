@@ -60,11 +60,23 @@ static void usage(void)
 static int build(xc_interface *xch)
 {
     char cmdline[512];
-    uint32_t ssid;
-    xen_domain_handle_t handle = { 0 };
     int rv, xs_fd;
     struct xc_dom_image *dom = NULL;
     int limit_kb = (maxmem ? : (memory + 1)) * 1024;
+    struct xen_domctl_createdomain config = {
+        .ssidref = SECINITSID_DOMU,
+        .flags = XEN_DOMCTL_CDF_xs_domain,
+        .max_vcpus = 1,
+        .max_evtchn_port = -1, /* No limit. */
+
+        /*
+         * 1 grant frame is enough: we don't need many grants.
+         * Mini-OS doesn't like less than 4, though, so use 4.
+         * 128 maptrack frames: 256 entries per frame, enough for 32768 domains.
+         */
+        .max_grant_frames = 4,
+        .max_maptrack_frames = 128,
+    };
 
     xs_fd = open("/dev/xen/xenbus_backend", O_RDWR);
     if ( xs_fd == -1 )
@@ -75,25 +87,21 @@ static int build(xc_interface *xch)
 
     if ( flask )
     {
-        rv = xc_flask_context_to_sid(xch, flask, strlen(flask), &ssid);
+        rv = xc_flask_context_to_sid(xch, flask, strlen(flask), &config.ssidref);
         if ( rv )
         {
             fprintf(stderr, "xc_flask_context_to_sid failed\n");
             goto err;
         }
     }
-    else
-    {
-        ssid = SECINITSID_DOMU;
-    }
-    rv = xc_domain_create(xch, ssid, handle, XEN_DOMCTL_CDF_xs_domain,
-                          &domid, NULL);
+
+    rv = xc_domain_create(xch, &domid, &config);
     if ( rv )
     {
         fprintf(stderr, "xc_domain_create failed\n");
         goto err;
     }
-    rv = xc_domain_max_vcpus(xch, domid, 1);
+    rv = xc_domain_max_vcpus(xch, domid, config.max_vcpus);
     if ( rv )
     {
         fprintf(stderr, "xc_domain_max_vcpus failed\n");
@@ -103,17 +111,6 @@ static int build(xc_interface *xch)
     if ( rv )
     {
         fprintf(stderr, "xc_domain_setmaxmem failed\n");
-        goto err;
-    }
-    /*
-     * 1 grant frame is enough: we don't need many grants.
-     * Mini-OS doesn't like less than 4, though, so use 4.
-     * 128 maptrack frames: 256 entries per frame, enough for 32768 domains.
-     */
-    rv = xc_domain_set_gnttab_limits(xch, domid, 4, 128);
-    if ( rv )
-    {
-        fprintf(stderr, "xc_domain_set_gnttab_limits failed\n");
         goto err;
     }
     rv = xc_domain_set_memmap_limit(xch, domid, limit_kb);
@@ -385,7 +382,7 @@ int main(int argc, char** argv)
     if ( rv )
         return 1;
 
-    rv = gen_stub_json_config(domid);
+    rv = gen_stub_json_config(domid, NULL);
     if ( rv )
         return 3;
 

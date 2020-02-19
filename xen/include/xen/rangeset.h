@@ -70,6 +70,19 @@ int rangeset_report_ranges(
     struct rangeset *r, unsigned long s, unsigned long e,
     int (*cb)(unsigned long s, unsigned long e, void *), void *ctxt);
 
+/*
+ * Note that the consume function can return an error value apart from
+ * -ERESTART, and that no cleanup is performed (ie: the user should call
+ * rangeset_destroy if needed).
+ */
+int rangeset_consume_ranges(struct rangeset *r,
+                            int (*cb)(unsigned long s, unsigned long e,
+                                      void *, unsigned long *c),
+                            void *ctxt);
+
+/* Merge rangeset r2 into rangeset r1. */
+int __must_check rangeset_merge(struct rangeset *r1, struct rangeset *r2);
+
 /* Add/remove/query a single number. */
 int __must_check rangeset_add_singleton(
     struct rangeset *r, unsigned long s);

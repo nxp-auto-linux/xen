@@ -203,16 +203,18 @@ static void output_physinfo(void)
     maybe_printf("nr_nodes               : %d\n", info.nr_nodes);
     maybe_printf("cores_per_socket       : %d\n", info.cores_per_socket);
     maybe_printf("threads_per_core       : %d\n", info.threads_per_core);
-    maybe_printf("cpu_mhz                : %d\n", info.cpu_khz / 1000);
+    maybe_printf("cpu_mhz                : %d.%03d\n", info.cpu_khz / 1000, info.cpu_khz % 1000);
 
     maybe_printf("hw_caps                : %08x:%08x:%08x:%08x:%08x:%08x:%08x:%08x\n",
          info.hw_cap[0], info.hw_cap[1], info.hw_cap[2], info.hw_cap[3],
          info.hw_cap[4], info.hw_cap[5], info.hw_cap[6], info.hw_cap[7]
         );
 
-    maybe_printf("virt_caps              :%s%s\n",
+    maybe_printf("virt_caps              :%s%s%s%s\n",
+         info.cap_pv ? " pv" : "",
          info.cap_hvm ? " hvm" : "",
-         info.cap_hvm_directio ? " hvm_directio" : ""
+         info.cap_hvm && info.cap_hvm_directio ? " hvm_directio" : "",
+         info.cap_pv && info.cap_hvm_directio ? " pv_directio" : ""
         );
 
     vinfo = libxl_get_version_info(ctx);

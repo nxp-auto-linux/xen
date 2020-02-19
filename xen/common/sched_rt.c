@@ -186,7 +186,7 @@ struct rt_private {
     struct list_head runq;      /* ordered list of runnable vcpus */
     struct list_head depletedq; /* unordered list of depleted vcpus */
 
-    struct timer *repl_timer;   /* replenishment timer */
+    struct timer repl_timer;    /* replenishment timer */
     struct list_head replq;     /* ordered list of vcpus that need replenishment */
 
     cpumask_t tickled;          /* cpus been tickled */
@@ -203,7 +203,7 @@ struct rt_vcpu {
     s_time_t period;
     s_time_t budget;
 
-    /* VCPU current infomation in nanosecond */
+    /* VCPU current information in nanosecond */
     s_time_t cur_budget;         /* current budget */
     s_time_t last_start;         /* last start time */
     s_time_t cur_deadline;       /* current deadline for EDF */
@@ -236,11 +236,6 @@ static inline struct rt_private *rt_priv(const struct scheduler *ops)
 static inline struct rt_vcpu *rt_vcpu(const struct vcpu *vcpu)
 {
     return vcpu->sched_priv;
-}
-
-static inline struct rt_dom *rt_dom(const struct domain *dom)
-{
-    return dom->sched_priv;
 }
 
 static inline struct list_head *rt_runq(const struct scheduler *ops)
@@ -333,11 +328,10 @@ rt_dump_vcpu(const struct scheduler *ops, const struct rt_vcpu *svc)
 
     cpupool_mask = cpupool_domain_cpumask(svc->vcpu->domain);
     cpumask_and(mask, cpupool_mask, svc->vcpu->cpu_hard_affinity);
-    cpulist_scnprintf(keyhandler_scratch, sizeof(keyhandler_scratch), mask);
     printk("[%5d.%-2u] cpu %u, (%"PRI_stime", %"PRI_stime"),"
            " cur_b=%"PRI_stime" cur_d=%"PRI_stime" last_start=%"PRI_stime"\n"
            " \t\t priority_level=%d has_extratime=%d\n"
-           " \t\t onQ=%d runnable=%d flags=%x effective hard_affinity=%s\n",
+           " \t\t onQ=%d runnable=%d flags=%x effective hard_affinity=%*pbl\n",
             svc->vcpu->domain->domain_id,
             svc->vcpu->vcpu_id,
             svc->vcpu->processor,
@@ -351,7 +345,7 @@ rt_dump_vcpu(const struct scheduler *ops, const struct rt_vcpu *svc)
             vcpu_on_q(svc),
             vcpu_runnable(svc->vcpu),
             svc->flags,
-            keyhandler_scratch);
+            nr_cpu_ids, cpumask_bits(mask));
 }
 
 static void
@@ -554,10 +548,10 @@ replq_remove(const struct scheduler *ops, struct rt_vcpu *svc)
         if ( !list_empty(replq) )
         {
             struct rt_vcpu *svc_next = replq_elem(replq->next);
-            set_timer(prv->repl_timer, svc_next->cur_deadline);
+            set_timer(&prv->repl_timer, svc_next->cur_deadline);
         }
         else
-            stop_timer(prv->repl_timer);
+            stop_timer(&prv->repl_timer);
     }
 }
 
@@ -597,7 +591,7 @@ replq_insert(const struct scheduler *ops, struct rt_vcpu *svc)
      * at the front of the event list.
      */
     if ( deadline_replq_insert(svc, &svc->replq_elem, replq) )
-        set_timer(prv->repl_timer, svc->cur_deadline);
+        set_timer(&prv->repl_timer, svc->cur_deadline);
 }
 
 /*
@@ -634,7 +628,7 @@ replq_reinsert(const struct scheduler *ops, struct rt_vcpu *svc)
         rearm = deadline_replq_insert(svc, &svc->replq_elem, replq);
 
     if ( rearm )
-        set_timer(rt_priv(ops)->repl_timer, rearm_svc->cur_deadline);
+        set_timer(&rt_priv(ops)->repl_timer, rearm_svc->cur_deadline);
 }
 
 /*
@@ -676,27 +670,18 @@ rt_init(struct scheduler *ops)
     if ( prv == NULL )
         goto err;
 
-    prv->repl_timer = xzalloc(struct timer);
-    if ( prv->repl_timer == NULL )
-        goto err;
-
     spin_lock_init(&prv->lock);
     INIT_LIST_HEAD(&prv->sdom);
     INIT_LIST_HEAD(&prv->runq);
     INIT_LIST_HEAD(&prv->depletedq);
     INIT_LIST_HEAD(&prv->replq);
 
-    cpumask_clear(&prv->tickled);
-
     ops->sched_data = prv;
     rc = 0;
 
  err:
-    if ( rc && prv )
-    {
-        xfree(prv->repl_timer);
+    if ( rc )
         xfree(prv);
-    }
 
     return rc;
 }
@@ -706,9 +691,8 @@ rt_deinit(struct scheduler *ops)
 {
     struct rt_private *prv = rt_priv(ops);
 
-    ASSERT(prv->repl_timer->status == TIMER_STATUS_invalid ||
-           prv->repl_timer->status == TIMER_STATUS_killed);
-    xfree(prv->repl_timer);
+    ASSERT(prv->repl_timer.status == TIMER_STATUS_invalid ||
+           prv->repl_timer.status == TIMER_STATUS_killed);
 
     ops->sched_data = NULL;
     xfree(prv);
@@ -731,9 +715,9 @@ rt_init_pdata(const struct scheduler *ops, void *pdata, int cpu)
      * TIMER_STATUS_invalid means we are the first cpu that sees the timer
      * allocated but not initialized, and so it's up to us to initialize it.
      */
-    if ( prv->repl_timer->status == TIMER_STATUS_invalid )
+    if ( prv->repl_timer.status == TIMER_STATUS_invalid )
     {
-        init_timer(prv->repl_timer, repl_timer_handler, (void*) ops, cpu);
+        init_timer(&prv->repl_timer, repl_timer_handler, (void *)ops, cpu);
         dprintk(XENLOG_DEBUG, "RTDS: timer initialized on cpu %u\n", cpu);
     }
 
@@ -769,10 +753,10 @@ rt_switch_sched(struct scheduler *new_ops, unsigned int cpu,
      * removed (in which case we'll see TIMER_STATUS_killed), it's our
      * job to (re)initialize the timer.
      */
-    if ( prv->repl_timer->status == TIMER_STATUS_invalid ||
-         prv->repl_timer->status == TIMER_STATUS_killed )
+    if ( prv->repl_timer.status == TIMER_STATUS_invalid ||
+         prv->repl_timer.status == TIMER_STATUS_killed )
     {
-        init_timer(prv->repl_timer, repl_timer_handler, (void*) new_ops, cpu);
+        init_timer(&prv->repl_timer, repl_timer_handler, (void *)new_ops, cpu);
         dprintk(XENLOG_DEBUG, "RTDS: timer initialized on cpu %u\n", cpu);
     }
 
@@ -797,7 +781,7 @@ rt_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
 
     spin_lock_irqsave(&prv->lock, flags);
 
-    if ( prv->repl_timer->cpu == cpu )
+    if ( prv->repl_timer.cpu == cpu )
     {
         struct cpupool *c = per_cpu(cpupool, cpu);
         unsigned int new_cpu = cpumask_cycle(cpu, cpupool_online_cpumask(c));
@@ -809,12 +793,12 @@ rt_deinit_pdata(const struct scheduler *ops, void *pcpu, int cpu)
          */
         if ( new_cpu >= nr_cpu_ids )
         {
-            kill_timer(prv->repl_timer);
+            kill_timer(&prv->repl_timer);
             dprintk(XENLOG_DEBUG, "RTDS: timer killed on cpu %d\n", cpu);
         }
         else
         {
-            migrate_timer(prv->repl_timer, new_cpu);
+            migrate_timer(&prv->repl_timer, new_cpu);
         }
     }
 
@@ -830,7 +814,7 @@ rt_alloc_domdata(const struct scheduler *ops, struct domain *dom)
 
     sdom = xzalloc(struct rt_dom);
     if ( sdom == NULL )
-        return NULL;
+        return ERR_PTR(-ENOMEM);
 
     INIT_LIST_HEAD(&sdom->sdom_elem);
     sdom->dom = dom;
@@ -846,38 +830,19 @@ rt_alloc_domdata(const struct scheduler *ops, struct domain *dom)
 static void
 rt_free_domdata(const struct scheduler *ops, void *data)
 {
-    unsigned long flags;
     struct rt_dom *sdom = data;
     struct rt_private *prv = rt_priv(ops);
 
-    spin_lock_irqsave(&prv->lock, flags);
-    list_del_init(&sdom->sdom_elem);
-    spin_unlock_irqrestore(&prv->lock, flags);
-    xfree(data);
-}
+    if ( sdom )
+    {
+        unsigned long flags;
 
-static int
-rt_dom_init(const struct scheduler *ops, struct domain *dom)
-{
-    struct rt_dom *sdom;
+        spin_lock_irqsave(&prv->lock, flags);
+        list_del_init(&sdom->sdom_elem);
+        spin_unlock_irqrestore(&prv->lock, flags);
 
-    /* IDLE Domain does not link on rt_private */
-    if ( is_idle_domain(dom) )
-        return 0;
-
-    sdom = rt_alloc_domdata(ops, dom);
-    if ( sdom == NULL )
-        return -ENOMEM;
-
-    dom->sched_priv = sdom;
-
-    return 0;
-}
-
-static void
-rt_dom_destroy(const struct scheduler *ops, struct domain *dom)
-{
-    rt_free_domdata(ops, rt_dom(dom));
+        xfree(sdom);
+    }
 }
 
 static void *
@@ -1505,7 +1470,6 @@ static void repl_timer_handler(void *data){
     struct rt_private *prv = rt_priv(ops);
     struct list_head *replq = rt_replq(ops);
     struct list_head *runq = rt_runq(ops);
-    struct timer *repl_timer = prv->repl_timer;
     struct list_head *iter, *tmp;
     struct rt_vcpu *svc;
     LIST_HEAD(tmp_replq);
@@ -1571,7 +1535,7 @@ static void repl_timer_handler(void *data){
      * the one in the front.
      */
     if ( !list_empty(replq) )
-        set_timer(repl_timer, replq_elem(replq->next)->cur_deadline);
+        set_timer(&prv->repl_timer, replq_elem(replq->next)->cur_deadline);
 
     spin_unlock_irq(&prv->lock);
 }
@@ -1591,8 +1555,6 @@ static const struct scheduler sched_rtds_def = {
     .deinit_pdata   = rt_deinit_pdata,
     .alloc_domdata  = rt_alloc_domdata,
     .free_domdata   = rt_free_domdata,
-    .init_domain    = rt_dom_init,
-    .destroy_domain = rt_dom_destroy,
     .alloc_vdata    = rt_alloc_vdata,
     .free_vdata     = rt_free_vdata,
     .insert_vcpu    = rt_vcpu_insert,

@@ -60,13 +60,18 @@ const hypercall_args_t hypercall_args_table[NR_hypercalls] =
     ARGS(xenoprof_op, 2),
     ARGS(event_channel_op, 2),
     ARGS(physdev_op, 2),
-    ARGS(hvm_op, 2),
     ARGS(sysctl, 1),
     ARGS(domctl, 1),
     ARGS(kexec_op, 2),
     ARGS(tmem_op, 1),
+#ifdef CONFIG_ARGO
+    ARGS(argo_op, 5),
+#endif
     ARGS(xenpmu_op, 2),
+#ifdef CONFIG_HVM
+    ARGS(hvm_op, 2),
     ARGS(dm_op, 3),
+#endif
     ARGS(mca, 1),
     ARGS(arch_1, 1),
 };
@@ -245,6 +250,14 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int nr,
 
     return rc;
 }
+
+#ifndef CONFIG_PV
+/* Stub for arch_do_multicall_call */
+enum mc_disposition arch_do_multicall_call(struct mc_state *mc)
+{
+    return mc_exit;
+}
+#endif
 
 /*
  * Local variables:

@@ -37,13 +37,15 @@ typedef void time_cb(struct vcpu *v, void *opaque);
 
 struct periodic_time {
     struct list_head list;
-    bool_t on_list;
-    bool_t one_shot;
-    bool_t do_not_freeze;
-    bool_t irq_issued;
-    bool_t warned_timeout_too_short;
+    bool on_list;
+    bool one_shot;
+    bool do_not_freeze;
+    bool irq_issued;
+    bool warned_timeout_too_short;
+    bool level;
 #define PTSRC_isa    1 /* ISA time source */
 #define PTSRC_lapic  2 /* LAPIC time source */
+#define PTSRC_ioapic 3 /* IOAPIC time source */
     u8 source;                  /* PTSRC_ */
     u8 irq;
     struct vcpu *vcpu;          /* vcpu timer interrupt delivers to */
@@ -148,8 +150,8 @@ void pt_migrate(struct vcpu *v);
 
 void pt_adjust_global_vcpu_target(struct vcpu *v);
 #define pt_global_vcpu_target(d) \
-    (is_hvm_domain(d) && (d)->arch.hvm_domain.i8259_target ? \
-     (d)->arch.hvm_domain.i8259_target : \
+    (is_hvm_domain(d) && (d)->arch.hvm.i8259_target ? \
+     (d)->arch.hvm.i8259_target : \
      (d)->vcpu ? (d)->vcpu[0] : NULL)
 
 void pt_may_unmask_irq(struct domain *d, struct periodic_time *vlapic_pt);
@@ -168,7 +170,7 @@ void pt_may_unmask_irq(struct domain *d, struct periodic_time *vlapic_pt);
  */
 void create_periodic_time(
     struct vcpu *v, struct periodic_time *pt, uint64_t delta,
-    uint64_t period, uint8_t irq, time_cb *cb, void *data);
+    uint64_t period, uint8_t irq, time_cb *cb, void *data, bool level);
 void destroy_periodic_time(struct periodic_time *pt);
 
 int pv_pit_handler(int port, int data, int write);

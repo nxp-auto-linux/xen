@@ -120,11 +120,6 @@ static inline struct null_vcpu *null_vcpu(const struct vcpu *v)
     return v->sched_priv;
 }
 
-static inline struct null_dom *null_dom(const struct domain *d)
-{
-    return d->sched_priv;
-}
-
 static inline bool vcpu_check_affinity(struct vcpu *v, unsigned int cpu,
                                        unsigned int balance_step)
 {
@@ -231,7 +226,7 @@ static void * null_alloc_domdata(const struct scheduler *ops,
 
     ndom = xzalloc(struct null_dom);
     if ( ndom == NULL )
-        return NULL;
+        return ERR_PTR(-ENOMEM);
 
     ndom->dom = d;
 
@@ -239,40 +234,24 @@ static void * null_alloc_domdata(const struct scheduler *ops,
     list_add_tail(&ndom->ndom_elem, &null_priv(ops)->ndom);
     spin_unlock_irqrestore(&prv->lock, flags);
 
-    return (void*)ndom;
+    return ndom;
 }
 
 static void null_free_domdata(const struct scheduler *ops, void *data)
 {
-    unsigned long flags;
     struct null_dom *ndom = data;
     struct null_private *prv = null_priv(ops);
 
-    spin_lock_irqsave(&prv->lock, flags);
-    list_del_init(&ndom->ndom_elem);
-    spin_unlock_irqrestore(&prv->lock, flags);
+    if ( ndom )
+    {
+        unsigned long flags;
 
-    xfree(data);
-}
+        spin_lock_irqsave(&prv->lock, flags);
+        list_del_init(&ndom->ndom_elem);
+        spin_unlock_irqrestore(&prv->lock, flags);
 
-static int null_dom_init(const struct scheduler *ops, struct domain *d)
-{
-    struct null_dom *ndom;
-
-    if ( is_idle_domain(d) )
-        return 0;
-
-    ndom = null_alloc_domdata(ops, d);
-    if ( ndom == NULL )
-        return -ENOMEM;
-
-    d->sched_priv = ndom;
-
-    return 0;
-}
-static void null_dom_destroy(const struct scheduler *ops, struct domain *d)
-{
-    null_free_domdata(ops, null_dom(d));
+        xfree(ndom);
+    }
 }
 
 /*
@@ -299,8 +278,7 @@ static unsigned int pick_cpu(struct null_private *prv, struct vcpu *v)
 
     for_each_affinity_balance_step( bs )
     {
-        if ( bs == BALANCE_SOFT_AFFINITY &&
-             !has_soft_affinity(v, v->cpu_hard_affinity) )
+        if ( bs == BALANCE_SOFT_AFFINITY && !has_soft_affinity(v) )
             continue;
 
         affinity_balance_cpumask(v, bs, cpumask_scratch_cpu(cpu));
@@ -366,7 +344,7 @@ static void vcpu_assign(struct null_private *prv, struct vcpu *v,
     v->processor = cpu;
     cpumask_clear_cpu(cpu, &prv->cpus_free);
 
-    dprintk(XENLOG_G_INFO, "%d <-- d%dv%d\n", cpu, v->domain->domain_id, v->vcpu_id);
+    dprintk(XENLOG_G_INFO, "%d <-- %pv\n", cpu, v);
 
     if ( unlikely(tb_init_done) )
     {
@@ -387,7 +365,7 @@ static void vcpu_deassign(struct null_private *prv, struct vcpu *v,
     per_cpu(npc, cpu).vcpu = NULL;
     cpumask_set_cpu(cpu, &prv->cpus_free);
 
-    dprintk(XENLOG_G_INFO, "%d <-- NULL (d%dv%d)\n", cpu, v->domain->domain_id, v->vcpu_id);
+    dprintk(XENLOG_G_INFO, "%d <-- NULL (%pv)\n", cpu, v);
 
     if ( unlikely(tb_init_done) )
     {
@@ -482,8 +460,7 @@ static void null_vcpu_insert(const struct scheduler *ops, struct vcpu *v)
          */
         spin_lock(&prv->waitq_lock);
         list_add_tail(&nvc->waitq_elem, &prv->waitq);
-        dprintk(XENLOG_G_WARNING, "WARNING: d%dv%d not assigned to any CPU!\n",
-                v->domain->domain_id, v->vcpu_id);
+        dprintk(XENLOG_G_WARNING, "WARNING: %pv not assigned to any CPU!\n", v);
         spin_unlock(&prv->waitq_lock);
     }
     spin_unlock_irq(lock);
@@ -512,8 +489,7 @@ static void _vcpu_remove(struct null_private *prv, struct vcpu *v)
     {
         list_for_each_entry( wvc, &prv->waitq, waitq_elem )
         {
-            if ( bs == BALANCE_SOFT_AFFINITY &&
-                 !has_soft_affinity(wvc->vcpu, wvc->vcpu->cpu_hard_affinity) )
+            if ( bs == BALANCE_SOFT_AFFINITY && !has_soft_affinity(wvc->vcpu) )
                 continue;
 
             if ( vcpu_check_affinity(wvc->vcpu, cpu, bs) )
@@ -672,8 +648,7 @@ static void null_vcpu_migrate(const struct scheduler *ops, struct vcpu *v,
         if ( list_empty(&nvc->waitq_elem) )
         {
             list_add_tail(&nvc->waitq_elem, &prv->waitq);
-            dprintk(XENLOG_G_WARNING, "WARNING: d%dv%d not assigned to any CPU!\n",
-                    v->domain->domain_id, v->vcpu_id);
+            dprintk(XENLOG_G_WARNING, "WARNING: %pv not assigned to any CPU!\n", v);
         }
         spin_unlock(&prv->waitq_lock);
     }
@@ -693,7 +668,7 @@ static void null_vcpu_migrate(const struct scheduler *ops, struct vcpu *v,
 static inline void null_vcpu_check(struct vcpu *v)
 {
     struct null_vcpu * const nvc = null_vcpu(v);
-    struct null_dom * const ndom = null_dom(v->domain);
+    struct null_dom * const ndom = v->domain->sched_priv;
 
     BUG_ON(nvc->vcpu != v);
 
@@ -782,7 +757,7 @@ static struct task_slice null_schedule(const struct scheduler *ops,
             list_for_each_entry( wvc, &prv->waitq, waitq_elem )
             {
                 if ( bs == BALANCE_SOFT_AFFINITY &&
-                     !has_soft_affinity(wvc->vcpu, wvc->vcpu->cpu_hard_affinity) )
+                     !has_soft_affinity(wvc->vcpu) )
                     continue;
 
                 if ( vcpu_check_affinity(wvc->vcpu, cpu, bs) )
@@ -818,17 +793,15 @@ static void null_dump_pcpu(const struct scheduler *ops, int cpu)
     struct null_vcpu *nvc;
     spinlock_t *lock;
     unsigned long flags;
-#define cpustr keyhandler_scratch
 
     lock = pcpu_schedule_lock_irqsave(cpu, &flags);
 
-    cpumask_scnprintf(cpustr, sizeof(cpustr), per_cpu(cpu_sibling_mask, cpu));
-    printk("CPU[%02d] sibling=%s, ", cpu, cpustr);
-    cpumask_scnprintf(cpustr, sizeof(cpustr), per_cpu(cpu_core_mask, cpu));
-    printk("core=%s", cpustr);
+    printk("CPU[%02d] sibling=%*pb, core=%*pb",
+           cpu,
+           nr_cpu_ids, cpumask_bits(per_cpu(cpu_sibling_mask, cpu)),
+           nr_cpu_ids, cpumask_bits(per_cpu(cpu_core_mask, cpu)));
     if ( per_cpu(npc, cpu).vcpu != NULL )
-        printk(", vcpu=d%dv%d", per_cpu(npc, cpu).vcpu->domain->domain_id,
-               per_cpu(npc, cpu).vcpu->vcpu_id);
+        printk(", vcpu=%pv", per_cpu(npc, cpu).vcpu);
     printk("\n");
 
     /* current VCPU (nothing to say if that's the idle vcpu) */
@@ -841,7 +814,6 @@ static void null_dump_pcpu(const struct scheduler *ops, int cpu)
     }
 
     pcpu_schedule_unlock_irqrestore(lock, flags, cpu);
-#undef cpustr
 }
 
 static void null_dump(const struct scheduler *ops)
@@ -850,12 +822,10 @@ static void null_dump(const struct scheduler *ops)
     struct list_head *iter;
     unsigned long flags;
     unsigned int loop;
-#define cpustr keyhandler_scratch
 
     spin_lock_irqsave(&prv->lock, flags);
 
-    cpulist_scnprintf(cpustr, sizeof(cpustr), &prv->cpus_free);
-    printk("\tcpus_free = %s\n", cpustr);
+    printk("\tcpus_free = %*pbl\n", nr_cpu_ids, cpumask_bits(&prv->cpus_free));
 
     printk("Domain info:\n");
     loop = 0;
@@ -893,13 +863,12 @@ static void null_dump(const struct scheduler *ops)
             printk(", ");
         if ( loop % 24 == 0 )
             printk("\n\t");
-        printk("d%dv%d", nvc->vcpu->domain->domain_id, nvc->vcpu->vcpu_id);
+        printk("%pv", nvc->vcpu);
     }
     printk("\n");
     spin_unlock(&prv->waitq_lock);
 
     spin_unlock_irqrestore(&prv->lock, flags);
-#undef cpustr
 }
 
 const struct scheduler sched_null_def = {
@@ -918,9 +887,6 @@ const struct scheduler sched_null_def = {
     .free_vdata     = null_free_vdata,
     .alloc_domdata  = null_alloc_domdata,
     .free_domdata   = null_free_domdata,
-
-    .init_domain    = null_dom_init,
-    .destroy_domain = null_dom_destroy,
 
     .insert_vcpu    = null_vcpu_insert,
     .remove_vcpu    = null_vcpu_remove,

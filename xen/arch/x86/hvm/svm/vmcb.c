@@ -53,8 +53,8 @@ void free_vmcb(struct vmcb_struct *vmcb)
 /* This function can directly access fields which are covered by clean bits. */
 static int construct_vmcb(struct vcpu *v)
 {
-    struct arch_svm_struct *arch_svm = &v->arch.hvm_svm;
-    struct vmcb_struct *vmcb = arch_svm->vmcb;
+    struct svm_vcpu *svm = &v->arch.hvm.svm;
+    struct vmcb_struct *vmcb = svm->vmcb;
 
     /* Build-time check of the size of VMCB AMD structure. */
     BUILD_BUG_ON(sizeof(*vmcb) != PAGE_SIZE);
@@ -84,11 +84,13 @@ static int construct_vmcb(struct vcpu *v)
                              CR_INTERCEPT_CR8_READ |
                              CR_INTERCEPT_CR8_WRITE);
 
+    svm->vmcb_sync_state = vmcb_needs_vmload;
+
     /* I/O and MSR permission bitmaps. */
-    arch_svm->msrpm = alloc_xenheap_pages(get_order_from_bytes(MSRPM_SIZE), 0);
-    if ( arch_svm->msrpm == NULL )
+    svm->msrpm = alloc_xenheap_pages(get_order_from_bytes(MSRPM_SIZE), 0);
+    if ( svm->msrpm == NULL )
         return -ENOMEM;
-    memset(arch_svm->msrpm, 0xff, MSRPM_SIZE);
+    memset(svm->msrpm, 0xff, MSRPM_SIZE);
 
     svm_disable_intercept_for_msr(v, MSR_FS_BASE);
     svm_disable_intercept_for_msr(v, MSR_GS_BASE);
@@ -103,8 +105,8 @@ static int construct_vmcb(struct vcpu *v)
     if ( cpu_has_lwp )
         svm_disable_intercept_for_msr(v, MSR_AMD64_LWP_CBADDR);
 
-    vmcb->_msrpm_base_pa = (u64)virt_to_maddr(arch_svm->msrpm);
-    vmcb->_iopm_base_pa = __pa(v->domain->arch.hvm_domain.io_bitmap);
+    vmcb->_msrpm_base_pa = virt_to_maddr(svm->msrpm);
+    vmcb->_iopm_base_pa = __pa(v->domain->arch.hvm.io_bitmap);
 
     /* Virtualise EFLAGS.IF and LAPIC TPR (CR8). */
     vmcb->_vintr.fields.intr_masking = 1;
@@ -123,7 +125,7 @@ static int construct_vmcb(struct vcpu *v)
     }
 
     /* Guest EFER. */
-    v->arch.hvm_vcpu.guest_efer = 0;
+    v->arch.hvm.guest_efer = 0;
     hvm_update_guest_efer(v);
 
     /* Guest segment limits. */
@@ -169,17 +171,17 @@ static int construct_vmcb(struct vcpu *v)
     vmcb->tr.base = 0;
     vmcb->tr.limit = 0xff;
 
-    v->arch.hvm_vcpu.guest_cr[0] = X86_CR0_PE | X86_CR0_ET;
+    v->arch.hvm.guest_cr[0] = X86_CR0_PE | X86_CR0_ET;
     hvm_update_guest_cr(v, 0);
 
-    v->arch.hvm_vcpu.guest_cr[4] = 0;
+    v->arch.hvm.guest_cr[4] = 0;
     hvm_update_guest_cr(v, 4);
 
     paging_update_paging_modes(v);
 
     vmcb->_exception_intercepts =
-        HVM_TRAP_MASK
-        | (1U << TRAP_no_device);
+        HVM_TRAP_MASK |
+        (v->arch.fully_eager_fpu ? 0 : (1U << TRAP_no_device));
 
     if ( paging_mode_hap(v->domain) )
     {
@@ -210,6 +212,9 @@ static int construct_vmcb(struct vcpu *v)
     {
         vmcb->_pause_filter_count = SVM_PAUSEFILTER_INIT;
         vmcb->_general1_intercepts |= GENERAL1_INTERCEPT_PAUSE;
+
+        if ( cpu_has_pause_thresh )
+            vmcb->_pause_filter_thresh = SVM_PAUSETHRESH_INIT;
     }
 
     vmcb->cleanbits.bytes = 0;
@@ -220,7 +225,7 @@ static int construct_vmcb(struct vcpu *v)
 int svm_create_vmcb(struct vcpu *v)
 {
     struct nestedvcpu *nv = &vcpu_nestedhvm(v);
-    struct arch_svm_struct *arch_svm = &v->arch.hvm_svm;
+    struct svm_vcpu *svm = &v->arch.hvm.svm;
     int rc;
 
     if ( (nv->nv_n1vmcx == NULL) &&
@@ -230,38 +235,38 @@ int svm_create_vmcb(struct vcpu *v)
         return -ENOMEM;
     }
 
-    arch_svm->vmcb = nv->nv_n1vmcx;
+    svm->vmcb = nv->nv_n1vmcx;
     rc = construct_vmcb(v);
     if ( rc != 0 )
     {
         free_vmcb(nv->nv_n1vmcx);
         nv->nv_n1vmcx = NULL;
-        arch_svm->vmcb = NULL;
+        svm->vmcb = NULL;
         return rc;
     }
 
-    arch_svm->vmcb_pa = nv->nv_n1vmcx_pa = virt_to_maddr(arch_svm->vmcb);
+    svm->vmcb_pa = nv->nv_n1vmcx_pa = virt_to_maddr(svm->vmcb);
     return 0;
 }
 
 void svm_destroy_vmcb(struct vcpu *v)
 {
     struct nestedvcpu *nv = &vcpu_nestedhvm(v);
-    struct arch_svm_struct *arch_svm = &v->arch.hvm_svm;
+    struct svm_vcpu *svm = &v->arch.hvm.svm;
 
     if ( nv->nv_n1vmcx != NULL )
         free_vmcb(nv->nv_n1vmcx);
 
-    if ( arch_svm->msrpm != NULL )
+    if ( svm->msrpm != NULL )
     {
         free_xenheap_pages(
-            arch_svm->msrpm, get_order_from_bytes(MSRPM_SIZE));
-        arch_svm->msrpm = NULL;
+            svm->msrpm, get_order_from_bytes(MSRPM_SIZE));
+        svm->msrpm = NULL;
     }
 
     nv->nv_n1vmcx = NULL;
     nv->nv_n1vmcx_pa = INVALID_PADDR;
-    arch_svm->vmcb = NULL;
+    svm->vmcb = NULL;
 }
 
 static void vmcb_dump(unsigned char ch)
@@ -281,7 +286,7 @@ static void vmcb_dump(unsigned char ch)
         for_each_vcpu ( d, v )
         {
             printk("\tVCPU %d\n", v->vcpu_id);
-            svm_vmcb_dump("key_handler", v->arch.hvm_svm.vmcb);
+            svm_vmcb_dump("key_handler", v->arch.hvm.svm.vmcb);
         }
     }
 

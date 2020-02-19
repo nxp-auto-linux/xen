@@ -38,6 +38,7 @@
 #include <xen/livepatch.h>
 #include <public/sysctl.h>
 #include <public/hvm/hvm_vcpu.h>
+#include <asm/altp2m.h>
 #include <asm/regs.h>
 #include <asm/mc146818rtc.h>
 #include <asm/system.h>
@@ -52,6 +53,7 @@
 #include <asm/hvm/hvm.h>
 #include <asm/hvm/nestedhvm.h>
 #include <asm/hvm/support.h>
+#include <asm/hvm/svm/svm.h>
 #include <asm/hvm/viridian.h>
 #include <asm/debugreg.h>
 #include <asm/msr.h>
@@ -107,10 +109,11 @@ static void play_dead(void)
     local_irq_disable();
 
     /*
-     * NOTE: After cpu_exit_clear, per-cpu variables are no longer accessible,
-     * as they may be freed at any time. In this case, heap corruption or
-     * #PF can occur (when heap debugging is enabled). For example, even
-     * printk() can involve tasklet scheduling, which touches per-cpu vars.
+     * NOTE: After cpu_exit_clear, per-cpu variables may no longer accessible,
+     * as they may be freed at any time if offline CPUs don't get parked. In
+     * this case, heap corruption or #PF can occur (when heap debugging is
+     * enabled). For example, even printk() can involve tasklet scheduling,
+     * which touches per-cpu vars.
      * 
      * Consider very carefully when adding code to *dead_idle. Most hypervisor
      * subsystems are unsafe to call.
@@ -154,8 +157,8 @@ void startup_cpu_idle_loop(void)
     struct vcpu *v = current;
 
     ASSERT(is_idle_vcpu(v));
-    cpumask_set_cpu(v->processor, v->domain->domain_dirty_cpumask);
-    cpumask_set_cpu(v->processor, v->vcpu_dirty_cpumask);
+    cpumask_set_cpu(v->processor, v->domain->dirty_cpumask);
+    v->dirty_cpu = v->processor;
 
     reset_stack_and_jump(idle_loop);
 }
@@ -195,7 +198,7 @@ void dump_pageframe_info(struct domain *d)
                 }
             }
             printk("    DomPage %p: caf=%08lx, taf=%" PRtype_info "\n",
-                   _p(page_to_mfn(page)),
+                   _p(mfn_x(page_to_mfn(page))),
                    page->count_info, page->u.inuse.type_info);
         }
         spin_unlock(&d->page_alloc_lock);
@@ -208,7 +211,7 @@ void dump_pageframe_info(struct domain *d)
     page_list_for_each ( page, &d->xenpage_list )
     {
         printk("    XenPage %p: caf=%08lx, taf=%" PRtype_info "\n",
-               _p(page_to_mfn(page)),
+               _p(mfn_x(page_to_mfn(page))),
                page->count_info, page->u.inuse.type_info);
     }
     spin_unlock(&d->page_alloc_lock);
@@ -217,12 +220,8 @@ void dump_pageframe_info(struct domain *d)
 void update_guest_memory_policy(struct vcpu *v,
                                 struct guest_memory_policy *policy)
 {
-    smap_check_policy_t old_smap_policy = v->arch.smap_check_policy;
     bool old_guest_mode = nestedhvm_is_n2(v);
     bool new_guest_mode = policy->nested_guest_mode;
-
-    v->arch.smap_check_policy = policy->smap_policy;
-    policy->smap_policy = old_smap_policy;
 
     /*
      * When 'v' is in the nested guest mode, all guest copy
@@ -301,11 +300,10 @@ struct domain *alloc_domain_struct(void)
 
 void free_domain_struct(struct domain *d)
 {
-    lock_profile_deregister_struct(LOCKPROF_TYPE_PERDOM, d);
     free_xenheap_page(d);
 }
 
-struct vcpu *alloc_vcpu_struct(void)
+struct vcpu *alloc_vcpu_struct(const struct domain *d)
 {
     struct vcpu *v;
     /*
@@ -314,8 +312,11 @@ struct vcpu *alloc_vcpu_struct(void)
      * may require that the shadow CR3 points below 4GB, and hence the whole
      * structure must satisfy this restriction. Thus we specify MEMF_bits(32).
      */
+    unsigned int memflags =
+        (is_hvm_domain(d) && paging_mode_shadow(d)) ? MEMF_bits(32) : 0;
+
     BUILD_BUG_ON(sizeof(*v) > PAGE_SIZE);
-    v = alloc_xenheap_pages(0, MEMF_bits(32));
+    v = alloc_xenheap_pages(0, memflags);
     if ( v != NULL )
         clear_page(v);
     return v;
@@ -326,7 +327,18 @@ void free_vcpu_struct(struct vcpu *v)
     free_xenheap_page(v);
 }
 
-int vcpu_initialise(struct vcpu *v)
+/* Initialise various registers to their architectural INIT/RESET state. */
+void arch_vcpu_regs_init(struct vcpu *v)
+{
+    memset(&v->arch.user_regs, 0, sizeof(v->arch.user_regs));
+    v->arch.user_regs.eflags = X86_EFLAGS_MBS;
+
+    memset(v->arch.dr, 0, sizeof(v->arch.dr));
+    v->arch.dr6 = X86_DR6_DEFAULT;
+    v->arch.dr7 = X86_DR7_DEFAULT;
+}
+
+int arch_vcpu_create(struct vcpu *v)
 {
     struct domain *d = v->domain;
     int rc;
@@ -345,6 +357,8 @@ int vcpu_initialise(struct vcpu *v)
             return rc;
 
         vmce_init_vcpu(v);
+
+        arch_vcpu_regs_init(v);
     }
     else if ( (rc = xstate_alloc_save_area(v)) != 0 )
         return rc;
@@ -360,7 +374,7 @@ int vcpu_initialise(struct vcpu *v)
         /* Idle domain */
         v->arch.cr3 = __pa(idle_pg_table);
         rc = 0;
-        v->arch.msr = ZERO_BLOCK_PTR; /* Catch stray misuses */
+        v->arch.msrs = ZERO_BLOCK_PTR; /* Catch stray misuses */
     }
 
     if ( rc )
@@ -380,21 +394,21 @@ int vcpu_initialise(struct vcpu *v)
 
  fail:
     vcpu_destroy_fpu(v);
-    xfree(v->arch.msr);
-    v->arch.msr = NULL;
+    xfree(v->arch.msrs);
+    v->arch.msrs = NULL;
 
     return rc;
 }
 
-void vcpu_destroy(struct vcpu *v)
+void arch_vcpu_destroy(struct vcpu *v)
 {
     xfree(v->arch.vm_event);
     v->arch.vm_event = NULL;
 
     vcpu_destroy_fpu(v);
 
-    xfree(v->arch.msr);
-    v->arch.msr = NULL;
+    xfree(v->arch.msrs);
+    v->arch.msrs = NULL;
 
     if ( !is_idle_domain(v->domain) )
         vpmu_destroy(v);
@@ -405,19 +419,47 @@ void vcpu_destroy(struct vcpu *v)
         pv_vcpu_destroy(v);
 }
 
+int arch_sanitise_domain_config(struct xen_domctl_createdomain *config)
+{
+    bool hvm = config->flags & XEN_DOMCTL_CDF_hvm_guest;
+    unsigned int max_vcpus;
+
+    if ( hvm ? !hvm_enabled : !IS_ENABLED(CONFIG_PV) )
+    {
+        dprintk(XENLOG_INFO, "%s support not available\n", hvm ? "HVM" : "PV");
+        return -EINVAL;
+    }
+
+    max_vcpus = hvm ? HVM_MAX_VCPUS : MAX_VIRT_CPUS;
+
+    if ( config->max_vcpus > max_vcpus )
+    {
+        dprintk(XENLOG_INFO, "Requested vCPUs (%u) exceeds max (%u)\n",
+                config->max_vcpus, max_vcpus);
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
 static bool emulation_flags_ok(const struct domain *d, uint32_t emflags)
 {
+#ifdef CONFIG_HVM
+    /* This doesn't catch !CONFIG_HVM case but it is better than nothing */
+    BUILD_BUG_ON(X86_EMU_ALL != XEN_X86_EMU_ALL);
+#endif
 
     if ( is_hvm_domain(d) )
     {
         if ( is_hardware_domain(d) &&
-             emflags != (XEN_X86_EMU_LAPIC|XEN_X86_EMU_IOAPIC) )
+             emflags != (X86_EMU_VPCI | X86_EMU_LAPIC | X86_EMU_IOAPIC) )
             return false;
         if ( !is_hardware_domain(d) &&
-             emflags != XEN_X86_EMU_ALL && emflags != XEN_X86_EMU_LAPIC )
+             emflags != (X86_EMU_ALL & ~X86_EMU_VPCI) &&
+             emflags != X86_EMU_LAPIC )
             return false;
     }
-    else if ( emflags != 0 && emflags != XEN_X86_EMU_PIT )
+    else if ( emflags != 0 && emflags != X86_EMU_PIT )
     {
         /* PV or classic PVH. */
         return false;
@@ -426,24 +468,44 @@ static bool emulation_flags_ok(const struct domain *d, uint32_t emflags)
     return true;
 }
 
-int arch_domain_create(struct domain *d, unsigned int domcr_flags,
-                       struct xen_arch_domainconfig *config)
+int arch_domain_create(struct domain *d,
+                       struct xen_domctl_createdomain *config)
 {
     bool paging_initialised = false;
+    uint32_t emflags;
     int rc;
 
-    if ( config == NULL && !is_idle_domain(d) )
-        return -EINVAL;
-
-    d->arch.s3_integrity = !!(domcr_flags & DOMCRF_s3_integrity);
-
     INIT_LIST_HEAD(&d->arch.pdev_list);
-
-    d->arch.relmem = RELMEM_not_started;
     INIT_PAGE_LIST_HEAD(&d->arch.relmem_list);
 
-    if ( d->domain_id && !is_idle_domain(d) &&
-         cpu_has_amd_erratum(&boot_cpu_data, AMD_ERRATUM_121) )
+    spin_lock_init(&d->arch.e820_lock);
+    spin_lock_init(&d->arch.vtsc_lock);
+
+    /* Minimal initialisation for the idle domain. */
+    if ( unlikely(is_idle_domain(d)) )
+    {
+        static const struct arch_csw idle_csw = {
+            .from = paravirt_ctxt_switch_from,
+            .to   = paravirt_ctxt_switch_to,
+            .tail = continue_idle_domain,
+        };
+
+        d->arch.ctxt_switch = &idle_csw;
+
+        d->arch.cpuid = ZERO_BLOCK_PTR; /* Catch stray misuses. */
+        d->arch.msr = ZERO_BLOCK_PTR;
+
+        return 0;
+    }
+
+    if ( !config )
+    {
+        /* Only IDLE is allowed with no config. */
+        ASSERT_UNREACHABLE();
+        return -EINVAL;
+    }
+
+    if ( d->domain_id && cpu_has_amd_erratum(&boot_cpu_data, AMD_ERRATUM_121) )
     {
         if ( !opt_allow_unsafe )
         {
@@ -456,110 +518,91 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags,
                d->domain_id);
     }
 
-    if ( is_idle_domain(d) )
+    d->arch.s3_integrity = config->flags & XEN_DOMCTL_CDF_s3_integrity;
+
+    emflags = config->arch.emulation_flags;
+
+    if ( is_hardware_domain(d) && is_pv_domain(d) )
+        emflags |= XEN_X86_EMU_PIT;
+
+    if ( emflags & ~XEN_X86_EMU_ALL )
     {
-        d->arch.emulation_flags = 0;
-        d->arch.cpuid = ZERO_BLOCK_PTR; /* Catch stray misuses. */
-        d->arch.msr = ZERO_BLOCK_PTR;
-    }
-    else
-    {
-        uint32_t emflags;
-
-        if ( is_hardware_domain(d) && is_pv_domain(d) )
-            config->emulation_flags |= XEN_X86_EMU_PIT;
-
-        emflags = config->emulation_flags;
-        if ( emflags & ~XEN_X86_EMU_ALL )
-        {
-            printk(XENLOG_G_ERR "d%d: Invalid emulation bitmap: %#x\n",
-                   d->domain_id, emflags);
-            return -EINVAL;
-        }
-
-        if ( !emulation_flags_ok(d, emflags) )
-        {
-            printk(XENLOG_G_ERR "d%d: Xen does not allow %s domain creation "
-                   "with the current selection of emulators: %#x\n",
-                   d->domain_id, is_hvm_domain(d) ? "HVM" : "PV", emflags);
-            return -EOPNOTSUPP;
-        }
-        d->arch.emulation_flags = emflags;
+        printk(XENLOG_G_ERR "d%d: Invalid emulation bitmap: %#x\n",
+               d->domain_id, emflags);
+        return -EINVAL;
     }
 
-    mapcache_domain_init(d);
+    if ( !emulation_flags_ok(d, emflags) )
+    {
+        printk(XENLOG_G_ERR "d%d: Xen does not allow %s domain creation "
+               "with the current selection of emulators: %#x\n",
+               d->domain_id, is_hvm_domain(d) ? "HVM" : "PV", emflags);
+        return -EOPNOTSUPP;
+    }
+    d->arch.emulation_flags = emflags;
 
     HYPERVISOR_COMPAT_VIRT_START(d) =
         is_pv_domain(d) ? __HYPERVISOR_COMPAT_VIRT_START : ~0u;
 
-    if ( !is_idle_domain(d) )
-    {
-        /* Need to determine if HAP is enabled before initialising paging */
-        if ( is_hvm_domain(d) )
-            d->arch.hvm_domain.hap_enabled =
-                hvm_funcs.hap_supported && (domcr_flags & DOMCRF_hap);
+    /* Need to determine if HAP is enabled before initialising paging */
+    if ( is_hvm_domain(d) )
+        d->arch.hvm.hap_enabled =
+            hvm_hap_supported() && (config->flags & XEN_DOMCTL_CDF_hap);
 
-        if ( (rc = paging_domain_init(d, domcr_flags)) != 0 )
-            goto fail;
-        paging_initialised = 1;
+    if ( (rc = paging_domain_init(d, config->flags)) != 0 )
+        goto fail;
+    paging_initialised = true;
 
-        if ( (rc = init_domain_cpuid_policy(d)) )
-            goto fail;
+    if ( (rc = init_domain_cpuid_policy(d)) )
+        goto fail;
 
-        if ( (rc = init_domain_msr_policy(d)) )
-            goto fail;
+    if ( (rc = init_domain_msr_policy(d)) )
+        goto fail;
 
-        d->arch.ioport_caps = 
-            rangeset_new(d, "I/O Ports", RANGESETF_prettyprint_hex);
-        rc = -ENOMEM;
-        if ( d->arch.ioport_caps == NULL )
-            goto fail;
+    d->arch.ioport_caps =
+        rangeset_new(d, "I/O Ports", RANGESETF_prettyprint_hex);
+    rc = -ENOMEM;
+    if ( d->arch.ioport_caps == NULL )
+        goto fail;
 
-        /*
-         * The shared_info machine address must fit in a 32-bit field within a
-         * 32-bit guest's start_info structure. Hence we specify MEMF_bits(32).
-         */
-        if ( (d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32))) == NULL )
-            goto fail;
+    /*
+     * The shared_info machine address must fit in a 32-bit field within a
+     * 32-bit guest's start_info structure. Hence we specify MEMF_bits(32).
+     */
+    if ( (d->shared_info = alloc_xenheap_pages(0, MEMF_bits(32))) == NULL )
+        goto fail;
 
-        clear_page(d->shared_info);
-        share_xen_page_with_guest(
-            virt_to_page(d->shared_info), d, XENSHARE_writable);
+    clear_page(d->shared_info);
+    share_xen_page_with_guest(virt_to_page(d->shared_info), d, SHARE_rw);
 
-        if ( (rc = init_domain_irq_mapping(d)) != 0 )
-            goto fail;
+    if ( (rc = init_domain_irq_mapping(d)) != 0 )
+        goto fail;
 
-        if ( (rc = iommu_domain_init(d)) != 0 )
-            goto fail;
-    }
-    spin_lock_init(&d->arch.e820_lock);
+    if ( (rc = iommu_domain_init(d)) != 0 )
+        goto fail;
 
     psr_domain_init(d);
 
     if ( is_hvm_domain(d) )
     {
-        if ( (rc = hvm_domain_initialise(d, domcr_flags, config)) != 0 )
+        if ( (rc = hvm_domain_initialise(d)) != 0 )
             goto fail;
     }
-    else if ( is_idle_domain(d) )
+    else if ( is_pv_domain(d) )
     {
-        static const struct arch_csw idle_csw = {
-            .from = paravirt_ctxt_switch_from,
-            .to   = paravirt_ctxt_switch_to,
-            .tail = continue_idle_domain,
-        };
+        mapcache_domain_init(d);
 
-        d->arch.ctxt_switch = &idle_csw;
+        if ( (rc = pv_domain_initialise(d)) != 0 )
+            goto fail;
     }
     else
-    {
-        if ( (rc = pv_domain_initialise(d, domcr_flags, config)) != 0 )
-            goto fail;
-    }
+        ASSERT_UNREACHABLE(); /* Not HVM and not PV? */
 
-    /* initialize default tsc behavior in case tools don't */
-    tsc_set_info(d, TSC_MODE_DEFAULT, 0UL, 0, 0);
-    spin_lock_init(&d->arch.vtsc_lock);
+    if ( (rc = tsc_set_info(d, TSC_MODE_DEFAULT, 0, 0, 0)) != 0 )
+    {
+        ASSERT_UNREACHABLE();
+        goto fail;
+    }
 
     /* PV/PVH guests get an emulated PIT too for video BIOSes to use. */
     pit_init(d, cpu_khz);
@@ -635,7 +678,8 @@ int arch_domain_soft_reset(struct domain *d)
     struct page_info *page = virt_to_page(d->shared_info), *new_page;
     int ret = 0;
     struct domain *owner;
-    unsigned long mfn, gfn;
+    mfn_t mfn;
+    unsigned long gfn;
     p2m_type_t p2mt;
     unsigned int i;
 
@@ -669,7 +713,7 @@ int arch_domain_soft_reset(struct domain *d)
     ASSERT( owner == d );
 
     mfn = page_to_mfn(page);
-    gfn = mfn_to_gmfn(d, mfn);
+    gfn = mfn_to_gmfn(d, mfn_x(mfn));
 
     /*
      * gfn == INVALID_GFN indicates that the shared_info page was never mapped
@@ -678,12 +722,12 @@ int arch_domain_soft_reset(struct domain *d)
     if ( gfn == gfn_x(INVALID_GFN) )
         goto exit_put_page;
 
-    if ( mfn_x(get_gfn_query(d, gfn, &p2mt)) != mfn )
+    if ( !mfn_eq(get_gfn_query(d, gfn, &p2mt), mfn) )
     {
         printk(XENLOG_G_ERR "Failed to get Dom%d's shared_info GFN (%lx)\n",
                d->domain_id, gfn);
         ret = -EINVAL;
-        goto exit_put_page;
+        goto exit_put_gfn;
     }
 
     new_page = alloc_domheap_page(d, 0);
@@ -695,7 +739,7 @@ int arch_domain_soft_reset(struct domain *d)
         goto exit_put_gfn;
     }
 
-    ret = guest_physmap_remove_page(d, _gfn(gfn), _mfn(mfn), PAGE_ORDER_4K);
+    ret = guest_physmap_remove_page(d, _gfn(gfn), mfn, PAGE_ORDER_4K);
     if ( ret )
     {
         printk(XENLOG_G_ERR "Failed to remove Dom%d's shared_info frame %lx\n",
@@ -704,7 +748,7 @@ int arch_domain_soft_reset(struct domain *d)
         goto exit_put_gfn;
     }
 
-    ret = guest_physmap_add_page(d, _gfn(gfn), _mfn(page_to_mfn(new_page)),
+    ret = guest_physmap_add_page(d, _gfn(gfn), page_to_mfn(new_page),
                                  PAGE_ORDER_4K);
     if ( ret )
     {
@@ -720,47 +764,8 @@ int arch_domain_soft_reset(struct domain *d)
     return ret;
 }
 
-/*
- * These are the masks of CR4 bits (subject to hardware availability) which a
- * PV guest may not legitimiately attempt to modify.
- */
-static unsigned long __read_mostly pv_cr4_mask, compat_pv_cr4_mask;
-
-static int __init init_pv_cr4_masks(void)
+void arch_domain_creation_finished(struct domain *d)
 {
-    unsigned long common_mask = ~X86_CR4_TSD;
-
-    /*
-     * All PV guests may attempt to modify TSD, DE and OSXSAVE.
-     */
-    if ( cpu_has_de )
-        common_mask &= ~X86_CR4_DE;
-    if ( cpu_has_xsave )
-        common_mask &= ~X86_CR4_OSXSAVE;
-
-    pv_cr4_mask = compat_pv_cr4_mask = common_mask;
-
-    /*
-     * 64bit PV guests may attempt to modify FSGSBASE.
-     */
-    if ( cpu_has_fsgsbase )
-        pv_cr4_mask &= ~X86_CR4_FSGSBASE;
-
-    return 0;
-}
-__initcall(init_pv_cr4_masks);
-
-unsigned long pv_guest_cr4_fixup(const struct vcpu *v, unsigned long guest_cr4)
-{
-    unsigned long hv_cr4 = real_cr4_to_pv_guest_cr4(read_cr4());
-    unsigned long mask = is_pv_32bit_vcpu(v) ? compat_pv_cr4_mask : pv_cr4_mask;
-
-    if ( (guest_cr4 & mask) != (hv_cr4 & mask) )
-        printk(XENLOG_G_WARNING
-               "d%d attempted to change %pv's CR4 flags %08lx -> %08lx\n",
-               current->domain->domain_id, v, hv_cr4, guest_cr4);
-
-    return (hv_cr4 & mask) | (guest_cr4 & ~mask);
 }
 
 #define xen_vcpu_guest_context vcpu_guest_context
@@ -774,11 +779,14 @@ int arch_set_info_guest(
     struct vcpu *v, vcpu_guest_context_u c)
 {
     struct domain *d = v->domain;
+    unsigned int i;
+    unsigned long flags;
+    bool compat;
+#ifdef CONFIG_PV
     unsigned long cr3_gfn;
     struct page_info *cr3_page;
-    unsigned long flags, cr4;
-    unsigned int i;
-    int rc = 0, compat;
+    int rc = 0;
+#endif
 
     /* The context is a compat-mode one if the target domain is compat-mode;
      * we expect the tools to DTRT even in compat-mode callers. */
@@ -835,41 +843,21 @@ int arch_set_info_guest(
             return -EINVAL;
     }
 
-    v->fpu_initialised = !!(flags & VGCF_I387_VALID);
-
     v->arch.flags &= ~TF_kernel_mode;
     if ( (flags & VGCF_in_kernel) || is_hvm_domain(d)/*???*/ )
         v->arch.flags |= TF_kernel_mode;
 
     v->arch.vgc_flags = flags;
 
-    if ( flags & VGCF_I387_VALID )
-    {
-        memcpy(v->arch.fpu_ctxt, &c.nat->fpu_ctxt, sizeof(c.nat->fpu_ctxt));
-        if ( v->arch.xsave_area )
-            v->arch.xsave_area->xsave_hdr.xstate_bv = XSTATE_FP_SSE;
-    }
-    else if ( v->arch.xsave_area )
-    {
-        v->arch.xsave_area->xsave_hdr.xstate_bv = 0;
-        v->arch.xsave_area->fpu_sse.mxcsr = MXCSR_DEFAULT;
-    }
-    else
-    {
-        typeof(v->arch.xsave_area->fpu_sse) *fpu_sse = v->arch.fpu_ctxt;
-
-        memset(fpu_sse, 0, sizeof(*fpu_sse));
-        fpu_sse->fcw = FCW_DEFAULT;
-        fpu_sse->mxcsr = MXCSR_DEFAULT;
-    }
-    if ( v->arch.xsave_area )
-        v->arch.xsave_area->xsave_hdr.xcomp_bv = 0;
+    vcpu_setup_fpu(v, v->arch.xsave_area,
+                   flags & VGCF_I387_VALID ? &c.nat->fpu_ctxt : NULL,
+                   FCW_DEFAULT);
 
     if ( !compat )
     {
         memcpy(&v->arch.user_regs, &c.nat->user_regs, sizeof(c.nat->user_regs));
         if ( is_pv_domain(d) )
-            memcpy(v->arch.pv_vcpu.trap_ctxt, c.nat->trap_ctxt,
+            memcpy(v->arch.pv.trap_ctxt, c.nat->trap_ctxt,
                    sizeof(c.nat->trap_ctxt));
     }
     else
@@ -878,24 +866,25 @@ int arch_set_info_guest(
         if ( is_pv_domain(d) )
         {
             for ( i = 0; i < ARRAY_SIZE(c.cmp->trap_ctxt); ++i )
-                XLAT_trap_info(v->arch.pv_vcpu.trap_ctxt + i,
+                XLAT_trap_info(v->arch.pv.trap_ctxt + i,
                                c.cmp->trap_ctxt + i);
         }
     }
 
     if ( is_hvm_domain(d) )
     {
-        for ( i = 0; i < ARRAY_SIZE(v->arch.debugreg); ++i )
-            v->arch.debugreg[i] = c(debugreg[i]);
+        for ( i = 0; i < ARRAY_SIZE(v->arch.dr); ++i )
+            v->arch.dr[i] = c(debugreg[i]);
+        v->arch.dr6 = c(debugreg[6]);
+        v->arch.dr7 = c(debugreg[7]);
 
         hvm_set_info_guest(v);
         goto out;
     }
 
-    init_int80_direct_trap(v);
-
+#ifdef CONFIG_PV
     /* IOPL privileges are virtualised. */
-    v->arch.pv_vcpu.iopl = v->arch.user_regs.eflags & X86_EFLAGS_IOPL;
+    v->arch.pv.iopl = v->arch.user_regs.eflags & X86_EFLAGS_IOPL;
     v->arch.user_regs.eflags &= ~X86_EFLAGS_IOPL;
 
     /* Ensure real hardware interrupts are enabled. */
@@ -906,8 +895,8 @@ int arch_set_info_guest(
         if ( !compat && !(flags & VGCF_in_kernel) && !c.nat->ctrlreg[1] )
             return -EINVAL;
 
-        v->arch.pv_vcpu.ldt_base = c(ldt_base);
-        v->arch.pv_vcpu.ldt_ents = c(ldt_ents);
+        v->arch.pv.ldt_base = c(ldt_base);
+        v->arch.pv.ldt_ents = c(ldt_ents);
     }
     else
     {
@@ -932,48 +921,56 @@ int arch_set_info_guest(
             fail = compat_pfn_to_cr3(pfn) != c.cmp->ctrlreg[3];
         }
 
-        for ( i = 0; i < ARRAY_SIZE(v->arch.pv_vcpu.gdt_frames); ++i )
-            fail |= v->arch.pv_vcpu.gdt_frames[i] != c(gdt_frames[i]);
-        fail |= v->arch.pv_vcpu.gdt_ents != c(gdt_ents);
+        for ( i = 0; i < ARRAY_SIZE(v->arch.pv.gdt_frames); ++i )
+            fail |= v->arch.pv.gdt_frames[i] != c(gdt_frames[i]);
+        fail |= v->arch.pv.gdt_ents != c(gdt_ents);
 
-        fail |= v->arch.pv_vcpu.ldt_base != c(ldt_base);
-        fail |= v->arch.pv_vcpu.ldt_ents != c(ldt_ents);
+        fail |= v->arch.pv.ldt_base != c(ldt_base);
+        fail |= v->arch.pv.ldt_ents != c(ldt_ents);
 
         if ( fail )
            return -EOPNOTSUPP;
     }
 
-    v->arch.pv_vcpu.kernel_ss = c(kernel_ss);
-    v->arch.pv_vcpu.kernel_sp = c(kernel_sp);
-    for ( i = 0; i < ARRAY_SIZE(v->arch.pv_vcpu.ctrlreg); ++i )
-        v->arch.pv_vcpu.ctrlreg[i] = c(ctrlreg[i]);
+    v->arch.pv.kernel_ss = c(kernel_ss);
+    v->arch.pv.kernel_sp = c(kernel_sp);
+    for ( i = 0; i < ARRAY_SIZE(v->arch.pv.ctrlreg); ++i )
+        v->arch.pv.ctrlreg[i] = c(ctrlreg[i]);
 
-    v->arch.pv_vcpu.event_callback_eip = c(event_callback_eip);
-    v->arch.pv_vcpu.failsafe_callback_eip = c(failsafe_callback_eip);
+    v->arch.pv.event_callback_eip = c(event_callback_eip);
+    v->arch.pv.failsafe_callback_eip = c(failsafe_callback_eip);
     if ( !compat )
     {
-        v->arch.pv_vcpu.syscall_callback_eip = c.nat->syscall_callback_eip;
-        v->arch.pv_vcpu.fs_base = c.nat->fs_base;
-        v->arch.pv_vcpu.gs_base_kernel = c.nat->gs_base_kernel;
-        v->arch.pv_vcpu.gs_base_user = c.nat->gs_base_user;
+        v->arch.pv.syscall_callback_eip = c.nat->syscall_callback_eip;
+        /* non-nul selector kills fs_base */
+        v->arch.pv.fs_base =
+            !(v->arch.user_regs.fs & ~3) ? c.nat->fs_base : 0;
+        v->arch.pv.gs_base_kernel = c.nat->gs_base_kernel;
+        /* non-nul selector kills gs_base_user */
+        v->arch.pv.gs_base_user =
+            !(v->arch.user_regs.gs & ~3) ? c.nat->gs_base_user : 0;
     }
     else
     {
-        v->arch.pv_vcpu.event_callback_cs = c(event_callback_cs);
-        v->arch.pv_vcpu.failsafe_callback_cs = c(failsafe_callback_cs);
+        v->arch.pv.event_callback_cs = c(event_callback_cs);
+        v->arch.pv.failsafe_callback_cs = c(failsafe_callback_cs);
     }
 
     /* Only CR0.TS is modifiable by guest or admin. */
-    v->arch.pv_vcpu.ctrlreg[0] &= X86_CR0_TS;
-    v->arch.pv_vcpu.ctrlreg[0] |= read_cr0() & ~X86_CR0_TS;
+    v->arch.pv.ctrlreg[0] &= X86_CR0_TS;
+    v->arch.pv.ctrlreg[0] |= read_cr0() & ~X86_CR0_TS;
 
-    cr4 = v->arch.pv_vcpu.ctrlreg[4];
-    v->arch.pv_vcpu.ctrlreg[4] = cr4 ? pv_guest_cr4_fixup(v, cr4) :
-        real_cr4_to_pv_guest_cr4(mmu_cr4_features);
+    v->arch.pv.ctrlreg[4] = pv_fixup_guest_cr4(v, v->arch.pv.ctrlreg[4]);
 
-    memset(v->arch.debugreg, 0, sizeof(v->arch.debugreg));
-    for ( i = 0; i < 8; i++ )
-        (void)set_debugreg(v, i, c(debugreg[i]));
+    memset(v->arch.dr, 0, sizeof(v->arch.dr));
+    v->arch.dr6 = X86_DR6_DEFAULT;
+    v->arch.dr7 = X86_DR7_DEFAULT;
+    v->arch.pv.dr7_emul = 0;
+
+    for ( i = 0; i < ARRAY_SIZE(v->arch.dr); i++ )
+        set_debugreg(v, i, c(debugreg[i]));
+    set_debugreg(v, 6, c(debugreg[6]));
+    set_debugreg(v, 7, c(debugreg[7]));
 
     if ( v->is_initialised )
         goto out;
@@ -988,7 +985,7 @@ int arch_set_info_guest(
         if ( d != current->domain && !VM_ASSIST(d, m2p_strict) &&
              is_pv_domain(d) && !is_pv_32bit_domain(d) &&
              test_bit(VMASST_TYPE_m2p_strict, &c.nat->vm_assist) &&
-             atomic_read(&d->arch.pv_domain.nr_l4_pages) )
+             atomic_read(&d->arch.pv.nr_l4_pages) )
         {
             bool done = false;
 
@@ -1002,7 +999,7 @@ int arch_set_info_guest(
                 {
                     if ( (page->u.inuse.type_info & PGT_type_mask) ==
                          PGT_l4_page_table )
-                        done = !fill_ro_mpt(_mfn(page_to_mfn(page)));
+                        done = !fill_ro_mpt(page_to_mfn(page));
 
                     page_unlock(page);
                 }
@@ -1030,13 +1027,15 @@ int arch_set_info_guest(
         rc = (int)pv_set_gdt(v, c.nat->gdt_frames, c.nat->gdt_ents);
     else
     {
-        unsigned long gdt_frames[ARRAY_SIZE(v->arch.pv_vcpu.gdt_frames)];
-        unsigned int n = (c.cmp->gdt_ents + 511) / 512;
+        unsigned long gdt_frames[ARRAY_SIZE(v->arch.pv.gdt_frames)];
+        unsigned int nr_frames = DIV_ROUND_UP(c.cmp->gdt_ents, 512);
 
-        if ( n > ARRAY_SIZE(v->arch.pv_vcpu.gdt_frames) )
+        if ( nr_frames > ARRAY_SIZE(v->arch.pv.gdt_frames) )
             return -EINVAL;
-        for ( i = 0; i < n; ++i )
+
+        for ( i = 0; i < nr_frames; ++i )
             gdt_frames[i] = c.cmp->gdt_frames[i];
+
         rc = (int)pv_set_gdt(v, gdt_frames, c.cmp->gdt_ents);
     }
     if ( rc != 0 )
@@ -1129,7 +1128,7 @@ int arch_set_info_guest(
         l4_pgentry_t *l4tab;
 
         l4tab = map_domain_page(pagetable_get_mfn(v->arch.guest_table));
-        *l4tab = l4e_from_pfn(page_to_mfn(cr3_page),
+        *l4tab = l4e_from_mfn(page_to_mfn(cr3_page),
             _PAGE_PRESENT|_PAGE_RW|_PAGE_USER|_PAGE_ACCESSED);
         unmap_domain_page(l4tab);
     }
@@ -1153,6 +1152,7 @@ int arch_set_info_guest(
         paging_update_paging_modes(v);
 
     update_cr3(v);
+#endif /* CONFIG_PV */
 
  out:
     if ( flags & VGCF_online )
@@ -1288,17 +1288,35 @@ static DEFINE_PER_CPU(unsigned int, dirty_segment_mask);
 #define DIRTY_FS           0x04
 #define DIRTY_GS           0x08
 #define DIRTY_FS_BASE      0x10
-#define DIRTY_GS_BASE_USER 0x20
+#define DIRTY_GS_BASE      0x20
 
 static void load_segments(struct vcpu *n)
 {
     struct cpu_user_regs *uregs = &n->arch.user_regs;
     int all_segs_okay = 1;
     unsigned int dirty_segment_mask, cpu = smp_processor_id();
+    bool fs_gs_done = false;
 
     /* Load and clear the dirty segment mask. */
     dirty_segment_mask = per_cpu(dirty_segment_mask, cpu);
     per_cpu(dirty_segment_mask, cpu) = 0;
+
+#ifdef CONFIG_HVM
+    if ( cpu_has_svm && !is_pv_32bit_vcpu(n) &&
+         !(read_cr4() & X86_CR4_FSGSBASE) && !((uregs->fs | uregs->gs) & ~3) )
+    {
+        unsigned long gsb = n->arch.flags & TF_kernel_mode
+            ? n->arch.pv.gs_base_kernel : n->arch.pv.gs_base_user;
+        unsigned long gss = n->arch.flags & TF_kernel_mode
+            ? n->arch.pv.gs_base_user : n->arch.pv.gs_base_kernel;
+
+        fs_gs_done = svm_load_segs(n->arch.pv.ldt_ents, LDT_VIRT_START(n),
+                                   uregs->fs, n->arch.pv.fs_base,
+                                   uregs->gs, gsb, gss);
+    }
+#endif
+    if ( !fs_gs_done )
+        load_LDT(n);
 
     /* Either selector != 0 ==> reload. */
     if ( unlikely((dirty_segment_mask & DIRTY_DS) | uregs->ds) )
@@ -1315,7 +1333,7 @@ static void load_segments(struct vcpu *n)
     }
 
     /* Either selector != 0 ==> reload. */
-    if ( unlikely((dirty_segment_mask & DIRTY_FS) | uregs->fs) )
+    if ( unlikely((dirty_segment_mask & DIRTY_FS) | uregs->fs) && !fs_gs_done )
     {
         all_segs_okay &= loadsegment(fs, uregs->fs);
         /* non-nul selector updates fs_base */
@@ -1324,28 +1342,31 @@ static void load_segments(struct vcpu *n)
     }
 
     /* Either selector != 0 ==> reload. */
-    if ( unlikely((dirty_segment_mask & DIRTY_GS) | uregs->gs) )
+    if ( unlikely((dirty_segment_mask & DIRTY_GS) | uregs->gs) && !fs_gs_done )
     {
         all_segs_okay &= loadsegment(gs, uregs->gs);
         /* non-nul selector updates gs_base_user */
         if ( uregs->gs & ~3 )
-            dirty_segment_mask &= ~DIRTY_GS_BASE_USER;
+            dirty_segment_mask &= ~DIRTY_GS_BASE;
     }
 
-    if ( !is_pv_32bit_vcpu(n) )
+    if ( !fs_gs_done && !is_pv_32bit_vcpu(n) )
     {
         /* This can only be non-zero if selector is NULL. */
-        if ( n->arch.pv_vcpu.fs_base | (dirty_segment_mask & DIRTY_FS_BASE) )
-            wrfsbase(n->arch.pv_vcpu.fs_base);
+        if ( n->arch.pv.fs_base | (dirty_segment_mask & DIRTY_FS_BASE) )
+            wrfsbase(n->arch.pv.fs_base);
 
-        /* Most kernels have non-zero GS base, so don't bother testing. */
-        /* (This is also a serialising instruction, avoiding AMD erratum #88.) */
-        wrmsrl(MSR_SHADOW_GS_BASE, n->arch.pv_vcpu.gs_base_kernel);
+        /*
+         * Most kernels have non-zero GS base, so don't bother testing.
+         * (For old AMD hardware this is also a serialising instruction,
+         * avoiding erratum #88.)
+         */
+        wrgsshadow(n->arch.pv.gs_base_kernel);
 
         /* This can only be non-zero if selector is NULL. */
-        if ( n->arch.pv_vcpu.gs_base_user |
-             (dirty_segment_mask & DIRTY_GS_BASE_USER) )
-            wrgsbase(n->arch.pv_vcpu.gs_base_user);
+        if ( n->arch.pv.gs_base_user |
+             (dirty_segment_mask & DIRTY_GS_BASE) )
+            wrgsbase(n->arch.pv.gs_base_user);
 
         /* If in kernel mode then switch the GS bases around. */
         if ( (n->arch.flags & TF_kernel_mode) )
@@ -1354,7 +1375,7 @@ static void load_segments(struct vcpu *n)
 
     if ( unlikely(!all_segs_okay) )
     {
-        struct pv_vcpu *pv = &n->arch.pv_vcpu;
+        struct pv_vcpu *pv = &n->arch.pv;
         struct cpu_user_regs *regs = guest_cpu_user_regs();
         unsigned long *rsp =
             (unsigned long *)(((n->arch.flags & TF_kernel_mode)
@@ -1365,7 +1386,7 @@ static void load_segments(struct vcpu *n)
         rflags  = regs->rflags & ~(X86_EFLAGS_IF|X86_EFLAGS_IOPL);
         rflags |= !vcpu_info(n, evtchn_upcall_mask) << 9;
         if ( VM_ASSIST(n->domain, architectural_iopl) )
-            rflags |= n->arch.pv_vcpu.iopl;
+            rflags |= n->arch.pv.iopl;
 
         if ( is_pv_32bit_vcpu(n) )
         {
@@ -1461,13 +1482,14 @@ static void save_segments(struct vcpu *v)
     regs->fs = read_sreg(fs);
     regs->gs = read_sreg(gs);
 
-    if ( cpu_has_fsgsbase && !is_pv_32bit_vcpu(v) )
+    /* %fs/%gs bases can only be stale if WR{FS,GS}BASE are usable. */
+    if ( (read_cr4() & X86_CR4_FSGSBASE) && !is_pv_32bit_vcpu(v) )
     {
-        v->arch.pv_vcpu.fs_base = __rdfsbase();
+        v->arch.pv.fs_base = __rdfsbase();
         if ( v->arch.flags & TF_kernel_mode )
-            v->arch.pv_vcpu.gs_base_kernel = __rdgsbase();
+            v->arch.pv.gs_base_kernel = __rdgsbase();
         else
-            v->arch.pv_vcpu.gs_base_user = __rdgsbase();
+            v->arch.pv.gs_base_user = __rdgsbase();
     }
 
     if ( regs->ds )
@@ -1481,9 +1503,9 @@ static void save_segments(struct vcpu *v)
         dirty_segment_mask |= DIRTY_FS;
         /* non-nul selector kills fs_base */
         if ( regs->fs & ~3 )
-            v->arch.pv_vcpu.fs_base = 0;
+            v->arch.pv.fs_base = 0;
     }
-    if ( v->arch.pv_vcpu.fs_base )
+    if ( v->arch.pv.fs_base )
         dirty_segment_mask |= DIRTY_FS_BASE;
 
     if ( regs->gs || is_pv_32bit_vcpu(v) )
@@ -1491,11 +1513,11 @@ static void save_segments(struct vcpu *v)
         dirty_segment_mask |= DIRTY_GS;
         /* non-nul selector kills gs_base_user */
         if ( regs->gs & ~3 )
-            v->arch.pv_vcpu.gs_base_user = 0;
+            v->arch.pv.gs_base_user = 0;
     }
-    if ( v->arch.flags & TF_kernel_mode ? v->arch.pv_vcpu.gs_base_kernel
-                                        : v->arch.pv_vcpu.gs_base_user )
-        dirty_segment_mask |= DIRTY_GS_BASE_USER;
+    if ( v->arch.flags & TF_kernel_mode ? v->arch.pv.gs_base_kernel
+                                        : v->arch.pv.gs_base_user )
+        dirty_segment_mask |= DIRTY_GS_BASE;
 
     this_cpu(dirty_segment_mask) = dirty_segment_mask;
 }
@@ -1510,38 +1532,31 @@ void paravirt_ctxt_switch_from(struct vcpu *v)
      * inside Xen, before we get a chance to reload DR7, and this cannot always
      * safely be handled.
      */
-    if ( unlikely(v->arch.debugreg[7] & DR7_ACTIVE_MASK) )
+    if ( unlikely(v->arch.dr7 & DR7_ACTIVE_MASK) )
         write_debugreg(7, 0);
 }
 
 void paravirt_ctxt_switch_to(struct vcpu *v)
 {
     root_pgentry_t *root_pgt = this_cpu(root_pgt);
-    unsigned long cr4;
 
     if ( root_pgt )
         root_pgt[root_table_offset(PERDOMAIN_VIRT_START)] =
             l4e_from_page(v->domain->arch.perdomain_l3_pg,
                           __PAGE_HYPERVISOR_RW);
 
-    cr4 = pv_guest_cr4_to_real_cr4(v);
-    if ( unlikely(cr4 != read_cr4()) )
-        write_cr4(cr4);
-
-    if ( unlikely(v->arch.debugreg[7] & DR7_ACTIVE_MASK) )
+    if ( unlikely(v->arch.dr7 & DR7_ACTIVE_MASK) )
         activate_debugregs(v);
 
-    if ( cpu_has_rdtscp )
-        wrmsr_tsc_aux(v->domain->arch.tsc_mode == TSC_MODE_PVRDTSCP
-                      ? v->domain->arch.incarnation : 0);
+    if ( cpu_has_msr_tsc_aux )
+        wrmsr_tsc_aux(v->arch.msrs->tsc_aux);
 }
 
 /* Update per-VCPU guest runstate shared memory area (if registered). */
 bool update_runstate_area(struct vcpu *v)
 {
     bool rc;
-    struct guest_memory_policy policy =
-        { .smap_policy = SMAP_CHECK_ENABLED, .nested_guest_mode = false };
+    struct guest_memory_policy policy = { .nested_guest_mode = false };
     void __user *guest_handle = NULL;
 
     if ( guest_handle_is_null(runstate_guest(v)) )
@@ -1590,7 +1605,7 @@ static void _update_runstate_area(struct vcpu *v)
 {
     if ( !update_runstate_area(v) && is_pv_vcpu(v) &&
          !(v->arch.flags & TF_kernel_mode) )
-        v->arch.pv_vcpu.need_update_runstate_area = 1;
+        v->arch.pv.need_update_runstate_area = 1;
 }
 
 static inline bool need_full_gdt(const struct domain *d)
@@ -1605,11 +1620,11 @@ static void __context_switch(void)
     struct vcpu          *p = per_cpu(curr_vcpu, cpu);
     struct vcpu          *n = current;
     struct domain        *pd = p->domain, *nd = n->domain;
-    struct desc_struct   *gdt;
+    seg_desc_t           *gdt;
     struct desc_ptr       gdt_desc;
 
     ASSERT(p != n);
-    ASSERT(cpumask_empty(n->vcpu_dirty_cpumask));
+    ASSERT(!vcpu_cpu_dirty(n));
 
     if ( !is_idle_domain(pd) )
     {
@@ -1624,8 +1639,8 @@ static void __context_switch(void)
      * which is synchronised on that function.
      */
     if ( pd != nd )
-        cpumask_set_cpu(cpu, nd->domain_dirty_cpumask);
-    cpumask_set_cpu(cpu, n->vcpu_dirty_cpumask);
+        cpumask_set_cpu(cpu, nd->dirty_cpumask);
+    write_atomic(&n->dirty_cpu, cpu);
 
     if ( !is_idle_domain(nd) )
     {
@@ -1638,9 +1653,9 @@ static void __context_switch(void)
                 BUG();
 
             if ( cpu_has_xsaves && is_hvm_vcpu(n) )
-                set_msr_xss(n->arch.hvm_vcpu.msr_xss);
+                set_msr_xss(n->arch.hvm.msr_xss);
         }
-        vcpu_restore_fpu_eager(n);
+        vcpu_restore_fpu_nonlazy(n, false);
         nd->arch.ctxt_switch->to(n);
     }
 
@@ -1664,22 +1679,31 @@ static void __context_switch(void)
     {
         gdt_desc.limit = LAST_RESERVED_GDT_BYTE;
         gdt_desc.base  = (unsigned long)(gdt - FIRST_RESERVED_GDT_ENTRY);
-        asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+
+        lgdt(&gdt_desc);
     }
 
     write_ptbase(n);
+
+#if defined(CONFIG_PV) && defined(CONFIG_HVM)
+    /* Prefetch the VMCB if we expect to use it later in the context switch */
+    if ( cpu_has_svm && is_pv_domain(nd) && !is_pv_32bit_domain(nd) &&
+         !is_idle_domain(nd) && !(read_cr4() & X86_CR4_FSGSBASE) )
+        svm_load_segs(0, 0, 0, 0, 0, 0, 0);
+#endif
 
     if ( need_full_gdt(nd) &&
          ((p->vcpu_id != n->vcpu_id) || !need_full_gdt(pd)) )
     {
         gdt_desc.limit = LAST_RESERVED_GDT_BYTE;
         gdt_desc.base = GDT_VIRT_START(n);
-        asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+
+        lgdt(&gdt_desc);
     }
 
     if ( pd != nd )
-        cpumask_clear_cpu(cpu, pd->domain_dirty_cpumask);
-    cpumask_clear_cpu(cpu, p->vcpu_dirty_cpumask);
+        cpumask_clear_cpu(cpu, pd->dirty_cpumask);
+    write_atomic(&p->dirty_cpu, VCPU_CPU_CLEAN);
 
     per_cpu(curr_vcpu, cpu) = n;
 }
@@ -1689,20 +1713,17 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
 {
     unsigned int cpu = smp_processor_id();
     const struct domain *prevd = prev->domain, *nextd = next->domain;
-    cpumask_t dirty_mask;
+    unsigned int dirty_cpu = next->dirty_cpu;
 
     ASSERT(local_irq_is_enabled());
 
+    get_cpu_info()->use_pv_cr3 = false;
     get_cpu_info()->xen_cr3 = 0;
 
-    cpumask_copy(&dirty_mask, next->vcpu_dirty_cpumask);
-    /* Allow at most one CPU at a time to be dirty. */
-    ASSERT(cpumask_weight(&dirty_mask) <= 1);
-    if ( unlikely(!cpumask_test_cpu(cpu, &dirty_mask) &&
-                  !cpumask_empty(&dirty_mask)) )
+    if ( unlikely(dirty_cpu != cpu) && dirty_cpu != VCPU_CPU_CLEAN )
     {
-        /* Other cpus call __sync_local_execstate from flush ipi handler. */
-        flush_tlb_mask(&dirty_mask);
+        /* Remote CPU calls __sync_local_execstate() from flush IPI handler. */
+        flush_mask(cpumask_of(dirty_cpu), FLUSH_VCPU_STATE);
     }
 
     if ( prev != next )
@@ -1712,7 +1733,7 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
         np2m_schedule(NP2M_SCHEDLE_OUT);
     }
 
-    if ( is_hvm_domain(prevd) && !list_empty(&prev->arch.hvm_vcpu.tm_list) )
+    if ( is_hvm_domain(prevd) && !list_empty(&prev->arch.hvm.tm_list) )
         pt_save_timer(prev);
 
     local_irq_disable();
@@ -1728,24 +1749,11 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
     {
         __context_switch();
 
-        if ( is_pv_domain(nextd) &&
-             (is_idle_domain(prevd) ||
-              is_hvm_domain(prevd) ||
-              is_pv_32bit_domain(prevd) != is_pv_32bit_domain(nextd)) )
-        {
-            uint64_t efer = read_efer();
-            if ( !(efer & EFER_SCE) )
-                write_efer(efer | EFER_SCE);
-        }
-
         /* Re-enable interrupts before restoring state which may fault. */
         local_irq_enable();
 
         if ( is_pv_domain(nextd) )
-        {
-            load_LDT(next);
             load_segments(next);
-        }
 
         ctxt_switch_levelling(next);
 
@@ -1835,11 +1843,13 @@ void sync_local_execstate(void)
 
 void sync_vcpu_execstate(struct vcpu *v)
 {
-    if ( cpumask_test_cpu(smp_processor_id(), v->vcpu_dirty_cpumask) )
+    if ( v->dirty_cpu == smp_processor_id() )
         sync_local_execstate();
-
-    /* Other cpus call __sync_local_execstate from flush ipi handler. */
-    flush_tlb_mask(v->vcpu_dirty_cpumask);
+    else if ( vcpu_cpu_dirty(v) )
+    {
+        /* Remote CPU calls __sync_local_execstate() from flush IPI handler. */
+        flush_mask(cpumask_of(v->dirty_cpu), FLUSH_VCPU_STATE);
+    }
 }
 
 static int relinquish_memory(
@@ -1957,19 +1967,52 @@ int domain_relinquish_resources(struct domain *d)
     int ret;
     struct vcpu *v;
 
-    BUG_ON(!cpumask_empty(d->domain_dirty_cpumask));
+    BUG_ON(!cpumask_empty(d->dirty_cpumask));
 
-    switch ( d->arch.relmem )
+    /*
+     * This hypercall can take minutes of wallclock time to complete.  This
+     * logic implements a co-routine, stashing state in struct domain across
+     * hypercall continuation boundaries.
+     */
+    switch ( d->arch.rel_priv )
     {
-    case RELMEM_not_started:
+        /*
+         * Record the current progress.  Subsequent hypercall continuations
+         * will logically restart work from this point.
+         *
+         * PROGRESS() markers must not be in the middle of loops.  The loop
+         * variable isn't preserved across a continuation.
+         *
+         * To avoid redundant work, there should be a marker before each
+         * function which may return -ERESTART.
+         */
+#define PROGRESS(x)                                                     \
+        d->arch.rel_priv = PROG_ ## x; /* Fallthrough */ case PROG_ ## x
+
+        enum {
+            PROG_paging = 1,
+            PROG_vcpu_pagetables,
+            PROG_shared,
+            PROG_xen,
+            PROG_l4,
+            PROG_l3,
+            PROG_l2,
+            PROG_done,
+        };
+
+    case 0:
         ret = pci_release_devices(d);
         if ( ret )
             return ret;
+
+    PROGRESS(paging):
 
         /* Tear down paging-assistance stuff. */
         ret = paging_teardown(d);
         if ( ret )
             return ret;
+
+    PROGRESS(vcpu_pagetables):
 
         /* Drop the in-use references to page-table bases. */
         for_each_vcpu ( d, v )
@@ -1979,15 +2022,18 @@ int domain_relinquish_resources(struct domain *d)
                 return ret;
         }
 
+        if ( altp2m_active(d) )
+        {
+            for_each_vcpu ( d, v )
+                altp2m_vcpu_disable_ve(v);
+        }
+
         if ( is_pv_domain(d) )
         {
             for_each_vcpu ( d, v )
             {
-                /*
-                 * Relinquish GDT mappings. No need for explicit unmapping of
-                 * the LDT as it automatically gets squashed with the guest
-                 * mappings.
-                 */
+                /* Relinquish GDT/LDT mappings. */
+                pv_destroy_ldt(v);
                 pv_destroy_gdt(v);
             }
         }
@@ -1995,15 +2041,12 @@ int domain_relinquish_resources(struct domain *d)
         if ( d->arch.pirq_eoi_map != NULL )
         {
             unmap_domain_page_global(d->arch.pirq_eoi_map);
-            put_page_and_type(mfn_to_page(d->arch.pirq_eoi_map_mfn));
+            put_page_and_type(mfn_to_page(_mfn(d->arch.pirq_eoi_map_mfn)));
             d->arch.pirq_eoi_map = NULL;
             d->arch.auto_unmask = 0;
         }
 
-        d->arch.relmem = RELMEM_shared;
-        /* fallthrough */
-
-    case RELMEM_shared:
+    PROGRESS(shared):
 
         if ( is_hvm_domain(d) )
         {
@@ -2014,44 +2057,39 @@ int domain_relinquish_resources(struct domain *d)
                 return ret;
         }
 
-        d->arch.relmem = RELMEM_xen;
-
         spin_lock(&d->page_alloc_lock);
         page_list_splice(&d->arch.relmem_list, &d->page_list);
         INIT_PAGE_LIST_HEAD(&d->arch.relmem_list);
         spin_unlock(&d->page_alloc_lock);
 
-        /* Fallthrough. Relinquish every page of memory. */
-    case RELMEM_xen:
+    PROGRESS(xen):
+
         ret = relinquish_memory(d, &d->xenpage_list, ~0UL);
         if ( ret )
             return ret;
-        d->arch.relmem = RELMEM_l4;
-        /* fallthrough */
 
-    case RELMEM_l4:
+    PROGRESS(l4):
+
         ret = relinquish_memory(d, &d->page_list, PGT_l4_page_table);
         if ( ret )
             return ret;
-        d->arch.relmem = RELMEM_l3;
-        /* fallthrough */
 
-    case RELMEM_l3:
+    PROGRESS(l3):
+
         ret = relinquish_memory(d, &d->page_list, PGT_l3_page_table);
         if ( ret )
             return ret;
-        d->arch.relmem = RELMEM_l2;
-        /* fallthrough */
 
-    case RELMEM_l2:
+    PROGRESS(l2):
+
         ret = relinquish_memory(d, &d->page_list, PGT_l2_page_table);
         if ( ret )
             return ret;
-        d->arch.relmem = RELMEM_done;
-        /* fallthrough */
 
-    case RELMEM_done:
+    PROGRESS(done):
         break;
+
+#undef PROGRESS
 
     default:
         BUG();

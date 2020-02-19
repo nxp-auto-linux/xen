@@ -68,19 +68,26 @@ physid_mask_t phys_cpu_present_map;
 
 void __init set_nr_cpu_ids(unsigned int max_cpus)
 {
+	unsigned int tot_cpus = num_processors + disabled_cpus;
+
 	if (!max_cpus)
-		max_cpus = num_processors + disabled_cpus;
+		max_cpus = tot_cpus;
 	if (max_cpus > NR_CPUS)
 		max_cpus = NR_CPUS;
 	else if (!max_cpus)
 		max_cpus = 1;
 	printk(XENLOG_INFO "SMP: Allowing %u CPUs (%d hotplug CPUs)\n",
 	       max_cpus, max_t(int, max_cpus - num_processors, 0));
-	nr_cpu_ids = max_cpus;
+
+	if (!park_offline_cpus)
+		tot_cpus = max_cpus;
+	nr_cpu_ids = min(tot_cpus, NR_CPUS + 0u);
+	if (park_offline_cpus && nr_cpu_ids < num_processors)
+		printk(XENLOG_WARNING "SMP: Cannot bring up %u further CPUs\n",
+		       num_processors - nr_cpu_ids);
 
 #ifndef nr_cpumask_bits
-	nr_cpumask_bits = (max_cpus + (BITS_PER_LONG - 1)) &
-			  ~(BITS_PER_LONG - 1);
+	nr_cpumask_bits = ROUNDUP(nr_cpu_ids, BITS_PER_LONG);
 	printk(XENLOG_DEBUG "NR_CPUS:%u nr_cpumask_bits:%u\n",
 	       NR_CPUS, nr_cpumask_bits);
 #endif
@@ -155,7 +162,8 @@ static int MP_processor_info_x(struct mpc_config_processor *m,
 		return -ENOSPC;
 	}
 
-	if (num_processors >= 8 && hotplug && genapic == &apic_default) {
+	if (num_processors >= 8 && hotplug
+	    && genapic.name == apic_default.name) {
 		printk(KERN_WARNING "WARNING: CPUs limit of 8 reached."
 			" Processor ignored.\n");
 		return -ENOSPC;
@@ -230,7 +238,7 @@ static void __init MP_ioapic_info (struct mpc_config_ioapic *m)
 	if (nr_ioapics >= MAX_IO_APICS) {
 		printk(KERN_CRIT "Max # of I/O APICs (%d) exceeded (found %d).\n",
 			MAX_IO_APICS, nr_ioapics);
-		panic("Recompile kernel with bigger MAX_IO_APICS");
+		panic("Recompile kernel with bigger MAX_IO_APICS\n");
 	}
 	if (!m->mpc_apicaddr) {
 		printk(KERN_ERR "WARNING: bogus zero I/O APIC address"
@@ -250,7 +258,7 @@ static void __init MP_intsrc_info (struct mpc_config_intsrc *m)
 			(m->mpc_irqflag >> 2) & 3, m->mpc_srcbus,
 			m->mpc_srcbusirq, m->mpc_dstapic, m->mpc_dstirq);
 	if (++mp_irq_entries == MAX_IRQ_SOURCES)
-		panic("Max # of irq sources exceeded");
+		panic("Max # of irq sources exceeded\n");
 }
 
 static void __init MP_lintsrc_info (struct mpc_config_lintsrc *m)
@@ -855,7 +863,7 @@ void __init mp_register_ioapic (
 	if (nr_ioapics >= MAX_IO_APICS) {
 		printk(KERN_ERR "ERROR: Max # of I/O APICs (%d) exceeded "
 			"(found %d)\n", MAX_IO_APICS, nr_ioapics);
-		panic("Recompile kernel with bigger MAX_IO_APICS");
+		panic("Recompile kernel with bigger MAX_IO_APICS\n");
 	}
 	if (!address) {
 		printk(KERN_ERR "WARNING: Bogus (zero) I/O APIC address"
@@ -954,7 +962,7 @@ void __init mp_override_legacy_irq (
 
 	mp_irqs[mp_irq_entries] = intsrc;
 	if (++mp_irq_entries == MAX_IRQ_SOURCES)
-		panic("Max # of irq sources exceeded");
+		panic("Max # of irq sources exceeded\n");
 
 	return;
 }
@@ -1020,7 +1028,7 @@ void __init mp_config_acpi_legacy_irqs (void)
 
 		mp_irqs[mp_irq_entries] = intsrc;
 		if (++mp_irq_entries == MAX_IRQ_SOURCES)
-			panic("Max # of irq sources exceeded");
+			panic("Max # of irq sources exceeded\n");
 	}
 }
 

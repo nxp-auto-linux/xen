@@ -184,7 +184,7 @@ static void update_pagetable_mac(vmac_ctx_t *ctx)
 
     for ( mfn = 0; mfn < max_page; mfn++ )
     {
-        struct page_info *page = mfn_to_page(mfn);
+        struct page_info *page = mfn_to_page(_mfn(mfn));
 
         if ( !mfn_valid(_mfn(mfn)) )
             continue;
@@ -276,7 +276,7 @@ static void tboot_gen_xenheap_integrity(const uint8_t key[TB_KEY_SIZE],
     vmac_set_key((uint8_t *)key, &ctx);
     for ( mfn = 0; mfn < max_page; mfn++ )
     {
-        struct page_info *page = __mfn_to_page(mfn);
+        struct page_info *page = mfn_to_page(_mfn(mfn));
 
         if ( !mfn_valid(_mfn(mfn)) )
             continue;
@@ -336,22 +336,23 @@ static void tboot_gen_frametable_integrity(const uint8_t key[TB_KEY_SIZE],
 
 void tboot_shutdown(uint32_t shutdown_type)
 {
-    uint32_t map_base, map_size;
+    mfn_t map_base;
+    uint32_t map_size;
     int err;
 
     g_tboot_shared->shutdown_type = shutdown_type;
 
     /* Create identity map for tboot shutdown code. */
     /* do before S3 integrity because mapping tboot may change xenheap */
-    map_base = PFN_DOWN(g_tboot_shared->tboot_base);
+    map_base = maddr_to_mfn(g_tboot_shared->tboot_base);
     map_size = PFN_UP(g_tboot_shared->tboot_size);
 
-    err = map_pages_to_xen(map_base << PAGE_SHIFT, map_base, map_size,
+    err = map_pages_to_xen(mfn_to_maddr(map_base), map_base, map_size,
                            __PAGE_HYPERVISOR);
     if ( err != 0 )
     {
-        printk("error (%#x) mapping tboot pages (mfns) @ %#x, %#x\n", err,
-               map_base, map_size);
+        printk("error (%#x) mapping tboot pages (mfns) @ %"PRI_mfn", %#x\n",
+               err, mfn_x(map_base), map_size);
         return;
     }
 
@@ -390,7 +391,12 @@ void tboot_shutdown(uint32_t shutdown_type)
         tboot_gen_xenheap_integrity(g_tboot_shared->s3_key, &xenheap_mac);
     }
 
-    write_ptbase(idle_vcpu[0]);
+    /*
+     * During early boot, we can be called by panic before idle_vcpu[0] is
+     * setup, but in that case we don't need to change page tables.
+     */
+    if ( idle_vcpu[0] != INVALID_VCPU )
+        write_ptbase(idle_vcpu[0]);
 
     ((void(*)(void))(unsigned long)g_tboot_shared->shutdown_entry)();
 
@@ -455,8 +461,6 @@ int __init tboot_parse_dmar_table(acpi_table_handler dmar_handler)
     if ( txt_heap_base == 0 )
         return 1;
 
-    /* map TXT heap into Xen addr space */
-
     /* walk heap to SinitMleData */
     pa = txt_heap_base;
     /* skip BiosData */
@@ -483,10 +487,6 @@ int __init tboot_parse_dmar_table(acpi_table_handler dmar_handler)
 
     rc = dmar_handler(dmar_table);
     xfree(dmar_table);
-
-    /* acpi_parse_dmar() zaps APCI DMAR signature in TXT heap table */
-    /* but dom0 will read real table, so must zap it there too */
-    acpi_dmar_zap();
 
     return rc;
 }
@@ -532,7 +532,7 @@ void tboot_s3_error(int error)
 
     printk("MAC for %s before S3 is: 0x%08"PRIx64"\n", what, orig_mac);
     printk("MAC for %s after S3 is: 0x%08"PRIx64"\n", what, resume_mac);
-    panic("Memory integrity was lost on resume (%d)", error);
+    panic("Memory integrity was lost on resume (%d)\n", error);
 }
 
 int tboot_wake_ap(int apicid, unsigned long sipi_vec)

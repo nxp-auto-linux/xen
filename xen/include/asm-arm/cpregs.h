@@ -1,8 +1,6 @@
 #ifndef __ASM_ARM_CPREGS_H
 #define __ASM_ARM_CPREGS_H
 
-#include <xen/stringify.h>
-
 /*
  * AArch32 Co-processor registers.
  *
@@ -47,8 +45,8 @@
     ((__HSR_CPREG_##op1) << HSR_CP64_OP1_SHIFT)
 
 /* Encode a register as per HSR ISS pattern */
-#define HSR_CPREG32(X) _HSR_CPREG32(X)
-#define HSR_CPREG64(X) _HSR_CPREG64(X)
+#define HSR_CPREG32(X...) _HSR_CPREG32(X)
+#define HSR_CPREG64(X...) _HSR_CPREG64(X)
 
 /*
  * Order registers by Coprocessor-> CRn-> Opcode 1-> CRm-> Opcode 2
@@ -106,6 +104,7 @@
 
 /* CP15 CR0: CPUID and Cache Type Registers */
 #define MIDR            p15,0,c0,c0,0   /* Main ID Register */
+#define CTR             p15,0,c0,c0,1   /* Cache Type Register */
 #define MPIDR           p15,0,c0,c0,5   /* Multiprocessor Affinity Register */
 #define ID_PFR0         p15,0,c0,c1,0   /* Processor Feature Register 0 */
 #define ID_PFR1         p15,0,c0,c1,1   /* Processor Feature Register 1 */
@@ -140,7 +139,8 @@
 #define HSTR            p15,4,c1,c1,3   /* Hyp. System Trap Register */
 
 /* CP15 CR2: Translation Table Base and Control Registers */
-#define TTBCR           p15,0,c2,c0,2   /* Translatation Table Base Control Register */
+#define TTBCR           p15,0,c2,c0,2   /* Translation Table Base Control Register */
+#define TTBCR2          p15,0,c2,c0,3   /* Translation Table Base Control Register 2 */
 #define TTBR0           p15,0,c2        /* Translation Table Base Reg. 0 */
 #define TTBR1           p15,1,c2        /* Translation Table Base Reg. 1 */
 #define HTTBR           p15,4,c2        /* Hyp. Translation Table Base Register */
@@ -303,6 +303,7 @@
 #define CPACR_EL1               CPACR
 #define CPTR_EL2                HCPTR
 #define CSSELR_EL1              CSSELR
+#define CTR_EL0                 CTR
 #define DACR32_EL2              DACR
 #define ESR_EL1                 DFSR
 #define ESR_EL2                 HSR

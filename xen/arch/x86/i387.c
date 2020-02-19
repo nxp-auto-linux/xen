@@ -15,6 +15,7 @@
 #include <asm/i387.h>
 #include <asm/xstate.h>
 #include <asm/asm_defns.h>
+#include <asm/spec_ctrl.h>
 
 /*******************************/
 /*     FPU Restore Functions   */
@@ -205,13 +206,13 @@ static inline void fpu_fxsave(struct vcpu *v)
 /*       VCPU FPU Functions    */
 /*******************************/
 /* Restore FPU state whenever VCPU is schduled in. */
-void vcpu_restore_fpu_eager(struct vcpu *v)
+void vcpu_restore_fpu_nonlazy(struct vcpu *v, bool need_stts)
 {
-    ASSERT(!is_idle_vcpu(v));
-    
     /* Restore nonlazy extended state (i.e. parts not tracked by CR0.TS). */
-    if ( !v->arch.nonlazy_xstate_used )
-        return;
+    if ( !v->arch.fully_eager_fpu && !v->arch.nonlazy_xstate_used )
+        goto maybe_stts;
+
+    ASSERT(!is_idle_vcpu(v));
 
     /* Avoid recursion */
     clts();
@@ -221,17 +222,28 @@ void vcpu_restore_fpu_eager(struct vcpu *v)
      * above) we also need to restore full state, to prevent subsequently
      * saving state belonging to another vCPU.
      */
-    if ( xstate_all(v) )
+    if ( v->arch.fully_eager_fpu || (v->arch.xsave_area && xstate_all(v)) )
     {
-        fpu_xrstor(v, XSTATE_ALL);
+        if ( cpu_has_xsave )
+            fpu_xrstor(v, XSTATE_ALL);
+        else
+            fpu_fxrstor(v);
+
         v->fpu_initialised = 1;
         v->fpu_dirtied = 1;
+
+        /* Xen doesn't need TS set, but the guest might. */
+        need_stts = is_pv_vcpu(v) && (v->arch.pv.ctrlreg[0] & X86_CR0_TS);
     }
     else
     {
         fpu_xrstor(v, XSTATE_NONLAZY);
-        stts();
+        need_stts = true;
     }
+
+ maybe_stts:
+    if ( need_stts )
+        stts();
 }
 
 /* 
@@ -246,6 +258,8 @@ void vcpu_restore_fpu_lazy(struct vcpu *v)
 
     if ( v->fpu_dirtied )
         return;
+
+    ASSERT(!v->arch.fully_eager_fpu);
 
     if ( cpu_has_xsave )
         fpu_xrstor(v, XSTATE_LAZY);
@@ -297,6 +311,8 @@ int vcpu_init_fpu(struct vcpu *v)
 {
     int rc;
     
+    v->arch.fully_eager_fpu = opt_eager_fpu;
+
     if ( (rc = xstate_alloc_save_area(v)) != 0 )
         return rc;
 
@@ -319,6 +335,49 @@ int vcpu_init_fpu(struct vcpu *v)
     }
 
     return rc;
+}
+
+void vcpu_setup_fpu(struct vcpu *v, struct xsave_struct *xsave_area,
+                    const void *data, unsigned int fcw_default)
+{
+    /*
+     * For the entire function please note that vcpu_init_fpu() (above) points
+     * v->arch.fpu_ctxt into v->arch.xsave_area when XSAVE is available. Hence
+     * accesses through both pointers alias one another, and the shorter form
+     * is used here.
+     */
+    typeof(xsave_area->fpu_sse) *fpu_sse = v->arch.fpu_ctxt;
+
+    ASSERT(!xsave_area || xsave_area == v->arch.xsave_area);
+
+    v->fpu_initialised = !!data;
+
+    if ( data )
+    {
+        memcpy(fpu_sse, data, sizeof(*fpu_sse));
+        if ( xsave_area )
+            xsave_area->xsave_hdr.xstate_bv = XSTATE_FP_SSE;
+    }
+    else if ( xsave_area && fcw_default == FCW_DEFAULT )
+    {
+        xsave_area->xsave_hdr.xstate_bv = 0;
+        fpu_sse->mxcsr = MXCSR_DEFAULT;
+    }
+    else
+    {
+        memset(fpu_sse, 0, sizeof(*fpu_sse));
+        fpu_sse->fcw = fcw_default;
+        fpu_sse->mxcsr = MXCSR_DEFAULT;
+        if ( v->arch.xsave_area )
+        {
+            v->arch.xsave_area->xsave_hdr.xstate_bv &= ~XSTATE_FP_SSE;
+            if ( fcw_default != FCW_DEFAULT )
+                v->arch.xsave_area->xsave_hdr.xstate_bv |= X86_XCR0_FP;
+        }
+    }
+
+    if ( xsave_area )
+        xsave_area->xsave_hdr.xcomp_bv = 0;
 }
 
 /* Free FPU's context save area */

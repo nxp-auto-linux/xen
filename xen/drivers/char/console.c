@@ -30,11 +30,14 @@
 #include <xen/hypercall.h> /* for do_console_io */
 #include <xen/early_printk.h>
 #include <xen/warning.h>
+#include <xen/pv_console.h>
+#include <asm/setup.h>
 
 #ifdef CONFIG_X86
 #include <xen/consoled.h>
-#include <xen/pv_console.h>
 #include <asm/guest.h>
+#else
+#include <asm/vpl011.h>
 #endif
 
 /* console: comma-separated list of console outputs. */
@@ -68,7 +71,8 @@ enum con_timestamp_mode
     TSM_NONE,          /* No timestamps */
     TSM_DATE,          /* [YYYY-MM-DD HH:MM:SS] */
     TSM_DATE_MS,       /* [YYYY-MM-DD HH:MM:SS.mmm] */
-    TSM_BOOT           /* [SSSSSS.uuuuuu] */
+    TSM_BOOT,          /* [SSSSSS.uuuuuu] */
+    TSM_RAW,           /* [XXXXXXXXXXXXXXXX] */
 };
 
 static enum con_timestamp_mode __read_mostly opt_con_timestamp_mode = TSM_NONE;
@@ -90,7 +94,8 @@ static uint32_t conringc, conringp;
 static int __read_mostly sercon_handle = -1;
 
 #ifdef CONFIG_X86
-static bool __read_mostly opt_console_xen; /* console=xen */
+/* Tristate: 0 disabled, 1 user enabled, -1 default enabled */
+int8_t __read_mostly opt_console_xen; /* console=xen */
 #endif
 
 static DEFINE_SPINLOCK(console_lock);
@@ -347,10 +352,8 @@ static void sercon_puts(const char *s)
     else
         serial_puts(sercon_handle, s);
 
-#ifdef CONFIG_X86
     /* Copy all serial output into PV console */
     pv_console_puts(s);
-#endif
 }
 
 static void dump_console_ring_key(unsigned char key)
@@ -391,31 +394,90 @@ static void dump_console_ring_key(unsigned char key)
     free_xenheap_pages(buf, order);
 }
 
-/* CTRL-<switch_char> switches input direction between Xen and DOM0. */
+/*
+ * CTRL-<switch_char> changes input direction, rotating among Xen, Dom0,
+ * and the DomUs started from Xen at boot.
+ */
 #define switch_code (opt_conswitch[0]-'a'+1)
-static int __read_mostly xen_rx = 1; /* FALSE => input passed to domain 0. */
+/*
+ * console_rx=0 => input to xen
+ * console_rx=1 => input to dom0
+ * console_rx=N => input to dom(N-1)
+ */
+static unsigned int __read_mostly console_rx = 0;
+
+/* Make sure to rcu_unlock_domain after use */
+struct domain *console_input_domain(void)
+{
+    if ( console_rx == 0 )
+            return NULL;
+    return rcu_lock_domain_by_id(console_rx - 1);
+}
 
 static void switch_serial_input(void)
 {
-    static char *input_str[2] = { "DOM0", "Xen" };
-    xen_rx = !xen_rx;
-    printk("*** Serial input -> %s", input_str[xen_rx]);
+    if ( console_rx == max_init_domid + 1 )
+    {
+        console_rx = 0;
+        printk("*** Serial input to Xen");
+    }
+    else
+    {
+        console_rx++;
+        printk("*** Serial input to DOM%d", console_rx - 1);
+    }
+
     if ( switch_code )
-        printk(" (type 'CTRL-%c' three times to switch input to %s)",
-               opt_conswitch[0], input_str[!xen_rx]);
+        printk(" (type 'CTRL-%c' three times to switch input)",
+               opt_conswitch[0]);
     printk("\n");
 }
 
 static void __serial_rx(char c, struct cpu_user_regs *regs)
 {
-    if ( xen_rx )
+    switch ( console_rx )
+    {
+    case 0:
         return handle_keypress(c, regs);
 
-    /* Deliver input to guest buffer, unless it is already full. */
-    if ( (serial_rx_prod-serial_rx_cons) != SERIAL_RX_SIZE )
-        serial_rx_ring[SERIAL_RX_MASK(serial_rx_prod++)] = c;
-    /* Always notify the guest: prevents receive path from getting stuck. */
-    send_global_virq(VIRQ_CONSOLE);
+    case 1:
+        /*
+         * Deliver input to the hardware domain buffer, unless it is
+         * already full.
+         */
+        if ( (serial_rx_prod - serial_rx_cons) != SERIAL_RX_SIZE )
+            serial_rx_ring[SERIAL_RX_MASK(serial_rx_prod++)] = c;
+
+        /*
+         * Always notify the hardware domain: prevents receive path from
+         * getting stuck.
+         */
+        send_global_virq(VIRQ_CONSOLE);
+        break;
+
+#ifdef CONFIG_SBSA_VUART_CONSOLE
+    default:
+    {
+        struct domain *d = rcu_lock_domain_by_any_id(console_rx - 1);
+
+        /*
+         * If we have a properly initialized vpl011 console for the
+         * domain, without a full PV ring to Dom0 (in that case input
+         * comes from the PV ring), then send the character to it.
+         */
+        if ( d != NULL &&
+             !d->arch.vpl011.backend_in_domain &&
+             d->arch.vpl011.backend.xen != NULL )
+            vpl011_rx_char_xen(d, c);
+        else
+            printk("Cannot send chars to Dom%d: no UART available\n",
+                   console_rx - 1);
+
+        if ( d != NULL )
+            rcu_unlock_domain(d);
+    }
+#endif
+    }
 
 #ifdef CONFIG_X86
     if ( pv_shim && pv_console )
@@ -458,7 +520,7 @@ static inline void xen_console_write_debug_port(const char *buf, size_t len)
     unsigned long tmp;
     asm volatile ( "rep outsb;"
                    : "=&S" (tmp), "=&c" (tmp)
-                   : "0" (buf), "1" (len), "d" (0xe9) );
+                   : "0" (buf), "1" (len), "d" (XEN_HVM_DEBUGCONS_IOPORT) );
 }
 #endif
 
@@ -630,16 +692,16 @@ static void __putstr(const char *str)
 static int printk_prefix_check(char *p, char **pp)
 {
     int loglvl = -1;
-    int upper_thresh = xenlog_upper_thresh;
-    int lower_thresh = xenlog_lower_thresh;
+    int upper_thresh = ACCESS_ONCE(xenlog_upper_thresh);
+    int lower_thresh = ACCESS_ONCE(xenlog_lower_thresh);
 
     while ( (p[0] == '<') && (p[1] != '\0') && (p[2] == '>') )
     {
         switch ( p[1] )
         {
         case 'G':
-            upper_thresh = xenlog_guest_upper_thresh;
-            lower_thresh = xenlog_guest_lower_thresh;
+            upper_thresh = ACCESS_ONCE(xenlog_guest_upper_thresh);
+            lower_thresh = ACCESS_ONCE(xenlog_guest_lower_thresh);
             if ( loglvl == -1 )
                 loglvl = XENLOG_GUEST_DEFAULT;
             break;
@@ -678,6 +740,8 @@ static int parse_console_timestamps(const char *s)
         opt_con_timestamp_mode = TSM_DATE_MS;
     else if ( !strcmp(s, "boot") )
         opt_con_timestamp_mode = TSM_BOOT;
+    else if ( !strcmp(s, "raw") )
+        opt_con_timestamp_mode = TSM_RAW;
     else if ( !strcmp(s, "none") )
         opt_con_timestamp_mode = TSM_NONE;
     else
@@ -688,38 +752,50 @@ static int parse_console_timestamps(const char *s)
 
 static void printk_start_of_line(const char *prefix)
 {
+    enum con_timestamp_mode mode = ACCESS_ONCE(opt_con_timestamp_mode);
     struct tm tm;
     char tstr[32];
     uint64_t sec, nsec;
 
     __putstr(prefix);
 
-    switch ( opt_con_timestamp_mode )
+    switch ( mode )
     {
     case TSM_DATE:
     case TSM_DATE_MS:
         tm = wallclock_time(&nsec);
 
         if ( tm.tm_mday == 0 )
-            return;
-
-        if ( opt_con_timestamp_mode == TSM_DATE )
+            /* nothing */;
+        else if ( mode == TSM_DATE )
+        {
             snprintf(tstr, sizeof(tstr), "[%04u-%02u-%02u %02u:%02u:%02u] ",
                      1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
                      tm.tm_hour, tm.tm_min, tm.tm_sec);
+            break;
+        }
         else
+        {
             snprintf(tstr, sizeof(tstr),
                      "[%04u-%02u-%02u %02u:%02u:%02u.%03"PRIu64"] ",
                      1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
                      tm.tm_hour, tm.tm_min, tm.tm_sec, nsec / 1000000);
-        break;
-
+            break;
+        }
+        /* fall through */
     case TSM_BOOT:
         sec = NOW();
         nsec = do_div(sec, 1000000000);
 
-        snprintf(tstr, sizeof(tstr), "[%5"PRIu64".%06"PRIu64"] ",
-                 sec, nsec / 1000);
+        if ( sec | nsec )
+        {
+            snprintf(tstr, sizeof(tstr), "[%5"PRIu64".%06"PRIu64"] ",
+                     sec, nsec / 1000);
+            break;
+        }
+        /* fall through */
+    case TSM_RAW:
+        snprintf(tstr, sizeof(tstr), "[%016"PRIx64"] ", get_cycles());
         break;
 
     case TSM_NONE:
@@ -816,11 +892,11 @@ void __init console_init_preirq(void)
             p++;
         if ( !strncmp(p, "vga", 3) )
             video_init();
-#ifdef CONFIG_X86
-	else if ( !strncmp(p, "pv", 2) )
+        else if ( !strncmp(p, "pv", 2) )
             pv_console_init();
+#ifdef CONFIG_X86
         else if ( !strncmp(p, "xen", 3) )
-            opt_console_xen = true;
+            opt_console_xen = 1;
 #endif
         else if ( !strncmp(p, "none", 4) )
             continue;
@@ -840,11 +916,13 @@ void __init console_init_preirq(void)
         }
     }
 
-    serial_set_rx_handler(sercon_handle, serial_rx);
-
 #ifdef CONFIG_X86
-    pv_console_set_rx_handler(serial_rx);
+    if ( opt_console_xen == -1 )
+        opt_console_xen = 0;
 #endif
+
+    serial_set_rx_handler(sercon_handle, serial_rx);
+    pv_console_set_rx_handler(serial_rx);
 
     /* HELLO WORLD --- start-of-day banner text. */
     spin_lock(&console_lock);
@@ -894,13 +972,15 @@ void __init console_init_ring(void)
     printk("Allocated console ring of %u KiB.\n", opt_conring_size >> 10);
 }
 
+void __init console_init_irq(void)
+{
+    serial_init_irq();
+}
+
 void __init console_init_postirq(void)
 {
     serial_init_postirq();
-
-#ifdef CONFIG_X86
     pv_console_init_postirq();
-#endif
 
     if ( conring != _conring )
         return;
@@ -931,7 +1011,7 @@ void __init console_endboot(void)
      * a useful 'how to switch' message.
      */
     if ( opt_conswitch[1] == 'x' )
-        xen_rx = !xen_rx;
+        console_rx = max_init_domid + 1;
 
     register_keyhandler('w', dump_console_ring_key,
                         "synchronously dump console ring buffer (dmesg)", 0);
@@ -1248,7 +1328,7 @@ void panic(const char *fmt, ...)
     console_start_sync();
     printk("\n****************************************\n");
     printk("Panic on CPU %d:\n", smp_processor_id());
-    printk("%s\n", buf);
+    printk("%s", buf);
     printk("****************************************\n\n");
     if ( opt_noreboot )
         printk("Manual reset required ('noreboot' specified)\n");
@@ -1263,9 +1343,7 @@ void panic(const char *fmt, ...)
 
     debugger_trap_immediate();
 
-#ifdef CONFIG_KEXEC
     kexec_crash();
-#endif
 
     if ( opt_noreboot )
         machine_halt();

@@ -20,6 +20,7 @@
  */
 #include <xen/lib.h>
 #include <xen/hypercall.h>
+#include <xen/nospec.h>
 
 #include <asm/hvm/support.h>
 
@@ -41,7 +42,7 @@ static long hvm_memory_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         rc = compat_memory_op(cmd, arg);
 
     if ( (cmd & MEMOP_CMD_MASK) == XENMEM_decrease_reservation )
-        curr->domain->arch.hvm_domain.qemu_mapcache_invalidate = true;
+        curr->domain->arch.hvm.qemu_mapcache_invalidate = true;
 
     return rc;
 }
@@ -89,6 +90,11 @@ static long hvm_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( !has_pirq(curr->domain) )
             return -ENOSYS;
         break;
+
+    case PHYSDEVOP_pci_mmcfg_reserved:
+        if ( !has_vpci(curr->domain) )
+            return -ENOSYS;
+        break;
     }
 
     if ( !curr->hcall_compat )
@@ -128,8 +134,13 @@ static const hypercall_table_t hvm_hypercall_table[] = {
 #ifdef CONFIG_TMEM
     HYPERCALL(tmem_op),
 #endif
+#ifdef CONFIG_ARGO
+    COMPAT_CALL(argo_op),
+#endif
     COMPAT_CALL(platform_op),
+#ifdef CONFIG_PV
     COMPAT_CALL(mmuext_op),
+#endif
     HYPERCALL(xenpmu_op),
     COMPAT_CALL(dm_op),
     HYPERCALL(arch_1)
@@ -176,8 +187,15 @@ int hvm_hypercall(struct cpu_user_regs *regs)
     BUILD_BUG_ON(ARRAY_SIZE(hvm_hypercall_table) >
                  ARRAY_SIZE(hypercall_args_table));
 
-    if ( (eax >= ARRAY_SIZE(hvm_hypercall_table)) ||
-         !hvm_hypercall_table[eax].native )
+    if ( eax >= ARRAY_SIZE(hvm_hypercall_table) )
+    {
+        regs->rax = -ENOSYS;
+        return HVM_HCALL_completed;
+    }
+
+    eax = array_index_nospec(eax, ARRAY_SIZE(hvm_hypercall_table));
+
+    if ( !hvm_hypercall_table[eax].native )
     {
         regs->rax = -ENOSYS;
         return HVM_HCALL_completed;
@@ -281,8 +299,8 @@ int hvm_hypercall(struct cpu_user_regs *regs)
     if ( curr->hcall_preempted )
         return HVM_HCALL_preempted;
 
-    if ( unlikely(currd->arch.hvm_domain.qemu_mapcache_invalidate) &&
-         test_and_clear_bool(currd->arch.hvm_domain.qemu_mapcache_invalidate) )
+    if ( unlikely(currd->arch.hvm.qemu_mapcache_invalidate) &&
+         test_and_clear_bool(currd->arch.hvm.qemu_mapcache_invalidate) )
         send_invalidate_req();
 
     return HVM_HCALL_completed;

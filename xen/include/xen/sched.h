@@ -15,11 +15,13 @@
 #include <xen/nodemask.h>
 #include <xen/radix-tree.h>
 #include <xen/multicall.h>
+#include <xen/nospec.h>
 #include <xen/tasklet.h>
 #include <xen/mm.h>
 #include <xen/smp.h>
 #include <xen/perfc.h>
 #include <asm/atomic.h>
+#include <xen/vpci.h>
 #include <xen/wait.h>
 #include <public/xen.h>
 #include <public/domctl.h>
@@ -121,7 +123,7 @@ struct evtchn
          */
         void *generic;
 #endif
-#ifdef CONFIG_FLASK
+#ifdef CONFIG_XSM_FLASK
         /*
          * Inlining the contents of the structure for FLASK avoids unneeded
          * allocations, and on 64-bit platforms with only FLASK enabled,
@@ -133,7 +135,7 @@ struct evtchn
 #endif
 } __attribute__((aligned(64)));
 
-int  evtchn_init(struct domain *d); /* from domain_create */
+int  evtchn_init(struct domain *d, unsigned int max_port);
 void evtchn_destroy(struct domain *d); /* from domain_kill */
 void evtchn_destroy_final(struct domain *d); /* from complete_domain_destroy */
 
@@ -210,6 +212,12 @@ struct vcpu
     bool             hcall_compat;
 #endif
 
+    /* Does soft affinity actually play a role (given hard affinity)? */
+    bool             soft_aff_effective;
+
+    /* The CPU, if any, which is holding onto this VCPU's state. */
+#define VCPU_CPU_CLEAN (~0u)
+    unsigned int     dirty_cpu;
 
     /*
      * > 0: a single port is being polled;
@@ -248,9 +256,6 @@ struct vcpu
     /* Bitmask of CPUs on which this VCPU prefers to run. */
     cpumask_var_t    cpu_soft_affinity;
 
-    /* Bitmask of CPUs which are holding onto this VCPU's state. */
-    cpumask_var_t    vcpu_dirty_cpumask;
-
     /* Tasklet for continue_hypercall_on_cpu(). */
     struct tasklet   continue_hypercall_tasklet;
 
@@ -263,6 +268,9 @@ struct vcpu
     mfn_t            vcpu_info_mfn;
 
     struct evtchn_fifo_vcpu *evtchn_fifo;
+
+    /* vPCI per-vCPU area, used to store data for long running operations. */
+    struct vpci_vcpu vpci;
 
     struct arch_vcpu arch;
 };
@@ -364,14 +372,13 @@ struct domain
 
 #ifdef CONFIG_HAS_PASSTHROUGH
     struct domain_iommu iommu;
-
-    /* Does this guest need iommu mappings (-1 meaning "being set up")? */
-    s8               need_iommu;
 #endif
     /* is node-affinity automatically computed? */
     bool             auto_node_affinity;
     /* Is this guest fully privileged (aka dom0)? */
     bool             is_privileged;
+    /* Can this guest access the Xen console? */
+    bool             is_console;
     /* Is this a xenstore domain (not dom0)? */
     bool             is_xenstore;
     /* Domain's VCPUs are pinned 1:1 to physical CPUs? */
@@ -417,7 +424,7 @@ struct domain
     unsigned long    vm_assist;
 
     /* Bitmask of CPUs which are holding onto this domain's state. */
-    cpumask_var_t    domain_dirty_cpumask;
+    cpumask_var_t    dirty_cpumask;
 
     struct arch_domain arch;
 
@@ -484,6 +491,11 @@ struct domain
         unsigned int guest_request_enabled       : 1;
         unsigned int guest_request_sync          : 1;
     } monitor;
+
+#ifdef CONFIG_ARGO
+    /* Argo interdomain communication support */
+    struct argo_domain *argo;
+#endif
 };
 
 /* Protect updates/reads (resp.) of domain_list and domain_hash. */
@@ -493,6 +505,11 @@ extern rcu_read_lock_t domlist_read_lock;
 extern struct vcpu *idle_vcpu[NR_CPUS];
 #define is_idle_domain(d) ((d)->domain_id == DOMID_IDLE)
 #define is_idle_vcpu(v)   (is_idle_domain((v)->domain))
+
+static inline bool is_system_domain(const struct domain *d)
+{
+    return d->domain_id >= DOMID_FIRST_RESERVED;
+}
 
 #define DOMAIN_DESTROYED (1u << 31) /* assumes atomic_t is >= 32 bits */
 #define put_domain(_d) \
@@ -530,31 +547,18 @@ int domain_set_node_affinity(struct domain *d, const nodemask_t *affinity);
 void domain_update_node_affinity(struct domain *d);
 
 /*
- * Create a domain: the configuration is only necessary for real domain
- * (i.e !DOMCRF_dummy, excluded idle domain).
+ * To be implemented by each architecture, sanity checking the configuration
+ * and filling in any appropriate defaults.
  */
-struct domain *domain_create(domid_t domid, unsigned int domcr_flags,
-                             uint32_t ssidref,
-                             struct xen_arch_domainconfig *config);
- /* DOMCRF_hvm: Create an HVM domain, as opposed to a PV domain. */
-#define _DOMCRF_hvm           0
-#define DOMCRF_hvm            (1U<<_DOMCRF_hvm)
- /* DOMCRF_hap: Create a domain with hardware-assisted paging. */
-#define _DOMCRF_hap           1
-#define DOMCRF_hap            (1U<<_DOMCRF_hap)
- /* DOMCRF_s3_integrity: Create a domain with tboot memory integrity protection
-                        by tboot */
-#define _DOMCRF_s3_integrity  2
-#define DOMCRF_s3_integrity   (1U<<_DOMCRF_s3_integrity)
- /* DOMCRF_dummy: Create a dummy domain (not scheduled; not on domain list) */
-#define _DOMCRF_dummy         3
-#define DOMCRF_dummy          (1U<<_DOMCRF_dummy)
- /* DOMCRF_oos_off: dont use out-of-sync optimization for shadow page tables */
-#define _DOMCRF_oos_off         4
-#define DOMCRF_oos_off          (1U<<_DOMCRF_oos_off)
- /* DOMCRF_xs_domain: xenstore domain */
-#define _DOMCRF_xs_domain       5
-#define DOMCRF_xs_domain        (1U<<_DOMCRF_xs_domain)
+int arch_sanitise_domain_config(struct xen_domctl_createdomain *config);
+
+/*
+ * Create a domain: the configuration is only necessary for real domain
+ * (domid < DOMID_FIRST_RESERVED).
+ */
+struct domain *domain_create(domid_t domid,
+                             struct xen_domctl_createdomain *config,
+                             bool is_priv);
 
 /*
  * rcu_lock_domain_by_id() is more efficient than get_domain_by_id().
@@ -601,6 +605,14 @@ static inline struct domain *rcu_lock_current_domain(void)
 }
 
 struct domain *get_domain_by_id(domid_t dom);
+
+struct domain *get_pg_owner(domid_t domid);
+
+static inline void put_pg_owner(struct domain *pg_owner)
+{
+    rcu_unlock_domain(pg_owner);
+}
+
 void domain_destroy(struct domain *d);
 int domain_kill(struct domain *d);
 int domain_shutdown(struct domain *d, u8 reason);
@@ -624,23 +636,12 @@ void __domain_crash(struct domain *d);
 } while (0)
 
 /*
- * Mark current domain as crashed and synchronously deschedule from the local
- * processor. This function never returns.
- */
-void noreturn __domain_crash_synchronous(void);
-#define domain_crash_synchronous() do {                                   \
-    printk("domain_crash_sync called from %s:%d\n", __FILE__, __LINE__);  \
-    __domain_crash_synchronous();                                         \
-} while (0)
-
-/*
  * Called from assembly code, with an optional address to help indicate why
- * the crash occured.  If addr is 0, look up address from last extable
+ * the crash occurred.  If addr is 0, look up address from last extable
  * redirection.
  */
 void noreturn asm_domain_crash_synchronous(unsigned long addr);
 
-#define set_current_state(_s) do { current->state = (_s); } while (0)
 void scheduler_init(void);
 int  sched_init_vcpu(struct vcpu *v, unsigned int processor);
 void sched_destroy_vcpu(struct vcpu *v);
@@ -796,11 +797,22 @@ static inline struct domain *next_domain_in_cpupool(
 #define _VPF_parked          8
 #define VPF_parked           (1UL<<_VPF_parked)
 
-static inline int vcpu_runnable(struct vcpu *v)
+static inline bool vcpu_runnable(const struct vcpu *v)
 {
     return !(v->pause_flags |
              atomic_read(&v->pause_count) |
              atomic_read(&v->domain->pause_count));
+}
+
+static inline bool is_vcpu_dirty_cpu(unsigned int cpu)
+{
+    BUILD_BUG_ON(NR_CPUS >= VCPU_CPU_CLEAN);
+    return cpu != VCPU_CPU_CLEAN;
+}
+
+static inline bool vcpu_cpu_dirty(const struct vcpu *v)
+{
+    return is_vcpu_dirty_cpu(v->dirty_cpu);
 }
 
 void vcpu_block(void);
@@ -827,8 +839,33 @@ static inline int domain_pause_by_systemcontroller_nosync(struct domain *d)
 }
 
 /* domain_pause() but safe against trying to pause current. */
-void domain_pause_except_self(struct domain *d);
+int __must_check domain_pause_except_self(struct domain *d);
 void domain_unpause_except_self(struct domain *d);
+
+/*
+ * For each allocated vcpu, d->vcpu[X]->vcpu_id == X
+ *
+ * During construction, all vcpus in d->vcpu[] are allocated sequentially, and
+ * in ascending order.  Therefore, if d->vcpu[N] exists (e.g. derived from
+ * current), all vcpus with an id less than N also exist.
+ *
+ * SMP considerations: The idle domain is constructed before APs are started.
+ * All other domains have d->vcpu[] allocated and d->max_vcpus set before the
+ * domain is made visible in the domlist, which is serialised on the global
+ * domlist_update_lock.
+ *
+ * Therefore, all observations of d->max_vcpus vs d->vcpu[] will be consistent
+ * despite the lack of smp_* barriers, either by being on the same CPU as the
+ * one which issued the writes, or because of barrier properties of the domain
+ * having been inserted into the domlist.
+ */
+static inline struct vcpu *domain_vcpu(const struct domain *d,
+                                       unsigned int vcpu_id)
+{
+    unsigned int idx = array_index_nospec(vcpu_id, d->max_vcpus);
+
+    return vcpu_id >= d->max_vcpus ? NULL : d->vcpu[idx];
+}
 
 void cpu_init(void);
 
@@ -840,6 +877,9 @@ void scheduler_free(struct scheduler *sched);
 int schedule_cpu_switch(unsigned int cpu, struct cpupool *c);
 void vcpu_force_reschedule(struct vcpu *v);
 int cpu_disable_scheduler(unsigned int cpu);
+/* We need it in dom0_setup_vcpu */
+void sched_set_affinity(struct vcpu *v, const cpumask_t *hard,
+                        const cpumask_t *soft);
 int vcpu_set_hard_affinity(struct vcpu *v, const cpumask_t *affinity);
 int vcpu_set_soft_affinity(struct vcpu *v, const cpumask_t *affinity);
 void restore_vcpu_affinity(struct domain *d);
@@ -880,25 +920,61 @@ void watchdog_domain_destroy(struct domain *d);
 
 #define VM_ASSIST(d, t) (test_bit(VMASST_TYPE_ ## t, &(d)->vm_assist))
 
-#define is_pv_domain(d) ((d)->guest_type == guest_type_pv)
-#define is_pv_vcpu(v)   (is_pv_domain((v)->domain))
-#define is_hvm_domain(d) ((d)->guest_type == guest_type_hvm)
-#define is_hvm_vcpu(v)   (is_hvm_domain(v->domain))
+static inline bool is_pv_domain(const struct domain *d)
+{
+    return IS_ENABLED(CONFIG_PV) ? d->guest_type == guest_type_pv : false;
+}
+
+static inline bool is_pv_vcpu(const struct vcpu *v)
+{
+    return is_pv_domain(v->domain);
+}
+
+#ifdef CONFIG_COMPAT
+static inline bool is_pv_32bit_domain(const struct domain *d)
+{
+    return is_pv_domain(d) && d->arch.is_32bit_pv;
+}
+
+static inline bool is_pv_32bit_vcpu(const struct vcpu *v)
+{
+    return is_pv_32bit_domain(v->domain);
+}
+
+static inline bool is_pv_64bit_domain(const struct domain *d)
+{
+    return is_pv_domain(d) && !d->arch.is_32bit_pv;
+}
+
+static inline bool is_pv_64bit_vcpu(const struct vcpu *v)
+{
+    return is_pv_64bit_domain(v->domain);
+}
+#endif
+static inline bool is_hvm_domain(const struct domain *d)
+{
+    return IS_ENABLED(CONFIG_HVM) ? d->guest_type == guest_type_hvm : false;
+}
+
+static inline bool is_hvm_vcpu(const struct vcpu *v)
+{
+    return is_hvm_domain(v->domain);
+}
+
 #define is_pinned_vcpu(v) ((v)->domain->is_pinned || \
                            cpumask_weight((v)->cpu_hard_affinity) == 1)
 #ifdef CONFIG_HAS_PASSTHROUGH
-#define need_iommu(d)    ((d)->need_iommu)
+#define has_iommu_pt(d) (dom_iommu(d)->status != IOMMU_STATUS_disabled)
+#define need_iommu_pt_sync(d) (dom_iommu(d)->need_sync)
 #else
-#define need_iommu(d)    (0)
+#define has_iommu_pt(d) false
+#define need_iommu_pt_sync(d) false
 #endif
 
 static inline bool is_vcpu_online(const struct vcpu *v)
 {
     return !test_bit(_VPF_down, &v->pause_flags);
 }
-
-void set_vcpu_migration_delay(unsigned int delay);
-unsigned int get_vcpu_migration_delay(void);
 
 extern bool sched_smt_power_savings;
 

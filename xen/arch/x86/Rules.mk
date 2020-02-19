@@ -14,18 +14,31 @@ CFLAGS += -msoft-float
 
 $(call cc-options-add,CFLAGS,CC,$(EMBEDDED_EXTRA_CFLAGS))
 $(call cc-option-add,CFLAGS,CC,-Wnested-externs)
-$(call as-insn-check,CFLAGS,CC,"vmcall",-DHAVE_GAS_VMX)
-$(call as-insn-check,CFLAGS,CC,"crc32 %eax$$(comma)%eax",-DHAVE_GAS_SSE4_2)
-$(call as-insn-check,CFLAGS,CC,"invept (%rax)$$(comma)%rax",-DHAVE_GAS_EPT)
-$(call as-insn-check,CFLAGS,CC,"rdrand %eax",-DHAVE_GAS_RDRAND)
-$(call as-insn-check,CFLAGS,CC,"rdfsbase %rax",-DHAVE_GAS_FSGSBASE)
-$(call as-insn-check,CFLAGS,CC,"rdseed %eax",-DHAVE_GAS_RDSEED)
-$(call as-insn-check,CFLAGS,CC,".equ \"x\"$$(comma)1", \
-                     -U__OBJECT_LABEL__ -DHAVE_GAS_QUOTED_SYM \
+$(call as-option-add,CFLAGS,CC,"vmcall",-DHAVE_AS_VMX)
+$(call as-option-add,CFLAGS,CC,"crc32 %eax$$(comma)%eax",-DHAVE_AS_SSE4_2)
+$(call as-option-add,CFLAGS,CC,"invept (%rax)$$(comma)%rax",-DHAVE_AS_EPT)
+$(call as-option-add,CFLAGS,CC,"rdrand %eax",-DHAVE_AS_RDRAND)
+$(call as-option-add,CFLAGS,CC,"rdfsbase %rax",-DHAVE_AS_FSGSBASE)
+$(call as-option-add,CFLAGS,CC,"rdseed %eax",-DHAVE_AS_RDSEED)
+$(call as-option-add,CFLAGS,CC,".equ \"x\"$$(comma)1", \
+                     -U__OBJECT_LABEL__ -DHAVE_AS_QUOTED_SYM \
                      '-D__OBJECT_LABEL__=$(subst $(BASEDIR)/,,$(CURDIR))/$$@')
+$(call as-option-add,CFLAGS,CC,"invpcid (%rax)$$(comma)%rax",-DHAVE_AS_INVPCID)
 
-CFLAGS += -mno-red-zone -mno-sse -fpic
-CFLAGS += -fno-asynchronous-unwind-tables
+# GAS's idea of true is -1.  Clang's idea is 1
+$(call as-option-add,CFLAGS,CC,\
+    ".if ((1 > 0) < 0); .error \"\";.endif",,-DHAVE_AS_NEGATIVE_TRUE)
+
+# Check to see whether the assmbler supports the .nop directive.
+$(call as-option-add,CFLAGS,CC,\
+    ".L1: .L2: .nops (.L2 - .L1)$$(comma)9",-DHAVE_AS_NOPS_DIRECTIVE)
+
+CFLAGS += -mno-red-zone -fpic -fno-asynchronous-unwind-tables
+
+# Xen doesn't use SSE interally.  If the compiler supports it, also skip the
+# SSE setup for variadic function calls.
+CFLAGS += -mno-sse $(call cc-option,$(CC),-mskip-rax-setup)
+
 # -fvisibility=hidden reduces -fpic cost, if it's available
 ifneq ($(call cc-option,$(CC),-fvisibility=hidden,n),n)
 CFLAGS += -DGCC_HAS_VISIBILITY_ATTRIBUTE
@@ -35,11 +48,24 @@ endif
 ifneq ($(call cc-option,$(CC),-mindirect-branch-register,n),n)
 CFLAGS += -mindirect-branch=thunk-extern -mindirect-branch-register
 CFLAGS += -DCONFIG_INDIRECT_THUNK
+CFLAGS += -fno-jump-tables
 export CONFIG_INDIRECT_THUNK=y
 endif
 
-# Set up the assembler include path properly for older GCC toolchains.  Clang
-# objects to the agument being passed however.
-ifneq ($(clang),y)
+# Set up the assembler include path properly for older toolchains.
 CFLAGS += -Wa,-I$(BASEDIR)/include
+
+ifeq ($(clang),y)
+# Note: Any test which adds -no-integrated-as will cause subsequent tests to
+# succeed, and not trigger further additions.
+
+# Check whether clang asm()-s support .include.
+$(call as-option-add,CFLAGS,CC,".include \"asm/indirect_thunk_asm.h\"",,\
+                     -no-integrated-as)
+
+# Check whether clang keeps .macro-s between asm()-s:
+# https://bugs.llvm.org/show_bug.cgi?id=36110
+$(call as-option-add,CFLAGS,CC,\
+                     ".macro FOO\n.endm\"); asm volatile (\".macro FOO\n.endm",\
+                     -no-integrated-as)
 endif

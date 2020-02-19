@@ -100,6 +100,7 @@ static void __init disable_all_dmar_units(void)
     {
         list_del(&drhd->list);
         scope_devices_free(&drhd->scope);
+        iommu_free(drhd);
         xfree(drhd);
     }
     list_for_each_entry_safe ( rmrr, _rmrr, &acpi_rmrr_units, list )
@@ -513,7 +514,7 @@ acpi_parse_one_drhd(struct acpi_dmar_header *header)
     else
     {
         u8 b, d, f;
-        unsigned int i = 0, invalid_cnt = 0;
+        unsigned int i = 0;
         union {
             const void *raw;
             const struct acpi_dmar_device_scope *scope;
@@ -535,37 +536,12 @@ acpi_parse_one_drhd(struct acpi_dmar_header *header)
             f = PCI_FUNC(dmaru->scope.devices[i]);
 
             if ( !pci_device_detect(drhd->segment, b, d, f) )
-            {
                 printk(XENLOG_WARNING VTDPREFIX
                        " Non-existent device (%04x:%02x:%02x.%u) in this DRHD's scope!\n",
                        drhd->segment, b, d, f);
-                invalid_cnt++;
-            }
         }
 
-        if ( invalid_cnt )
-        {
-            if ( iommu_workaround_bios_bug &&
-                 invalid_cnt == dmaru->scope.devices_cnt )
-            {
-                printk(XENLOG_WARNING VTDPREFIX
-                       "  Workaround BIOS bug: ignoring DRHD (no devices in its scope are PCI discoverable)\n");
-
-                scope_devices_free(&dmaru->scope);
-                iommu_free(dmaru);
-                xfree(dmaru);
-            }
-            else
-            {
-                printk(XENLOG_WARNING VTDPREFIX
-                       "  DRHD is invalid (some devices in its scope are not PCI discoverable)\n");
-                printk(XENLOG_WARNING VTDPREFIX
-                       "  Try \"iommu=force\" or \"iommu=workaround_bios_bug\" if you really want VT-d\n");
-                ret = -EINVAL;
-            }
-        }
-        else
-            acpi_register_drhd_unit(dmaru);
+        acpi_register_drhd_unit(dmaru);
     }
 
 out:
@@ -1008,7 +984,7 @@ int __init acpi_dmar_init(void)
     if ( ACPI_SUCCESS(acpi_get_table_phys(ACPI_SIG_DMAR, 0,
                                           &dmar_addr, &dmar_len)) )
     {
-        map_pages_to_xen((unsigned long)__va(dmar_addr), PFN_DOWN(dmar_addr),
+        map_pages_to_xen((unsigned long)__va(dmar_addr), maddr_to_mfn(dmar_addr),
                          PFN_UP(dmar_addr + dmar_len) - PFN_DOWN(dmar_addr),
                          PAGE_HYPERVISOR);
         dmar_table = __va(dmar_addr);

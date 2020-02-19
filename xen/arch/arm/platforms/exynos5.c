@@ -17,7 +17,6 @@
  * GNU General Public License for more details.
  */
 
-#include <asm/p2m.h>
 #include <xen/device_tree.h>
 #include <xen/domain_page.h>
 #include <xen/mm.h>
@@ -26,6 +25,7 @@
 #include <asm/platforms/exynos5.h>
 #include <asm/platform.h>
 #include <asm/io.h>
+#include <asm/smccc.h>
 
 static bool secure_firmware;
 
@@ -249,7 +249,7 @@ static int exynos5_cpu_up(int cpu)
     iounmap(power);
 
     if ( secure_firmware )
-        call_smc(SMC_CMD_CPU1BOOT, cpu, 0, 0);
+        arm_smccc_smc(SMC_CMD_CPU1BOOT, cpu, NULL);
 
     return cpu_up_send_sgi(cpu);
 }

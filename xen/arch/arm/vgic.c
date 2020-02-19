@@ -26,6 +26,7 @@
 #include <xen/sched.h>
 #include <xen/perfc.h>
 
+#include <asm/event.h>
 #include <asm/current.h>
 
 #include <asm/mmio.h>
@@ -97,7 +98,7 @@ int domain_vgic_register(struct domain *d, int *mmio_count)
 {
     switch ( d->arch.vgic.version )
     {
-#ifdef CONFIG_HAS_GICV3
+#ifdef CONFIG_GICV3
     case GIC_V3:
         if ( vgic_v3_init(d, mmio_count) )
            return -ENODEV;
@@ -288,10 +289,10 @@ bool vgic_migrate_irq(struct vcpu *old, struct vcpu *new, unsigned int irq)
     /* If the IRQ is still lr_pending, re-inject it to the new vcpu */
     if ( !list_empty(&p->lr_queue) )
     {
-        gic_remove_irq_from_queues(old, p);
+        vgic_remove_irq_from_queues(old, p);
         irq_set_affinity(p->desc, cpumask_of(new->processor));
         spin_unlock_irqrestore(&old->arch.vgic.lock, flags);
-        vgic_vcpu_inject_irq(new, irq);
+        vgic_inject_irq(new->domain, new, irq, true);
         return true;
     }
     /* if the IRQ is in a GICH_LR register, set GIC_IRQ_GUEST_MIGRATING
@@ -450,7 +451,7 @@ bool vgic_to_sgi(struct vcpu *v, register_t sgir, enum gic_sgi_mode irqmode,
                         sgir, target->list);
                 continue;
             }
-            vgic_vcpu_inject_irq(d->vcpu[vcpuid], virq);
+            vgic_inject_irq(d, d->vcpu[vcpuid], virq, true);
         }
         break;
     case SGI_TARGET_OTHERS:
@@ -459,12 +460,12 @@ bool vgic_to_sgi(struct vcpu *v, register_t sgir, enum gic_sgi_mode irqmode,
         {
             if ( i != current->vcpu_id && d->vcpu[i] != NULL &&
                  is_vcpu_online(d->vcpu[i]) )
-                vgic_vcpu_inject_irq(d->vcpu[i], virq);
+                vgic_inject_irq(d, d->vcpu[i], virq, true);
         }
         break;
     case SGI_TARGET_SELF:
         perfc_incr(vgic_sgi_self);
-        vgic_vcpu_inject_irq(d->vcpu[current->vcpu_id], virq);
+        vgic_inject_irq(d, current, virq, true);
         break;
     default:
         gprintk(XENLOG_WARNING,
@@ -515,12 +516,36 @@ void vgic_clear_pending_irqs(struct vcpu *v)
     spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
 }
 
-void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int virq)
+void vgic_remove_irq_from_queues(struct vcpu *v, struct pending_irq *p)
+{
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
+
+    clear_bit(GIC_IRQ_GUEST_QUEUED, &p->status);
+    list_del_init(&p->inflight);
+    gic_remove_from_lr_pending(v, p);
+}
+
+void vgic_inject_irq(struct domain *d, struct vcpu *v, unsigned int virq,
+                     bool level)
 {
     uint8_t priority;
     struct pending_irq *iter, *n;
     unsigned long flags;
-    bool running;
+
+    /*
+     * For edge triggered interrupts we always ignore a "falling edge".
+     * For level triggered interrupts we shouldn't, but do anyways.
+     */
+    if ( !level )
+        return;
+
+    if ( !v )
+    {
+        /* The IRQ needs to be an SPI if no vCPU is specified. */
+        ASSERT(virq >= 32 && virq <= vgic_num_irqs(d));
+
+        v = vgic_get_target_vcpu(d->vcpu[0], virq);
+    };
 
     spin_lock_irqsave(&v->arch.vgic.lock, flags);
 
@@ -565,30 +590,27 @@ void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int virq)
     list_add_tail(&n->inflight, &v->arch.vgic.inflight_irqs);
 out:
     spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
+
     /* we have a new higher priority irq, inject it into the guest */
-    running = v->is_running;
-    vcpu_unblock(v);
-    if ( running && v != current )
-    {
-        perfc_incr(vgic_cross_cpu_intr_inject);
-        smp_send_event_check_mask(cpumask_of(v->processor));
-    }
-}
+    vcpu_kick(v);
 
-void vgic_vcpu_inject_spi(struct domain *d, unsigned int virq)
-{
-    struct vcpu *v;
-
-    /* the IRQ needs to be an SPI */
-    ASSERT(virq >= 32 && virq <= vgic_num_irqs(d));
-
-    v = vgic_get_target_vcpu(d->vcpu[0], virq);
-    vgic_vcpu_inject_irq(v, virq);
+    return;
 }
 
 void arch_evtchn_inject(struct vcpu *v)
 {
-    vgic_vcpu_inject_irq(v, v->domain->arch.evtchn_irq);
+    vgic_inject_irq(v->domain, v, v->domain->arch.evtchn_irq, true);
+}
+
+bool vgic_evtchn_irq_pending(struct vcpu *v)
+{
+    struct pending_irq *p;
+
+    p = irq_to_pending(v, v->domain->arch.evtchn_irq);
+    /* Does not work for LPIs. */
+    ASSERT(!is_lpi(v->domain->arch.evtchn_irq));
+
+    return list_empty(&p->inflight);
 }
 
 bool vgic_emulate(struct cpu_user_regs *regs, union hsr hsr)
@@ -643,6 +665,23 @@ int vgic_allocate_virq(struct domain *d, bool spi)
 void vgic_free_virq(struct domain *d, unsigned int virq)
 {
     clear_bit(virq, d->arch.vgic.allocated_irqs);
+}
+
+unsigned int vgic_max_vcpus(unsigned int domctl_vgic_version)
+{
+    switch ( domctl_vgic_version )
+    {
+    case XEN_DOMCTL_CONFIG_GIC_V2:
+        return 8;
+
+#ifdef CONFIG_GICV3
+    case XEN_DOMCTL_CONFIG_GIC_V3:
+        return 4096;
+#endif
+
+    default:
+        return 0;
+    }
 }
 
 /*

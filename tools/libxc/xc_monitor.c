@@ -90,7 +90,7 @@ int xc_monitor_write_ctrlreg(xc_interface *xch, uint32_t domain_id,
 }
 
 int xc_monitor_mov_to_msr(xc_interface *xch, uint32_t domain_id, uint32_t msr,
-                          bool enable)
+                          bool enable, bool onchangeonly)
 {
     DECLARE_DOMCTL;
 
@@ -100,6 +100,7 @@ int xc_monitor_mov_to_msr(xc_interface *xch, uint32_t domain_id, uint32_t msr,
                                     : XEN_DOMCTL_MONITOR_OP_DISABLE;
     domctl.u.monitor_op.event = XEN_DOMCTL_MONITOR_EVENT_MOV_TO_MSR;
     domctl.u.monitor_op.u.mov_to_msr.msr = msr;
+    domctl.u.monitor_op.u.mov_to_msr.onchangeonly = onchangeonly;
 
     return do_domctl(xch, &domctl);
 }
@@ -158,6 +159,20 @@ int xc_monitor_guest_request(xc_interface *xch, uint32_t domain_id, bool enable,
     domctl.u.monitor_op.event = XEN_DOMCTL_MONITOR_EVENT_GUEST_REQUEST;
     domctl.u.monitor_op.u.guest_request.sync = sync;
     domctl.u.monitor_op.u.guest_request.allow_userspace = enable ? allow_userspace : false;
+
+    return do_domctl(xch, &domctl);
+}
+
+int xc_monitor_inguest_pagefault(xc_interface *xch, uint32_t domain_id,
+                                bool disable)
+{
+    DECLARE_DOMCTL;
+
+    domctl.cmd = XEN_DOMCTL_monitor_op;
+    domctl.domain = domain_id;
+    domctl.u.monitor_op.op = disable ? XEN_DOMCTL_MONITOR_OP_ENABLE
+                                    : XEN_DOMCTL_MONITOR_OP_DISABLE;
+    domctl.u.monitor_op.event = XEN_DOMCTL_MONITOR_EVENT_INGUEST_PAGEFAULT;
 
     return do_domctl(xch, &domctl);
 }

@@ -16,9 +16,9 @@
  *
  * 7 - Primary stack (with a struct cpu_info at the top)
  * 6 - Primary stack
- * 5 - Optionally not preset (MEMORY_GUARD)
- * 4 - unused
- * 3 - Syscall trampolines
+ * 5 - Optionally not present (MEMORY_GUARD)
+ * 4 - Unused; optionally not present (MEMORY_GUARD)
+ * 3 - Unused; optionally not present (MEMORY_GUARD)
  * 2 - MCE IST stack
  * 1 - NMI IST stack
  * 0 - Double Fault IST stack
@@ -44,20 +44,33 @@ struct cpu_info {
     /*
      * Of the two following fields the latter is being set to the CR3 value
      * to be used on the given pCPU for loading whenever 64-bit PV guest
-     * context is being entered. The value never changes once set.
+     * context is being entered. A value of zero indicates no setting of CR3
+     * is to be performed.
      * The former is the value to restore when re-entering Xen, if any. IOW
-     * its value being zero means there's nothing to restore. However, its
-     * value can also be negative, indicating to the exit-to-Xen code that
-     * restoring is not necessary, but allowing any nested entry code paths
-     * to still know the value to put back into CR3.
+     * its value being zero means there's nothing to restore.
      */
     unsigned long xen_cr3;
     unsigned long pv_cr3;
 
     /* See asm-x86/spec_ctrl_asm.h for usage. */
     unsigned int shadow_spec_ctrl;
-    bool         use_shadow_spec_ctrl;
-    uint8_t      bti_ist_info;
+    uint8_t      xen_spec_ctrl;
+    uint8_t      spec_ctrl_flags;
+
+    /*
+     * The following field controls copying of the L4 page table of 64-bit
+     * PV guests to the per-cpu root page table on entering the guest context.
+     * If set the L4 page table is being copied to the root page table and
+     * the field will be reset.
+     */
+    bool         root_pgt_changed;
+
+    /*
+     * use_pv_cr3 is set in case the value of pv_cr3 is to be written into
+     * CR3 when returning from an interrupt. The main use is when returning
+     * from a NMI or MCE to hypervisor code where pv_cr3 was active.
+     */
+    bool         use_pv_cr3;
 
     unsigned long __pad;
     /* get_stack_bottom() must be 16-byte aligned */

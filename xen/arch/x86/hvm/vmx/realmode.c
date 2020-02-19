@@ -96,14 +96,14 @@ static void realmode_deliver_exception(
 void vmx_realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt)
 {
     struct vcpu *curr = current;
-    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
+    struct hvm_vcpu_io *vio = &curr->arch.hvm.hvm_io;
     int rc;
 
     perfc_incr(realmode_emulations);
 
     rc = hvm_emulate_one(hvmemul_ctxt);
 
-    if ( hvm_vcpu_io_need_completion(vio) )
+    if ( hvm_ioreq_needs_completion(&vio->io_req) )
         vio->io_completion = HVMIO_realmode_completion;
 
     if ( rc == X86EMUL_UNHANDLEABLE )
@@ -115,7 +115,7 @@ void vmx_realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt)
     if ( rc == X86EMUL_UNRECOGNIZED )
     {
         gdprintk(XENLOG_ERR, "Unrecognized insn.\n");
-        if ( curr->arch.hvm_vcpu.guest_cr[0] & X86_CR0_PE )
+        if ( curr->arch.hvm.guest_cr[0] & X86_CR0_PE )
             goto fail;
 
         realmode_deliver_exception(TRAP_invalid_op, 0, hvmemul_ctxt);
@@ -129,7 +129,7 @@ void vmx_realmode_emulate_one(struct hvm_emulate_ctxt *hvmemul_ctxt)
         {
             domain_pause_for_debugger();
         }
-        else if ( curr->arch.hvm_vcpu.guest_cr[0] & X86_CR0_PE )
+        else if ( curr->arch.hvm.guest_cr[0] & X86_CR0_PE )
         {
             gdprintk(XENLOG_ERR, "Exception %02x in protected mode.\n",
                      hvmemul_ctxt->ctxt.event.vector);
@@ -156,7 +156,7 @@ void vmx_realmode(struct cpu_user_regs *regs)
     struct vcpu *curr = current;
     struct hvm_emulate_ctxt hvmemul_ctxt;
     struct segment_register *sreg;
-    struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
+    struct hvm_vcpu_io *vio = &curr->arch.hvm.hvm_io;
     unsigned long intr_info;
     unsigned int emulations = 0;
 
@@ -168,15 +168,15 @@ void vmx_realmode(struct cpu_user_regs *regs)
     hvm_emulate_init_once(&hvmemul_ctxt, NULL, regs);
 
     /* Only deliver interrupts into emulated real mode. */
-    if ( !(curr->arch.hvm_vcpu.guest_cr[0] & X86_CR0_PE) &&
+    if ( !(curr->arch.hvm.guest_cr[0] & X86_CR0_PE) &&
          (intr_info & INTR_INFO_VALID_MASK) )
     {
         realmode_deliver_exception((uint8_t)intr_info, 0, &hvmemul_ctxt);
         intr_info = 0;
     }
 
-    curr->arch.hvm_vmx.vmx_emulate = 1;
-    while ( curr->arch.hvm_vmx.vmx_emulate &&
+    curr->arch.hvm.vmx.vmx_emulate = 1;
+    while ( curr->arch.hvm.vmx.vmx_emulate &&
             !softirq_pending(smp_processor_id()) )
     {
         /*
@@ -185,7 +185,7 @@ void vmx_realmode(struct cpu_user_regs *regs)
          * in real mode, because we don't emulate protected-mode IDT vectoring.
          */
         if ( unlikely(!(++emulations & 15)) &&
-             curr->arch.hvm_vmx.vmx_realmode && 
+             curr->arch.hvm.vmx.vmx_realmode &&
              hvm_local_events_need_delivery(curr) )
             break;
 
@@ -195,20 +195,20 @@ void vmx_realmode(struct cpu_user_regs *regs)
             break;
 
         /* Stop emulating unless our segment state is not safe */
-        if ( curr->arch.hvm_vmx.vmx_realmode )
-            curr->arch.hvm_vmx.vmx_emulate = 
-                (curr->arch.hvm_vmx.vm86_segment_mask != 0);
+        if ( curr->arch.hvm.vmx.vmx_realmode )
+            curr->arch.hvm.vmx.vmx_emulate =
+                (curr->arch.hvm.vmx.vm86_segment_mask != 0);
         else
-            curr->arch.hvm_vmx.vmx_emulate = 
+            curr->arch.hvm.vmx.vmx_emulate =
                  ((hvmemul_ctxt.seg_reg[x86_seg_cs].sel & 3)
                   || (hvmemul_ctxt.seg_reg[x86_seg_ss].sel & 3));
     }
 
     /* Need to emulate next time if we've started an IO operation */
     if ( vio->io_req.state != STATE_IOREQ_NONE )
-        curr->arch.hvm_vmx.vmx_emulate = 1;
+        curr->arch.hvm.vmx.vmx_emulate = 1;
 
-    if ( !curr->arch.hvm_vmx.vmx_emulate && !curr->arch.hvm_vmx.vmx_realmode )
+    if ( !curr->arch.hvm.vmx.vmx_emulate && !curr->arch.hvm.vmx.vmx_realmode )
     {
         /*
          * Cannot enter protected mode with bogus selector RPLs and DPLs.

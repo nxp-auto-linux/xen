@@ -18,6 +18,8 @@
 
 #define __packed      __attribute__((__packed__))
 
+#define __weak        __attribute__((__weak__))
+
 #if (!defined(__clang__) && (__GNUC__ == 4) && (__GNUC_MINOR__ < 5))
 #define unreachable() do {} while (1)
 #else
@@ -80,6 +82,9 @@
 /* Results in more efficient PIC code (no indirections through GOT or PLT). */
 #pragma GCC visibility push(hidden)
 #endif
+
+/* Make the optimizer believe the variable can be manipulated arbitrarily. */
+#define OPTIMIZER_HIDE_VAR(var) __asm__ ( "" : "+g" (var) )
 
 /* This macro obfuscates arithmetic on a variable address so that gcc
    shouldn't recognize the original var, and make assumptions about it */

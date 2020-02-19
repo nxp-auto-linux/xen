@@ -1,18 +1,14 @@
-#include <xen/sched.h>
-#include <xen/lib.h>
-#include <xen/errno.h>
+#include <xen/cpu.h>
 #include <xen/domain_page.h>
-#include <xen/bitops.h>
-#include <xen/vm_event.h>
-#include <xen/monitor.h>
 #include <xen/iocap.h>
-#include <xen/mem_access.h>
-#include <xen/xmalloc.h>
-#include <public/vm_event.h>
-#include <asm/flushtlb.h>
-#include <asm/gic.h>
+#include <xen/lib.h>
+#include <xen/sched.h>
+#include <xen/softirq.h>
+
+#include <asm/alternative.h>
 #include <asm/event.h>
-#include <asm/hardirq.h>
+#include <asm/flushtlb.h>
+#include <asm/guest_walk.h>
 #include <asm/page.h>
 
 #define MAX_VMID_8_BIT  (1UL << 8)
@@ -38,12 +34,6 @@ static unsigned int __read_mostly max_vmid = MAX_VMID_8_BIT;
 
 #define P2M_ROOT_PAGES    (1<<P2M_ROOT_ORDER)
 
-/* Override macros from asm/mm.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 unsigned int __read_mostly p2m_ipa_bits;
 
 /* Helpers to lookup the properties of each level */
@@ -52,21 +42,22 @@ static const paddr_t level_masks[] =
 static const uint8_t level_orders[] =
     { ZEROETH_ORDER, FIRST_ORDER, SECOND_ORDER, THIRD_ORDER };
 
-static void p2m_flush_tlb(struct p2m_domain *p2m);
+static mfn_t __read_mostly empty_root_mfn;
+
+static uint64_t generate_vttbr(uint16_t vmid, mfn_t root_mfn)
+{
+    return (mfn_to_maddr(root_mfn) | ((uint64_t)vmid << 48));
+}
 
 /* Unlock the flush and do a P2M TLB flush if necessary */
 void p2m_write_unlock(struct p2m_domain *p2m)
 {
-    if ( p2m->need_flush )
-    {
-        p2m->need_flush = false;
-        /*
-         * The final flush is done with the P2M write lock taken to
-         * to avoid someone else modify the P2M before the TLB
-         * invalidation has completed.
-         */
-        p2m_flush_tlb(p2m);
-    }
+    /*
+     * The final flush is done with the P2M write lock taken to avoid
+     * someone else modifying the P2M wbefore the TLB invalidation has
+     * completed.
+     */
+    p2m_tlb_flush_sync(p2m);
 
     write_unlock(&p2m->lock);
 }
@@ -97,16 +88,32 @@ void dump_p2m_lookup(struct domain *d, paddr_t addr)
 
     printk("dom%d IPA 0x%"PRIpaddr"\n", d->domain_id, addr);
 
-    printk("P2M @ %p mfn:0x%lx\n",
-           p2m->root, __page_to_mfn(p2m->root));
+    printk("P2M @ %p mfn:%#"PRI_mfn"\n",
+           p2m->root, mfn_x(page_to_mfn(p2m->root)));
 
     dump_pt_walk(page_to_maddr(p2m->root), addr,
                  P2M_ROOT_LEVEL, P2M_ROOT_PAGES);
 }
 
+/*
+ * p2m_save_state and p2m_restore_state work in pair to workaround
+ * ARM64_WORKAROUND_AT_SPECULATE. p2m_save_state will set-up VTTBR to
+ * point to the empty page-tables to stop allocating TLB entries.
+ */
 void p2m_save_state(struct vcpu *p)
 {
     p->arch.sctlr = READ_SYSREG(SCTLR_EL1);
+
+    if ( cpus_have_const_cap(ARM64_WORKAROUND_AT_SPECULATE) )
+    {
+        WRITE_SYSREG64(generate_vttbr(INVALID_VMID, empty_root_mfn), VTTBR_EL2);
+        /*
+         * Ensure VTTBR_EL2 is correctly synchronized so we can restore
+         * the next vCPU context without worrying about AT instruction
+         * speculation.
+         */
+        isb();
+    }
 }
 
 void p2m_restore_state(struct vcpu *n)
@@ -117,16 +124,27 @@ void p2m_restore_state(struct vcpu *n)
     if ( is_idle_vcpu(n) )
         return;
 
-    WRITE_SYSREG64(p2m->vttbr, VTTBR_EL2);
-    isb();
-
     WRITE_SYSREG(n->arch.sctlr, SCTLR_EL1);
-    isb();
-
     WRITE_SYSREG(n->arch.hcr_el2, HCR_EL2);
-    isb();
+
+    /*
+     * ARM64_WORKAROUND_AT_SPECULATE: VTTBR_EL2 should be restored after all
+     * registers associated to EL1/EL0 translations regime have been
+     * synchronized.
+     */
+    asm volatile(ALTERNATIVE("nop", "isb", ARM64_WORKAROUND_AT_SPECULATE));
+    WRITE_SYSREG64(p2m->vttbr, VTTBR_EL2);
 
     last_vcpu_ran = &p2m->last_vcpu_ran[smp_processor_id()];
+
+    /*
+     * While we are restoring an out-of-context translation regime
+     * we still need to ensure:
+     *  - VTTBR_EL2 is synchronized before flushing the TLBs
+     *  - All registers for EL1 are synchronized before executing an AT
+     *  instructions targeting S1/S2.
+     */
+    isb();
 
     /*
      * Flush local TLB for the domain to prevent wrong TLB translation
@@ -138,10 +156,17 @@ void p2m_restore_state(struct vcpu *n)
     *last_vcpu_ran = n->vcpu_id;
 }
 
-static void p2m_flush_tlb(struct p2m_domain *p2m)
+/*
+ * Force a synchronous P2M TLB flush.
+ *
+ * Must be called with the p2m lock held.
+ */
+static void p2m_force_tlb_flush_sync(struct p2m_domain *p2m)
 {
     unsigned long flags = 0;
     uint64_t ovttbr;
+
+    ASSERT(p2m_is_write_locked(p2m));
 
     /*
      * ARM only provides an instruction to flush TLBs for the current
@@ -150,8 +175,24 @@ static void p2m_flush_tlb(struct p2m_domain *p2m)
     ovttbr = READ_SYSREG64(VTTBR_EL2);
     if ( ovttbr != p2m->vttbr )
     {
+        uint64_t vttbr;
+
         local_irq_save(flags);
-        WRITE_SYSREG64(p2m->vttbr, VTTBR_EL2);
+
+        /*
+         * ARM64_WORKAROUND_AT_SPECULATE: We need to stop AT to allocate
+         * TLBs entries because the context is partially modified. We
+         * only need the VMID for flushing the TLBs, so we can generate
+         * a new VTTBR with the VMID to flush and the empty root table.
+         */
+        if ( !cpus_have_const_cap(ARM64_WORKAROUND_AT_SPECULATE) )
+            vttbr = p2m->vttbr;
+        else
+            vttbr = generate_vttbr(p2m->vmid, empty_root_mfn);
+
+        WRITE_SYSREG64(vttbr, VTTBR_EL2);
+
+        /* Ensure VTTBR_EL2 is synchronized before flushing the TLBs */
         isb();
     }
 
@@ -160,22 +201,18 @@ static void p2m_flush_tlb(struct p2m_domain *p2m)
     if ( ovttbr != READ_SYSREG64(VTTBR_EL2) )
     {
         WRITE_SYSREG64(ovttbr, VTTBR_EL2);
+        /* Ensure VTTBR_EL2 is back in place before continuing. */
         isb();
         local_irq_restore(flags);
     }
+
+    p2m->need_flush = false;
 }
 
-/*
- * Force a synchronous P2M TLB flush.
- *
- * Must be called with the p2m lock held.
- */
-static void p2m_flush_tlb_sync(struct p2m_domain *p2m)
+void p2m_tlb_flush_sync(struct p2m_domain *p2m)
 {
-    ASSERT(p2m_is_write_locked(p2m));
-
-    p2m_flush_tlb(p2m);
-    p2m->need_flush = false;
+    if ( p2m->need_flush )
+        p2m_force_tlb_flush_sync(p2m);
 }
 
 /*
@@ -228,6 +265,29 @@ static p2m_access_t p2m_mem_access_radix_get(struct p2m_domain *p2m, gfn_t gfn)
         return radix_tree_ptr_to_int(ptr);
 }
 
+/*
+ * In the case of the P2M, the valid bit is used for other purpose. Use
+ * the type to check whether an entry is valid.
+ */
+static inline bool p2m_is_valid(lpae_t pte)
+{
+    return pte.p2m.type != p2m_invalid;
+}
+
+/*
+ * lpae_is_* helpers don't check whether the valid bit is set in the
+ * PTE. Provide our own overlay to check the valid bit.
+ */
+static inline bool p2m_is_mapping(lpae_t pte, unsigned int level)
+{
+    return p2m_is_valid(pte) && lpae_is_mapping(pte, level);
+}
+
+static inline bool p2m_is_superpage(lpae_t pte, unsigned int level)
+{
+    return p2m_is_valid(pte) && lpae_is_superpage(pte, level);
+}
+
 #define GUEST_TABLE_MAP_FAILED 0
 #define GUEST_TABLE_SUPER_PAGE 1
 #define GUEST_TABLE_NORMAL_PAGE 2
@@ -250,7 +310,8 @@ static int p2m_create_table(struct p2m_domain *p2m, lpae_t *entry);
  *  GUEST_TABLE_SUPER_PAGE: The next entry points to a superpage.
  */
 static int p2m_next_level(struct p2m_domain *p2m, bool read_only,
-                          lpae_t **table, unsigned int offset)
+                          unsigned int level, lpae_t **table,
+                          unsigned int offset)
 {
     lpae_t *entry;
     int ret;
@@ -258,7 +319,7 @@ static int p2m_next_level(struct p2m_domain *p2m, bool read_only,
 
     entry = *table + offset;
 
-    if ( !lpae_valid(*entry) )
+    if ( !p2m_is_valid(*entry) )
     {
         if ( read_only )
             return GUEST_TABLE_MAP_FAILED;
@@ -269,10 +330,11 @@ static int p2m_next_level(struct p2m_domain *p2m, bool read_only,
     }
 
     /* The function p2m_next_level is never called at the 3rd level */
-    if ( lpae_mapping(*entry) )
+    ASSERT(level < 3);
+    if ( p2m_is_mapping(*entry, level) )
         return GUEST_TABLE_SUPER_PAGE;
 
-    mfn = _mfn(entry->p2m.base);
+    mfn = lpae_get_mfn(*entry);
 
     unmap_domain_page(*table);
     *table = map_domain_page(mfn);
@@ -289,10 +351,14 @@ static int p2m_next_level(struct p2m_domain *p2m, bool read_only,
  *
  * If the entry is not present, INVALID_MFN will be returned and the
  * page_order will be set according to the order of the invalid range.
+ *
+ * valid will contain the value of bit[0] (e.g valid bit) of the
+ * entry.
  */
 mfn_t p2m_get_entry(struct p2m_domain *p2m, gfn_t gfn,
                     p2m_type_t *t, p2m_access_t *a,
-                    unsigned int *page_order)
+                    unsigned int *page_order,
+                    bool *valid)
 {
     paddr_t addr = gfn_to_gaddr(gfn);
     unsigned int level = 0;
@@ -317,6 +383,9 @@ mfn_t p2m_get_entry(struct p2m_domain *p2m, gfn_t gfn,
 
     *t = p2m_invalid;
 
+    if ( valid )
+        *valid = false;
+
     /* XXX: Check if the mapping is lower than the mapped gfn */
 
     /* This gfn is higher than the highest the p2m map currently holds */
@@ -340,7 +409,7 @@ mfn_t p2m_get_entry(struct p2m_domain *p2m, gfn_t gfn,
 
     for ( level = P2M_ROOT_LEVEL; level < 3; level++ )
     {
-        rc = p2m_next_level(p2m, true, &table, offsets[level]);
+        rc = p2m_next_level(p2m, true, level, &table, offsets[level]);
         if ( rc == GUEST_TABLE_MAP_FAILED )
             goto out_unmap;
         else if ( rc != GUEST_TABLE_NORMAL_PAGE )
@@ -349,19 +418,22 @@ mfn_t p2m_get_entry(struct p2m_domain *p2m, gfn_t gfn,
 
     entry = table[offsets[level]];
 
-    if ( lpae_valid(entry) )
+    if ( p2m_is_valid(entry) )
     {
         *t = entry.p2m.type;
 
         if ( a )
             *a = p2m_mem_access_radix_get(p2m, gfn);
 
-        mfn = _mfn(entry.p2m.base);
+        mfn = lpae_get_mfn(entry);
         /*
          * The entry may point to a superpage. Find the MFN associated
          * to the GFN.
          */
         mfn = mfn_add(mfn, gfn_x(gfn) & ((1UL << level_orders[level]) - 1));
+
+        if ( valid )
+            *valid = lpae_is_valid(entry);
     }
 
 out_unmap:
@@ -376,14 +448,47 @@ out:
 
 mfn_t p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t)
 {
-    mfn_t ret;
+    mfn_t mfn;
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
 
     p2m_read_lock(p2m);
-    ret = p2m_get_entry(p2m, gfn, t, NULL, NULL);
+    mfn = p2m_get_entry(p2m, gfn, t, NULL, NULL, NULL);
     p2m_read_unlock(p2m);
 
-    return ret;
+    return mfn;
+}
+
+struct page_info *p2m_get_page_from_gfn(struct domain *d, gfn_t gfn,
+                                        p2m_type_t *t)
+{
+    struct page_info *page;
+    p2m_type_t p2mt;
+    mfn_t mfn = p2m_lookup(d, gfn, &p2mt);
+
+    if ( t )
+        *t = p2mt;
+
+    if ( !p2m_is_any_ram(p2mt) )
+        return NULL;
+
+    if ( !mfn_valid(mfn) )
+        return NULL;
+
+    page = mfn_to_page(mfn);
+
+    /*
+     * get_page won't work on foreign mapping because the page doesn't
+     * belong to the current domain.
+     */
+    if ( p2m_is_foreign(p2mt) )
+    {
+        struct domain *fdom = page_get_owner_and_reference(page);
+        ASSERT(fdom != NULL);
+        ASSERT(fdom != d);
+        return page;
+    }
+
+    return get_page(page, d) ? page : NULL;
 }
 
 int guest_physmap_mark_populate_on_demand(struct domain *d,
@@ -393,10 +498,10 @@ int guest_physmap_mark_populate_on_demand(struct domain *d,
     return -ENOSYS;
 }
 
-int p2m_pod_decrease_reservation(struct domain *d, gfn_t gfn,
-                                 unsigned int order)
+unsigned long p2m_pod_decrease_reservation(struct domain *d, gfn_t gfn,
+                                           unsigned int order)
 {
-    return -ENOSYS;
+    return 0;
 }
 
 static void p2m_set_permission(lpae_t *e, p2m_type_t t, p2m_access_t a)
@@ -415,7 +520,7 @@ static void p2m_set_permission(lpae_t *e, p2m_type_t t, p2m_access_t a)
         break;
 
     case p2m_iommu_map_rw:
-    case p2m_map_foreign:
+    case p2m_map_foreign_rw:
     case p2m_grant_map_rw:
     case p2m_mmio_direct_dev:
     case p2m_mmio_direct_nc:
@@ -425,6 +530,7 @@ static void p2m_set_permission(lpae_t *e, p2m_type_t t, p2m_access_t a)
         break;
 
     case p2m_iommu_map_ro:
+    case p2m_map_foreign_ro:
     case p2m_grant_map_ro:
     case p2m_invalid:
         e->p2m.xn = 1;
@@ -526,9 +632,22 @@ static lpae_t mfn_to_p2m_entry(mfn_t mfn, p2m_type_t t, p2m_access_t a)
 
     ASSERT(!(mfn_to_maddr(mfn) & ~PADDR_MASK));
 
-    e.p2m.base = mfn_x(mfn);
+    lpae_set_mfn(e, mfn);
 
     return e;
+}
+
+/* Generate table entry with correct attributes. */
+static lpae_t page_to_p2m_table(struct page_info *page)
+{
+    /*
+     * The access value does not matter because the hardware will ignore
+     * the permission fields for table entry.
+     *
+     * We use p2m_ram_rw so the entry has a valid type. This is important
+     * for p2m_is_valid() to return valid on table entries.
+     */
+    return mfn_to_p2m_entry(page_to_mfn(page), p2m_ram_rw, p2m_access_rwx);
 }
 
 static inline void p2m_write_pte(lpae_t *p, lpae_t pte, bool clean_pte)
@@ -551,9 +670,8 @@ static int p2m_create_table(struct p2m_domain *p2m, lpae_t *entry)
 {
     struct page_info *page;
     lpae_t *p;
-    lpae_t pte;
 
-    ASSERT(!lpae_valid(*entry));
+    ASSERT(!p2m_is_valid(*entry));
 
     page = alloc_domheap_page(NULL, 0);
     if ( page == NULL )
@@ -569,14 +687,7 @@ static int p2m_create_table(struct p2m_domain *p2m, lpae_t *entry)
 
     unmap_domain_page(p);
 
-    /*
-     * The access value does not matter because the hardware will ignore
-     * the permission fields for table entry.
-     */
-    pte = mfn_to_p2m_entry(page_to_mfn(page), p2m_invalid,
-                           p2m->default_access);
-
-    p2m_write_pte(entry, pte, p2m->clean_pte);
+    p2m_write_pte(entry, page_to_p2m_table(page), p2m->clean_pte);
 
     return 0;
 }
@@ -617,7 +728,7 @@ static int p2m_mem_access_radix_set(struct p2m_domain *p2m, gfn_t gfn,
  */
 static void p2m_put_l3_page(const lpae_t pte)
 {
-    ASSERT(lpae_valid(pte));
+    ASSERT(p2m_is_valid(pte));
 
     /*
      * TODO: Handle other p2m types
@@ -628,7 +739,7 @@ static void p2m_put_l3_page(const lpae_t pte)
      */
     if ( p2m_is_foreign(pte.p2m.type) )
     {
-        mfn_t mfn = _mfn(pte.p2m.base);
+        mfn_t mfn = lpae_get_mfn(pte);
 
         ASSERT(mfn_valid(mfn));
         put_page(mfn_to_page(mfn));
@@ -645,11 +756,11 @@ static void p2m_free_entry(struct p2m_domain *p2m,
     struct page_info *pg;
 
     /* Nothing to do if the entry is invalid. */
-    if ( !lpae_valid(entry) )
+    if ( !p2m_is_valid(entry) )
         return;
 
     /* Nothing to do but updating the stats if the entry is a super-page. */
-    if ( lpae_is_superpage(entry, level) )
+    if ( p2m_is_superpage(entry, level) )
     {
         p2m->stats.mappings[level]--;
         return;
@@ -662,7 +773,7 @@ static void p2m_free_entry(struct p2m_domain *p2m,
         return;
     }
 
-    table = map_domain_page(_mfn(entry.p2m.base));
+    table = map_domain_page(lpae_get_mfn(entry));
     for ( i = 0; i < LPAE_ENTRIES; i++ )
         p2m_free_entry(p2m, *(table + i), level + 1);
 
@@ -674,10 +785,9 @@ static void p2m_free_entry(struct p2m_domain *p2m,
      * XXX: Should we defer the free of the page table to avoid the
      * flush?
      */
-    if ( p2m->need_flush )
-        p2m_flush_tlb_sync(p2m);
+    p2m_tlb_flush_sync(p2m);
 
-    mfn = _mfn(entry.p2m.base);
+    mfn = lpae_get_mfn(entry);
     ASSERT(mfn_valid(mfn));
 
     pg = mfn_to_page(mfn);
@@ -696,7 +806,7 @@ static bool p2m_split_superpage(struct p2m_domain *p2m, lpae_t *entry,
     bool rv = true;
 
     /* Convenience aliases */
-    mfn_t mfn = _mfn(entry->p2m.base);
+    mfn_t mfn = lpae_get_mfn(*entry);
     unsigned int next_level = level + 1;
     unsigned int level_order = level_orders[next_level];
 
@@ -705,7 +815,7 @@ static bool p2m_split_superpage(struct p2m_domain *p2m, lpae_t *entry,
      * a superpage.
      */
     ASSERT(level < target);
-    ASSERT(lpae_is_superpage(*entry, level));
+    ASSERT(p2m_is_superpage(*entry, level));
 
     page = alloc_domheap_page(NULL, 0);
     if ( !page )
@@ -727,7 +837,7 @@ static bool p2m_split_superpage(struct p2m_domain *p2m, lpae_t *entry,
          * the necessary fields. So the correct permission are kept.
          */
         pte = *entry;
-        pte.p2m.base = mfn_x(mfn_add(mfn, i << level_order));
+        lpae_set_mfn(pte, mfn_add(mfn, i << level_order));
 
         /*
          * First and second level pages set p2m.table = 0, but third
@@ -758,14 +868,11 @@ static bool p2m_split_superpage(struct p2m_domain *p2m, lpae_t *entry,
 
     unmap_domain_page(table);
 
-    pte = mfn_to_p2m_entry(page_to_mfn(page), p2m_invalid,
-                           p2m->default_access);
-
     /*
      * Even if we failed, we should install the newly allocated LPAE
      * entry. The caller will be in charge to free the sub-tree.
      */
-    p2m_write_pte(entry, pte, p2m->clean_pte);
+    p2m_write_pte(entry, page_to_p2m_table(page), p2m->clean_pte);
 
     return rv;
 }
@@ -786,6 +893,8 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
     unsigned int target = 3 - (page_order / LPAE_SHIFT);
     lpae_t *entry, *table, orig_pte;
     int rc;
+    /* A mapping is removed if the MFN is invalid. */
+    bool removing_mapping = mfn_eq(smfn, INVALID_MFN);
 
     /* Convenience aliases */
     const unsigned int offsets[4] = {
@@ -811,10 +920,10 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
     {
         /*
          * Don't try to allocate intermediate page table if the mapping
-         * is about to be removed (i.e mfn == INVALID_MFN).
+         * is about to be removed.
          */
-        rc = p2m_next_level(p2m, mfn_eq(smfn, INVALID_MFN),
-                            &table, offsets[level]);
+        rc = p2m_next_level(p2m, removing_mapping,
+                            level, &table, offsets[level]);
         if ( rc == GUEST_TABLE_MAP_FAILED )
         {
             /*
@@ -824,7 +933,7 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
              * when removing a mapping as it may not exist in the
              * page table. In this case, just ignore it.
              */
-            rc = mfn_eq(smfn, INVALID_MFN) ? 0 : -ENOENT;
+            rc = removing_mapping ?  0 : -ENOENT;
             goto out;
         }
         else if ( rc != GUEST_TABLE_NORMAL_PAGE )
@@ -842,7 +951,7 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
         /* We need to split the original page. */
         lpae_t split_pte = *entry;
 
-        ASSERT(lpae_is_superpage(*entry, level));
+        ASSERT(p2m_is_superpage(*entry, level));
 
         if ( !p2m_split_superpage(p2m, &split_pte, level, target, offsets) )
         {
@@ -864,14 +973,14 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
          * For more details see (D4.7.1 in ARM DDI 0487A.j).
          */
         p2m_remove_pte(entry, p2m->clean_pte);
-        p2m_flush_tlb_sync(p2m);
+        p2m_force_tlb_flush_sync(p2m);
 
         p2m_write_pte(entry, split_pte, p2m->clean_pte);
 
         /* then move to the level we want to make real changes */
         for ( ; level < target; level++ )
         {
-            rc = p2m_next_level(p2m, true, &table, offsets[level]);
+            rc = p2m_next_level(p2m, true, level, &table, offsets[level]);
 
             /*
              * The entry should be found and either be a table
@@ -916,12 +1025,12 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
      * sequence when updating the translation table (D4.7.1 in ARM DDI
      * 0487A.j).
      */
-    if ( lpae_valid(orig_pte) )
+    if ( lpae_is_valid(orig_pte) )
         p2m_remove_pte(entry, p2m->clean_pte);
 
-    if ( mfn_eq(smfn, INVALID_MFN) )
+    if ( removing_mapping )
         /* Flush can be deferred if the entry is removed */
-        p2m->need_flush |= !!lpae_valid(orig_pte);
+        p2m->need_flush |= !!lpae_is_valid(orig_pte);
     else
     {
         lpae_t pte = mfn_to_p2m_entry(smfn, t, a);
@@ -936,15 +1045,15 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
          * Although, it could be defered when only the permissions are
          * changed (e.g in case of memaccess).
          */
-        if ( lpae_valid(orig_pte) )
+        if ( lpae_is_valid(orig_pte) )
         {
             if ( likely(!p2m->mem_access_enabled) ||
                  P2M_CLEAR_PERM(pte) != P2M_CLEAR_PERM(orig_pte) )
-                p2m_flush_tlb_sync(p2m);
+                p2m_force_tlb_flush_sync(p2m);
             else
                 p2m->need_flush = true;
         }
-        else /* new mapping */
+        else if ( !p2m_is_valid(orig_pte) ) /* new mapping */
             p2m->stats.mappings[level]++;
 
         p2m_write_pte(entry, pte, p2m->clean_pte);
@@ -958,12 +1067,23 @@ static int __p2m_set_entry(struct p2m_domain *p2m,
      * Free the entry only if the original pte was valid and the base
      * is different (to avoid freeing when permission is changed).
      */
-    if ( lpae_valid(orig_pte) && entry->p2m.base != orig_pte.p2m.base )
+    if ( p2m_is_valid(orig_pte) &&
+         !mfn_eq(lpae_get_mfn(*entry), lpae_get_mfn(orig_pte)) )
         p2m_free_entry(p2m, orig_pte, level);
 
-    if ( need_iommu(p2m->domain) &&
-         (lpae_valid(orig_pte) || lpae_valid(*entry)) )
-        rc = iommu_iotlb_flush(p2m->domain, gfn_x(sgfn), 1UL << page_order);
+    if ( has_iommu_pt(p2m->domain) &&
+         (lpae_is_valid(orig_pte) || lpae_is_valid(*entry)) )
+    {
+        unsigned int flush_flags = 0;
+
+        if ( lpae_is_valid(orig_pte) )
+            flush_flags |= IOMMU_FLUSHF_modified;
+        if ( lpae_is_valid(*entry) )
+            flush_flags |= IOMMU_FLUSHF_added;
+
+        rc = iommu_iotlb_flush(p2m->domain, _dfn(gfn_x(sgfn)),
+                               1UL << page_order, flush_flags);
+    }
     else
         rc = 0;
 
@@ -1019,6 +1139,164 @@ int p2m_set_entry(struct p2m_domain *p2m,
     }
 
     return rc;
+}
+
+/* Invalidate all entries in the table. The p2m should be write locked. */
+static void p2m_invalidate_table(struct p2m_domain *p2m, mfn_t mfn)
+{
+    lpae_t *table;
+    unsigned int i;
+
+    ASSERT(p2m_is_write_locked(p2m));
+
+    table = map_domain_page(mfn);
+
+    for ( i = 0; i < LPAE_ENTRIES; i++ )
+    {
+        lpae_t pte = table[i];
+
+        /*
+         * Writing an entry can be expensive because it may involve
+         * cleaning the cache. So avoid updating the entry if the valid
+         * bit is already cleared.
+         */
+        if ( !pte.p2m.valid )
+            continue;
+
+        pte.p2m.valid = 0;
+
+        p2m_write_pte(&table[i], pte, p2m->clean_pte);
+    }
+
+    unmap_domain_page(table);
+
+    p2m->need_flush = true;
+}
+
+/*
+ * Invalidate all entries in the root page-tables. This is
+ * useful to get fault on entry and do an action.
+ */
+void p2m_invalidate_root(struct p2m_domain *p2m)
+{
+    unsigned int i;
+
+    p2m_write_lock(p2m);
+
+    for ( i = 0; i < P2M_ROOT_LEVEL; i++ )
+        p2m_invalidate_table(p2m, page_to_mfn(p2m->root + i));
+
+    p2m_write_unlock(p2m);
+}
+
+/*
+ * Resolve any translation fault due to change in the p2m. This
+ * includes break-before-make and valid bit cleared.
+ */
+bool p2m_resolve_translation_fault(struct domain *d, gfn_t gfn)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+    unsigned int level = 0;
+    bool resolved = false;
+    lpae_t entry, *table;
+    paddr_t addr = gfn_to_gaddr(gfn);
+
+    /* Convenience aliases */
+    const unsigned int offsets[4] = {
+        zeroeth_table_offset(addr),
+        first_table_offset(addr),
+        second_table_offset(addr),
+        third_table_offset(addr)
+    };
+
+    p2m_write_lock(p2m);
+
+    /* This gfn is higher than the highest the p2m map currently holds */
+    if ( gfn_x(gfn) > gfn_x(p2m->max_mapped_gfn) )
+        goto out;
+
+    table = p2m_get_root_pointer(p2m, gfn);
+    /*
+     * The table should always be non-NULL because the gfn is below
+     * p2m->max_mapped_gfn and the root table pages are always present.
+     */
+    BUG_ON(table == NULL);
+
+    /*
+     * Go down the page-tables until an entry has the valid bit unset or
+     * a block/page entry has been hit.
+     */
+    for ( level = P2M_ROOT_LEVEL; level <= 3; level++ )
+    {
+        int rc;
+
+        entry = table[offsets[level]];
+
+        if ( level == 3 )
+            break;
+
+        /* Stop as soon as we hit an entry with the valid bit unset. */
+        if ( !lpae_is_valid(entry) )
+            break;
+
+        rc = p2m_next_level(p2m, true, level, &table, offsets[level]);
+        if ( rc == GUEST_TABLE_MAP_FAILED )
+            goto out_unmap;
+        else if ( rc != GUEST_TABLE_NORMAL_PAGE )
+            break;
+    }
+
+    /*
+     * If the valid bit of the entry is set, it means someone was playing with
+     * the Stage-2 page table. Nothing to do and mark the fault as resolved.
+     */
+    if ( lpae_is_valid(entry) )
+    {
+        resolved = true;
+        goto out_unmap;
+    }
+
+    /*
+     * The valid bit is unset. If the entry is still not valid then the fault
+     * cannot be resolved, exit and report it.
+     */
+    if ( !p2m_is_valid(entry) )
+        goto out_unmap;
+
+    /*
+     * Now we have an entry with valid bit unset, but still valid from
+     * the P2M point of view.
+     *
+     * If an entry is pointing to a table, each entry of the table will
+     * have there valid bit cleared. This allows a function to clear the
+     * full p2m with just a couple of write. The valid bit will then be
+     * propagated on the fault.
+     * If an entry is pointing to a block/page, no work to do for now.
+     */
+    if ( lpae_is_table(entry, level) )
+        p2m_invalidate_table(p2m, lpae_get_mfn(entry));
+
+    /*
+     * Now that the work on the entry is done, set the valid bit to prevent
+     * another fault on that entry.
+     */
+    resolved = true;
+    entry.p2m.valid = 1;
+
+    p2m_write_pte(table + offsets[level], entry, p2m->clean_pte);
+
+    /*
+     * No need to flush the TLBs as the modified entry had the valid bit
+     * unset.
+     */
+
+out_unmap:
+    unmap_domain_page(table);
+
+out:
+    p2m_write_unlock(p2m);
+
+    return resolved;
 }
 
 static inline int p2m_insert_mapping(struct domain *d,
@@ -1122,29 +1400,39 @@ int guest_physmap_remove_page(struct domain *d, gfn_t gfn, mfn_t mfn,
     return p2m_remove_mapping(d, gfn, (1 << page_order), mfn);
 }
 
-static int p2m_alloc_table(struct domain *d)
+static struct page_info *p2m_allocate_root(void)
 {
-    struct p2m_domain *p2m = p2m_get_hostp2m(d);
     struct page_info *page;
     unsigned int i;
 
     page = alloc_domheap_pages(NULL, P2M_ROOT_ORDER, 0);
     if ( page == NULL )
-        return -ENOMEM;
+        return NULL;
 
     /* Clear both first level pages */
     for ( i = 0; i < P2M_ROOT_PAGES; i++ )
         clear_and_clean_page(page + i);
 
-    p2m->root = page;
+    return page;
+}
 
-    p2m->vttbr = page_to_maddr(p2m->root) | ((uint64_t)p2m->vmid << 48);
+static int p2m_alloc_table(struct domain *d)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+
+    p2m->root = p2m_allocate_root();
+    if ( !p2m->root )
+        return -ENOMEM;
+
+    p2m->vttbr = generate_vttbr(p2m->vmid, page_to_mfn(p2m->root));
 
     /*
      * Make sure that all TLBs corresponding to the new VMID are flushed
      * before using it
      */
-    p2m_flush_tlb(p2m);
+    p2m_write_lock(p2m);
+    p2m_force_tlb_flush_sync(p2m);
+    p2m_write_unlock(p2m);
 
     return 0;
 }
@@ -1168,7 +1456,7 @@ static void p2m_vmid_allocator_init(void)
     vmid_mask = xzalloc_array(unsigned long, BITS_TO_LONGS(MAX_VMID));
 
     if ( !vmid_mask )
-        panic("Could not allocate VMID bitmap space");
+        panic("Could not allocate VMID bitmap space\n");
 
     set_bit(INVALID_VMID, vmid_mask);
 }
@@ -1313,7 +1601,7 @@ int relinquish_p2m_mapping(struct domain *d)
     for ( ; gfn_x(start) < gfn_x(end);
           start = gfn_next_boundary(start, order) )
     {
-        mfn_t mfn = p2m_get_entry(p2m, start, &t, NULL, &order);
+        mfn_t mfn = p2m_get_entry(p2m, start, &t, NULL, &order, NULL);
 
         count++;
         /*
@@ -1356,13 +1644,17 @@ int relinquish_p2m_mapping(struct domain *d)
     return rc;
 }
 
-int p2m_cache_flush(struct domain *d, gfn_t start, unsigned long nr)
+int p2m_cache_flush_range(struct domain *d, gfn_t *pstart, gfn_t end)
 {
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
-    gfn_t end = gfn_add(start, nr);
-    gfn_t next_gfn;
+    gfn_t next_block_gfn;
+    gfn_t start = *pstart;
+    mfn_t mfn = INVALID_MFN;
     p2m_type_t t;
     unsigned int order;
+    int rc = 0;
+    /* Counter for preemption */
+    unsigned short count = 0;
 
     /*
      * The operation cache flush will invalidate the RAM assigned to the
@@ -1375,31 +1667,170 @@ int p2m_cache_flush(struct domain *d, gfn_t start, unsigned long nr)
     start = gfn_max(start, p2m->lowest_mapped_gfn);
     end = gfn_min(end, p2m->max_mapped_gfn);
 
-    for ( ; gfn_x(start) < gfn_x(end); start = next_gfn )
+    next_block_gfn = start;
+
+    while ( gfn_x(start) < gfn_x(end) )
     {
-        mfn_t mfn = p2m_get_entry(p2m, start, &t, NULL, &order);
-
-        next_gfn = gfn_next_boundary(start, order);
-
-        /* Skip hole and non-RAM page */
-        if ( mfn_eq(mfn, INVALID_MFN) || !p2m_is_ram(t) )
-            continue;
-
-        /* XXX: Implement preemption */
-        while ( gfn_x(start) < gfn_x(next_gfn) )
+       /*
+         * Cleaning the cache for the P2M may take a long time. So we
+         * need to be able to preempt. We will arbitrarily preempt every
+         * time count reach 512 or above.
+         *
+         * The count will be incremented by:
+         *  - 1 on region skipped
+         *  - 10 for each page requiring a flush
+         */
+        if ( count >= 512 )
         {
-            flush_page_to_ram(mfn_x(mfn), false);
-
-            start = gfn_add(start, 1);
-            mfn = mfn_add(mfn, 1);
+            if ( softirq_pending(smp_processor_id()) )
+            {
+                rc = -ERESTART;
+                break;
+            }
+            count = 0;
         }
+
+        /*
+         * We want to flush page by page as:
+         *  - it may not be possible to map the full block (can be up to 1GB)
+         *    in Xen memory
+         *  - we may want to do fine grain preemption as flushing multiple
+         *    page in one go may take a long time
+         *
+         * As p2m_get_entry is able to return the size of the mapping
+         * in the p2m, it is pointless to execute it for each page.
+         *
+         * We can optimize it by tracking the gfn of the next
+         * block. So we will only call p2m_get_entry for each block (can
+         * be up to 1GB).
+         */
+        if ( gfn_eq(start, next_block_gfn) )
+        {
+            bool valid;
+
+            mfn = p2m_get_entry(p2m, start, &t, NULL, &order, &valid);
+            next_block_gfn = gfn_next_boundary(start, order);
+
+            if ( mfn_eq(mfn, INVALID_MFN) || !p2m_is_any_ram(t) || !valid )
+            {
+                count++;
+                start = next_block_gfn;
+                continue;
+            }
+        }
+
+        count += 10;
+
+        flush_page_to_ram(mfn_x(mfn), false);
+
+        start = gfn_add(start, 1);
+        mfn = mfn_add(mfn, 1);
     }
 
-    invalidate_icache();
+    if ( rc != -ERESTART )
+        invalidate_icache();
 
     p2m_read_unlock(p2m);
 
-    return 0;
+    *pstart = start;
+
+    return rc;
+}
+
+/*
+ * Clean & invalidate RAM associated to the guest vCPU.
+ *
+ * The function can only work with the current vCPU and should be called
+ * with IRQ enabled as the vCPU could get preempted.
+ */
+void p2m_flush_vm(struct vcpu *v)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(v->domain);
+    int rc;
+    gfn_t start = _gfn(0);
+
+    ASSERT(v == current);
+    ASSERT(local_irq_is_enabled());
+    ASSERT(v->arch.need_flush_to_ram);
+
+    do
+    {
+        rc = p2m_cache_flush_range(v->domain, &start, _gfn(ULONG_MAX));
+        if ( rc == -ERESTART )
+            do_softirq();
+    } while ( rc == -ERESTART );
+
+    if ( rc != 0 )
+        gprintk(XENLOG_WARNING,
+                "P2M has not been correctly cleaned (rc = %d)\n",
+                rc);
+
+    /*
+     * Invalidate the p2m to track which page was modified by the guest
+     * between call of p2m_flush_vm().
+     */
+    p2m_invalidate_root(p2m);
+
+    v->arch.need_flush_to_ram = false;
+}
+
+/*
+ * See note at ARMv7 ARM B1.14.4 (DDI 0406C.c) (TL;DR: S/W ops are not
+ * easily virtualized).
+ *
+ * Main problems:
+ *  - S/W ops are local to a CPU (not broadcast)
+ *  - We have line migration behind our back (speculation)
+ *  - System caches don't support S/W at all (damn!)
+ *
+ * In the face of the above, the best we can do is to try and convert
+ * S/W ops to VA ops. Because the guest is not allowed to infer the S/W
+ * to PA mapping, it can only use S/W to nuke the whole cache, which is
+ * rather a good thing for us.
+ *
+ * Also, it is only used when turning caches on/off ("The expected
+ * usage of the cache maintenance instructions that operate by set/way
+ * is associated with the powerdown and powerup of caches, if this is
+ * required by the implementation.").
+ *
+ * We use the following policy:
+ *  - If we trap a S/W operation, we enabled VM trapping to detect
+ *  caches being turned on/off, and do a full clean.
+ *
+ *  - We flush the caches on both caches being turned on and off.
+ *
+ *  - Once the caches are enabled, we stop trapping VM ops.
+ */
+void p2m_set_way_flush(struct vcpu *v)
+{
+    /* This function can only work with the current vCPU. */
+    ASSERT(v == current);
+
+    if ( !(v->arch.hcr_el2 & HCR_TVM) )
+    {
+        v->arch.need_flush_to_ram = true;
+        vcpu_hcr_set_flags(v, HCR_TVM);
+    }
+}
+
+void p2m_toggle_cache(struct vcpu *v, bool was_enabled)
+{
+    bool now_enabled = vcpu_has_cache_enabled(v);
+
+    /* This function can only work with the current vCPU. */
+    ASSERT(v == current);
+
+    /*
+     * If switching the MMU+caches on, need to invalidate the caches.
+     * If switching it off, need to clean the caches.
+     * Clean + invalidate does the trick always.
+     */
+    if ( was_enabled != now_enabled )
+        v->arch.need_flush_to_ram = true;
+
+    /* Caches are now on, stop trapping VM ops (until a S/W op) */
+    if ( now_enabled )
+        vcpu_hcr_clear_flags(v, HCR_TVM);
 }
 
 mfn_t gfn_to_mfn(struct domain *d, gfn_t gfn)
@@ -1415,6 +1846,8 @@ struct page_info *get_page_from_gva(struct vcpu *v, vaddr_t va,
     struct page_info *page = NULL;
     paddr_t maddr = 0;
     uint64_t par;
+    mfn_t mfn;
+    p2m_type_t t;
 
     /*
      * XXX: To support a different vCPU, we would need to load the
@@ -1423,49 +1856,121 @@ struct page_info *get_page_from_gva(struct vcpu *v, vaddr_t va,
     if ( v != current )
         return NULL;
 
+    /*
+     * The lock is here to protect us against the break-before-make
+     * sequence used when updating the entry.
+     */
     p2m_read_lock(p2m);
-
     par = gvirt_to_maddr(va, &maddr, flags);
+    p2m_read_unlock(p2m);
 
+    /*
+     * gvirt_to_maddr may fail if the entry does not have the valid bit
+     * set. Fallback to the second method:
+     *  1) Translate the VA to IPA using software lookup -> Stage-1 page-table
+     *  may not be accessible because the stage-2 entries may have valid
+     *  bit unset.
+     *  2) Software lookup of the MFN
+     *
+     * Note that when memaccess is enabled, we instead call directly
+     * p2m_mem_access_check_and_get_page(...). Because the function is a
+     * a variant of the methods described above, it will be able to
+     * handle entries with valid bit unset.
+     *
+     * TODO: Integrate more nicely memaccess with the rest of the
+     * function.
+     * TODO: Use the fault error in PAR_EL1 to avoid pointless
+     *  translation.
+     */
     if ( par )
     {
-        dprintk(XENLOG_G_DEBUG,
-                "%pv: gvirt_to_maddr failed va=%#"PRIvaddr" flags=0x%lx par=%#"PRIx64"\n",
-                v, va, flags, par);
-        goto err;
-    }
+        paddr_t ipa;
+        unsigned int s1_perms;
 
-    if ( !mfn_valid(maddr_to_mfn(maddr)) )
+        /*
+         * When memaccess is enabled, the translation GVA to MADDR may
+         * have failed because of a permission fault.
+         */
+        if ( p2m->mem_access_enabled )
+            return p2m_mem_access_check_and_get_page(va, flags, v);
+
+        /*
+         * The software stage-1 table walk can still fail, e.g, if the
+         * GVA is not mapped.
+         */
+        if ( !guest_walk_tables(v, va, &ipa, &s1_perms) )
+        {
+            dprintk(XENLOG_G_DEBUG,
+                    "%pv: Failed to walk page-table va %#"PRIvaddr"\n", v, va);
+            return NULL;
+        }
+
+        mfn = p2m_lookup(d, gaddr_to_gfn(ipa), &t);
+        if ( mfn_eq(INVALID_MFN, mfn) || !p2m_is_ram(t) )
+            return NULL;
+
+        /*
+         * Check permission that are assumed by the caller. For instance
+         * in case of guestcopy, the caller assumes that the translated
+         * page can be accessed with the requested permissions. If this
+         * is not the case, we should fail.
+         *
+         * Please note that we do not check for the GV2M_EXEC
+         * permission. This is fine because the hardware-based translation
+         * instruction does not test for execute permissions.
+         */
+        if ( (flags & GV2M_WRITE) && !(s1_perms & GV2M_WRITE) )
+            return NULL;
+
+        if ( (flags & GV2M_WRITE) && t != p2m_ram_rw )
+            return NULL;
+    }
+    else
+        mfn = maddr_to_mfn(maddr);
+
+    if ( !mfn_valid(mfn) )
     {
         dprintk(XENLOG_G_DEBUG, "%pv: Invalid MFN %#"PRI_mfn"\n",
-                v, mfn_x(maddr_to_mfn(maddr)));
-        goto err;
+                v, mfn_x(mfn));
+        return NULL;
     }
 
-    page = mfn_to_page(maddr_to_mfn(maddr));
+    page = mfn_to_page(mfn);
     ASSERT(page);
 
     if ( unlikely(!get_page(page, d)) )
     {
         dprintk(XENLOG_G_DEBUG, "%pv: Failing to acquire the MFN %#"PRI_mfn"\n",
                 v, mfn_x(maddr_to_mfn(maddr)));
-        page = NULL;
+        return NULL;
     }
-
-err:
-    if ( !page && p2m->mem_access_enabled )
-        page = p2m_mem_access_check_and_get_page(va, flags, v);
-
-    p2m_read_unlock(p2m);
 
     return page;
 }
 
-static void __init setup_virt_paging_one(void *data)
+/* VTCR value to be configured by all CPUs. Set only once by the boot CPU */
+static uint32_t __read_mostly vtcr;
+
+static void setup_virt_paging_one(void *data)
 {
-    unsigned long val = (unsigned long)data;
-    WRITE_SYSREG32(val, VTCR_EL2);
-    isb();
+    WRITE_SYSREG32(vtcr, VTCR_EL2);
+
+    /*
+     * ARM64_WORKAROUND_AT_SPECULATE: We want to keep the TLBs free from
+     * entries related to EL1/EL0 translation regime until a guest vCPU
+     * is running. For that, we need to set-up VTTBR to point to an empty
+     * page-table and turn on stage-2 translation. The TLB entries
+     * associated with EL1/EL0 translation regime will also be flushed in case
+     * an AT instruction was speculated before hand.
+     */
+    if ( cpus_have_cap(ARM64_WORKAROUND_AT_SPECULATE) )
+    {
+        WRITE_SYSREG64(generate_vttbr(INVALID_VMID, empty_root_mfn), VTTBR_EL2);
+        WRITE_SYSREG(READ_SYSREG(HCR_EL2) | HCR_VM, HCR_EL2);
+        isb();
+
+        flush_tlb_all_local();
+    }
 }
 
 void __init setup_virt_paging(void)
@@ -1548,9 +2053,64 @@ void __init setup_virt_paging(void)
 
     /* It is not allowed to concatenate a level zero root */
     BUG_ON( P2M_ROOT_LEVEL == 0 && P2M_ROOT_ORDER > 0 );
-    setup_virt_paging_one((void *)val);
-    smp_call_function(setup_virt_paging_one, (void *)val, 1);
+    vtcr = val;
+
+    /*
+     * ARM64_WORKAROUND_AT_SPECULATE requires to allocate root table
+     * with all entries zeroed.
+     */
+    if ( cpus_have_cap(ARM64_WORKAROUND_AT_SPECULATE) )
+    {
+        struct page_info *root;
+
+        root = p2m_allocate_root();
+        if ( !root )
+            panic("Unable to allocate root table for ARM64_WORKAROUND_AT_SPECULATE\n");
+
+        empty_root_mfn = page_to_mfn(root);
+    }
+
+    setup_virt_paging_one(NULL);
+    smp_call_function(setup_virt_paging_one, NULL, 1);
 }
+
+static int cpu_virt_paging_callback(struct notifier_block *nfb,
+                                    unsigned long action,
+                                    void *hcpu)
+{
+    switch ( action )
+    {
+    case CPU_STARTING:
+        ASSERT(system_state != SYS_STATE_boot);
+        setup_virt_paging_one(NULL);
+        break;
+    default:
+        break;
+    }
+
+    return NOTIFY_DONE;
+}
+
+static struct notifier_block cpu_virt_paging_nfb = {
+    .notifier_call = cpu_virt_paging_callback,
+};
+
+static int __init cpu_virt_paging_init(void)
+{
+    register_cpu_notifier(&cpu_virt_paging_nfb);
+
+    return 0;
+}
+/*
+ * Initialization of the notifier has to be done at init rather than presmp_init
+ * phase because: the registered notifier is used to setup virtual paging for
+ * non-boot CPUs after the initial virtual paging for all CPUs is already setup,
+ * i.e. when a non-boot CPU is hotplugged after the system has booted. In other
+ * words, the notifier should be registered after the virtual paging is
+ * initially setup (setup_virt_paging() is called from start_xen()). This is
+ * required because vtcr config value has to be set before a notifier can fire.
+ */
+__initcall(cpu_virt_paging_init);
 
 /*
  * Local variables:

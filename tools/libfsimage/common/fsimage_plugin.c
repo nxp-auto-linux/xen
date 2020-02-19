@@ -29,7 +29,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 
-#include "fsimage_plugin.h"
+#include "xenfsimage_plugin.h"
 #include "fsimage_priv.h"
 
 static fsi_plugin_t *plugins;
@@ -121,7 +121,7 @@ fail:
 
 static int load_plugins(void)
 {
-	const char *fsdir = getenv("FSIMAGE_FSDIR");
+	const char *fsdir = getenv("XEN_FSIMAGE_FSDIR");
 	struct dirent *dp = NULL;
 	DIR *dir = NULL;
 	char *tmp = NULL;

@@ -64,28 +64,6 @@ struct nestedvmx {
 /* bit 0-8, and 12 must be 1 */
 #define VMX_ENTRY_CTLS_DEFAULT1		0x11ff
 
-/*
- * Encode of VMX instructions base on Table 24-11 & 24-12 of SDM 3B
- */
-
-enum vmx_regs_enc {
-    VMX_REG_RAX,
-    VMX_REG_RCX,
-    VMX_REG_RDX,
-    VMX_REG_RBX,
-    VMX_REG_RSP,
-    VMX_REG_RBP,
-    VMX_REG_RSI,
-    VMX_REG_RDI,
-    VMX_REG_R8,
-    VMX_REG_R9,
-    VMX_REG_R10,
-    VMX_REG_R11,
-    VMX_REG_R12,
-    VMX_REG_R13,
-    VMX_REG_R14,
-    VMX_REG_R15,
-};
 
 union vmx_inst_info {
     struct {
@@ -115,9 +93,6 @@ bool_t nvmx_intercepts_exception(
 void nvmx_domain_relinquish_resources(struct domain *d);
 
 bool_t nvmx_ept_enabled(struct vcpu *v);
-
-int nvmx_handle_vmxon(struct cpu_user_regs *regs);
-int nvmx_handle_vmxoff(struct cpu_user_regs *regs);
 
 #define EPT_TRANSLATE_SUCCEED       0
 #define EPT_TRANSLATE_VIOLATION     1
@@ -210,18 +185,8 @@ enum vmx_insn_errno set_vvmcs_real_safe(const struct vcpu *, u32 encoding,
    set_vvmcs_real_safe(vcpu, encoding, val) : \
    set_vvmcs_virtual_safe(vcpu_nestedhvm(vcpu).nv_vvmcx, encoding, val))
 
-uint64_t get_shadow_eptp(struct vcpu *v);
-
 void nvmx_destroy_vmcs(struct vcpu *v);
-int nvmx_handle_vmptrld(struct cpu_user_regs *regs);
-int nvmx_handle_vmptrst(struct cpu_user_regs *regs);
-int nvmx_handle_vmclear(struct cpu_user_regs *regs);
-int nvmx_handle_vmread(struct cpu_user_regs *regs);
-int nvmx_handle_vmwrite(struct cpu_user_regs *regs);
-int nvmx_handle_vmresume(struct cpu_user_regs *regs);
-int nvmx_handle_vmlaunch(struct cpu_user_regs *regs);
-int nvmx_handle_invept(struct cpu_user_regs *regs);
-int nvmx_handle_invvpid(struct cpu_user_regs *regs);
+int nvmx_handle_vmx_insn(struct cpu_user_regs *regs, unsigned int exit_reason);
 int nvmx_msr_read_intercept(unsigned int msr,
                                 u64 *msr_content);
 

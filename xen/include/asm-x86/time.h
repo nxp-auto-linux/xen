@@ -12,15 +12,11 @@
  *    2 = guest rdtsc always executed natively (no monotonicity/frequency
  *         guarantees); guest rdtscp emulated at native frequency if
  *         unsupported by h/w, else executed natively
- *    3 = same as 2, except xen manages TSC_AUX register so guest can
- *         determine when a restore/migration has occurred and assumes
- *         guest obtains/uses pvclock-like mechanism to adjust for
- *         monotonicity and frequency changes
+ *    3 = Removed, was PVRDTSCP.
  */
 #define TSC_MODE_DEFAULT          0
 #define TSC_MODE_ALWAYS_EMULATE   1
 #define TSC_MODE_NEVER_EMULATE    2
-#define TSC_MODE_PVRDTSCP         3
 
 typedef u64 cycles_t;
 
@@ -28,7 +24,7 @@ extern bool disable_tsc_sync;
 
 static inline cycles_t get_cycles(void)
 {
-    return rdtsc();
+    return rdtsc_ordered();
 }
 
 unsigned long
@@ -56,13 +52,13 @@ uint64_t ns_to_acpi_pm_tick(uint64_t ns);
 
 uint64_t tsc_ticks2ns(uint64_t ticks);
 
-void pv_soft_rdtsc(struct vcpu *v, struct cpu_user_regs *regs, int rdtscp);
+uint64_t pv_soft_rdtsc(const struct vcpu *v, const struct cpu_user_regs *regs);
 u64 gtime_to_gtsc(struct domain *d, u64 time);
 u64 gtsc_to_gtime(struct domain *d, u64 tsc);
 
-void tsc_set_info(struct domain *d, uint32_t tsc_mode, uint64_t elapsed_nsec,
-                  uint32_t gtsc_khz, uint32_t incarnation);
-   
+int tsc_set_info(struct domain *d, uint32_t tsc_mode, uint64_t elapsed_nsec,
+                 uint32_t gtsc_khz, uint32_t incarnation);
+
 void tsc_get_info(struct domain *d, uint32_t *tsc_mode, uint64_t *elapsed_nsec,
                   uint32_t *gtsc_khz, uint32_t *incarnation);
    

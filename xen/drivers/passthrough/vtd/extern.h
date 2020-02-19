@@ -27,6 +27,7 @@
 
 struct pci_ats_dev;
 extern bool_t rwbf_quirk;
+extern const struct iommu_ops intel_iommu_ops;
 
 void print_iommu_regs(struct acpi_drhd_unit *drhd);
 void print_vtd_entries(struct iommu *iommu, int bus, int devfn, u64 gmfn);
@@ -98,7 +99,5 @@ int __must_check me_wifi_quirk(struct domain *domain,
 void pci_vtd_quirk(const struct pci_dev *);
 bool_t platform_supports_intremap(void);
 bool_t platform_supports_x2apic(void);
-
-void vtd_set_hwdom_mapping(struct domain *d);
 
 #endif // _VTD_EXTERN_H_

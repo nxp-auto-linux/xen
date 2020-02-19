@@ -29,8 +29,6 @@ static keyhandler_fn_t show_handlers, dump_hwdom_registers,
 static irq_keyhandler_fn_t do_toggle_alt_key, dump_registers,
     reboot_machine, run_all_keyhandlers, do_debug_key;
 
-char keyhandler_scratch[1024];
-
 static struct keyhandler {
     union {
         keyhandler_fn_t *fn;
@@ -250,44 +248,14 @@ static void reboot_machine(unsigned char key, struct cpu_user_regs *regs)
     machine_restart(0);
 }
 
-static void cpuset_print(char *set, int size, const cpumask_t *mask)
-{
-    *set++ = '{';
-    set += cpulist_scnprintf(set, size-2, mask);
-    *set++ = '}';
-    *set++ = '\0';
-}
-
-static void nodeset_print(char *set, int size, const nodemask_t *mask)
-{
-    *set++ = '[';
-    set += nodelist_scnprintf(set, size-2, mask);
-    *set++ = ']';
-    *set++ = '\0';
-}
-
-static void periodic_timer_print(char *str, int size, uint64_t period)
-{
-    if ( period == 0 )
-    {
-        strlcpy(str, "No periodic timer", size);
-        return;
-    }
-
-    snprintf(str, size,
-             "%u Hz periodic timer (period %u ms)",
-             1000000000/(int)period, (int)period/1000000);
-}
-
 static void dump_domains(unsigned char key)
 {
     struct domain *d;
     struct vcpu   *v;
     s_time_t       now = NOW();
-#define tmpstr keyhandler_scratch
 
-    printk("'%c' pressed -> dumping domain info (now=0x%X:%08X)\n", key,
-           (u32)(now>>32), (u32)now);
+    printk("'%c' pressed -> dumping domain info (now = %"PRI_stime")\n",
+           key, now);
 
     rcu_read_lock(&domlist_read_lock);
 
@@ -298,14 +266,14 @@ static void dump_domains(unsigned char key)
         process_pending_softirqs();
 
         printk("General information for domain %u:\n", d->domain_id);
-        cpuset_print(tmpstr, sizeof(tmpstr), d->domain_dirty_cpumask);
         printk("    refcnt=%d dying=%d pause_count=%d\n",
                atomic_read(&d->refcnt), d->is_dying,
                atomic_read(&d->pause_count));
         printk("    nr_pages=%d xenheap_pages=%d shared_pages=%u paged_pages=%u "
-               "dirty_cpus=%s max_pages=%u\n", d->tot_pages, d->xenheap_pages,
-                atomic_read(&d->shr_pages), atomic_read(&d->paged_pages),
-                tmpstr, d->max_pages);
+               "dirty_cpus={%*pbl} max_pages=%u\n",
+               d->tot_pages, d->xenheap_pages, atomic_read(&d->shr_pages),
+               atomic_read(&d->paged_pages), nr_cpu_ids,
+               cpumask_bits(d->dirty_cpumask), d->max_pages);
         printk("    handle=%02x%02x%02x%02x-%02x%02x-%02x%02x-"
                "%02x%02x-%02x%02x%02x%02x%02x%02x vm_assist=%08lx\n",
                d->handle[ 0], d->handle[ 1], d->handle[ 2], d->handle[ 3],
@@ -324,8 +292,8 @@ static void dump_domains(unsigned char key)
 
         dump_pageframe_info(d);
 
-        nodeset_print(tmpstr, sizeof(tmpstr), &d->node_affinity);
-        printk("NODE affinity for domain %d: %s\n", d->domain_id, tmpstr);
+        printk("NODE affinity for domain %d: [%*pbl]\n",
+               d->domain_id, MAX_NUMNODES, d->node_affinity.bits);
 
         printk("VCPU information and callbacks for domain %u:\n",
                d->domain_id);
@@ -340,17 +308,22 @@ static void dump_domains(unsigned char key)
                    v->is_running ? 'T':'F', v->poll_evtchn,
                    vcpu_info(v, evtchn_upcall_pending),
                    !vcpu_event_delivery_is_enabled(v));
-            cpuset_print(tmpstr, sizeof(tmpstr), v->vcpu_dirty_cpumask);
-            printk("dirty_cpus=%s\n", tmpstr);
-            cpuset_print(tmpstr, sizeof(tmpstr), v->cpu_hard_affinity);
-            printk("    cpu_hard_affinity=%s ", tmpstr);
-            cpuset_print(tmpstr, sizeof(tmpstr), v->cpu_soft_affinity);
-            printk("cpu_soft_affinity=%s\n", tmpstr);
+            if ( vcpu_cpu_dirty(v) )
+                printk("dirty_cpu=%u", v->dirty_cpu);
+            printk("\n");
+            printk("    cpu_hard_affinity={%*pbl} cpu_soft_affinity={%*pbl}\n",
+                   nr_cpu_ids, cpumask_bits(v->cpu_hard_affinity),
+                   nr_cpu_ids, cpumask_bits(v->cpu_soft_affinity));
             printk("    pause_count=%d pause_flags=%lx\n",
                    atomic_read(&v->pause_count), v->pause_flags);
             arch_dump_vcpu_info(v);
-            periodic_timer_print(tmpstr, sizeof(tmpstr), v->periodic_period);
-            printk("    %s\n", tmpstr);
+
+            if ( v->periodic_period == 0 )
+                printk("No periodic timer\n");
+            else
+                printk("%"PRI_stime" Hz periodic timer (period %"PRI_stime" ms)\n",
+                       1000000000 / v->periodic_period,
+                       v->periodic_period / 1000000);
         }
     }
 
@@ -371,7 +344,6 @@ static void dump_domains(unsigned char key)
     arch_dump_shared_mem_info();
 
     rcu_read_unlock(&domlist_read_lock);
-#undef tmpstr
 }
 
 static cpumask_t read_clocks_cpumask;

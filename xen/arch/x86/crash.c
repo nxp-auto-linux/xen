@@ -146,9 +146,6 @@ static void nmi_shootdown_cpus(void)
     write_atomic((unsigned long *)__va(__pa(&exception_table[TRAP_nmi])),
                  (unsigned long)&do_nmi_crash);
 
-    /* Ensure the new callback function is set before sending out the NMI. */
-    wmb();
-
     smp_send_nmi_allbutself();
 
     msecs = 1000; /* Wait at most a second for the other cpus to stop */
@@ -162,11 +159,8 @@ static void nmi_shootdown_cpus(void)
     if ( cpumask_empty(&waiting_to_crash) )
         printk("Shot down all CPUs\n");
     else
-    {
-        cpulist_scnprintf(keyhandler_scratch, sizeof keyhandler_scratch,
-                          &waiting_to_crash);
-        printk("Failed to shoot down CPUs {%s}\n", keyhandler_scratch);
-    }
+        printk("Failed to shoot down CPUs {%*pbl}\n",
+               nr_cpu_ids, cpumask_bits(&waiting_to_crash));
 
     /* Crash shutdown any IOMMU functionality as the crashdump kernel is not
      * happy when booting if interrupt/dma remapping is still enabled */

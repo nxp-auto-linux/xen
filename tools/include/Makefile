@@ -4,8 +4,9 @@ include $(XEN_ROOT)/tools/Rules.mk
 # Relative to $(XEN_ROOT)/xen/xsm/flask
 FLASK_H_DEPEND := policy/initial_sids
 
-.PHONY: all build
-all build: xen-foreign xen/.dir xen-xsm/.dir
+.PHONY: all all-y build
+all build: all-y xen-foreign xen/.dir xen-xsm/.dir
+all-y:
 
 .PHONY: xen-foreign
 xen-foreign:
@@ -21,7 +22,17 @@ xen/.dir:
 	ln -sf $(addprefix $(XEN_ROOT)/xen/include/xen/,libelf.h elfstructs.h) xen/libelf/
 	ln -s ../xen-foreign xen/foreign
 	ln -sf $(XEN_ROOT)/xen/include/acpi acpi
+ifeq ($(CONFIG_X86),y)
+	ln -sf $(XEN_ROOT)/xen/include/asm-x86 xen/asm
+	mkdir -p xen/lib/x86
+	for f in $(filter-out %autogen.h,$(patsubst $(XEN_ROOT)/xen/include/xen/lib/x86/%,%,Makefile $(wildcard $(XEN_ROOT)/xen/include/xen/lib/x86/*.h))); do \
+		ln -sf $(XEN_ROOT)/xen/include/xen/lib/x86/$$f xen/lib/x86/$$f; \
+	done
+endif
 	touch $@
+
+all-$(CONFIG_X86): xen/.dir
+	$(MAKE) -C xen/lib/x86 all XEN_ROOT=$(XEN_ROOT)
 
 # Not xen/xsm as that clashes with link to
 # $(XEN_ROOT)/xen/include/public/xsm above.

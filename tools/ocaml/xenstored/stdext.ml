@@ -20,7 +20,7 @@ type ('a, 'b) either = Right of 'a | Left of 'b
 (** apply the clean_f function after fct function has been called.
  * Even if fct raises an exception, clean_f is applied
  *)
-let exnhook = ref None 
+let exnhook = ref None
 
 let finally fct clean_f =
 	let result = try
@@ -36,7 +36,7 @@ let finally fct clean_f =
 let may f v =
 	match v with Some x -> Some (f x) | None -> None
 
-(** default value to d if v is none. *) 
+(** default value to d if v is none. *)
 let default d v =
 	match v with Some x -> x | None -> d
 
@@ -85,7 +85,7 @@ let mkdir_safe dir perm =
 let mkdir_rec dir perm =
 	let rec p_mkdir dir =
 		let p_name = Filename.dirname dir in
-		if p_name <> "/" && p_name <> "." 
+		if p_name <> "/" && p_name <> "."
 		then p_mkdir p_name;
 		mkdir_safe dir perm in
 	p_mkdir dir
@@ -100,9 +100,9 @@ let daemonize () =
 
 		begin match Unix.fork () with
 		| 0 ->
-			let nullfd = Unix.openfile "/dev/null" [ Unix.O_WRONLY ] 0 in
+			let nullfd = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0 in
 			begin try
-				Unix.close Unix.stdin;
+				Unix.dup2 nullfd Unix.stdin;
 				Unix.dup2 nullfd Unix.stdout;
 				Unix.dup2 nullfd Unix.stderr;
 			with exn -> Unix.close nullfd; raise exn
@@ -122,7 +122,7 @@ let pidfile_write filename =
 		let pid = Unix.getpid () in
 		let buf = string_of_int pid ^ "\n" in
 		let len = String.length buf in
-		if Unix.write fd buf 0 len <> len 
+		if Unix.write_substring fd buf 0 len <> len
 		then failwith "pidfile_write failed";
 	)
 	(fun () -> Unix.close fd)

@@ -30,6 +30,15 @@
 ?	mc_notifydomain			arch-x86/xen-mca.h
 !	mc_physcpuinfo			arch-x86/xen-mca.h
 ?	page_offline_action		arch-x86/xen-mca.h
+?	argo_addr			argo.h
+!	argo_iov			argo.h
+?	argo_register_ring		argo.h
+?	argo_ring			argo.h
+?	argo_ring_data			argo.h
+?	argo_ring_data_ent		argo.h
+?	argo_ring_message_header	argo.h
+?	argo_send_addr			argo.h
+?	argo_unregister_ring		argo.h
 ?	evtchn_alloc_unbound		event_channel.h
 ?	evtchn_bind_interdomain		event_channel.h
 ?	evtchn_bind_ipi			event_channel.h
@@ -57,6 +66,7 @@
 ?	grant_entry_v2			grant_table.h
 ?	gnttab_swap_grant_ref		grant_table.h
 !	dm_op_buf			hvm/dm_op.h
+?	dm_op_relocate_memory		hvm/dm_op.h
 ?	dm_op_create_ioreq_server	hvm/dm_op.h
 ?	dm_op_destroy_ioreq_server	hvm/dm_op.h
 ?	dm_op_get_ioreq_server_info	hvm/dm_op.h
@@ -64,6 +74,7 @@
 ?	dm_op_inject_msi		hvm/dm_op.h
 ?	dm_op_ioreq_server_range	hvm/dm_op.h
 ?	dm_op_modified_memory		hvm/dm_op.h
+?	dm_op_pin_memory_cacheattr	hvm/dm_op.h
 ?	dm_op_remote_shutdown		hvm/dm_op.h
 ?	dm_op_set_ioreq_server_state	hvm/dm_op.h
 ?	dm_op_set_isa_irq_level		hvm/dm_op.h
@@ -71,6 +82,7 @@
 ?	dm_op_set_pci_intx_level	hvm/dm_op.h
 ?	dm_op_set_pci_link_route	hvm/dm_op.h
 ?	dm_op_track_dirty_vram		hvm/dm_op.h
+!	hvm_altp2m_set_mem_access_multi	hvm/hvm_op.h
 ?	vcpu_hvm_context		hvm/hvm_vcpu.h
 ?	vcpu_hvm_x86_32			hvm/hvm_vcpu.h
 ?	vcpu_hvm_x86_64			hvm/hvm_vcpu.h
@@ -84,6 +96,7 @@
 !	memory_map			memory.h
 !	memory_reservation		memory.h
 !	mem_access_op			memory.h
+!	mem_acquire_resource		memory.h
 !	pod_target			memory.h
 !	remove_from_physmap		memory.h
 !	reserved_device_memory_map	memory.h

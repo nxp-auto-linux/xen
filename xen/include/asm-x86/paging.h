@@ -37,11 +37,14 @@
 
 #define PG_SH_shift    20
 #define PG_HAP_shift   21
+#define PG_SHF_shift   22
 /* We're in one of the shadow modes */
 #ifdef CONFIG_SHADOW_PAGING
 #define PG_SH_enable   (1U << PG_SH_shift)
+#define PG_SH_forced   (1U << PG_SHF_shift)
 #else
 #define PG_SH_enable   0
+#define PG_SH_forced   0
 #endif
 #define PG_HAP_enable  (1U << PG_HAP_shift)
 
@@ -62,6 +65,7 @@
 
 #define paging_mode_enabled(_d)   (!!(_d)->arch.paging.mode)
 #define paging_mode_shadow(_d)    (!!((_d)->arch.paging.mode & PG_SH_enable))
+#define paging_mode_sh_forced(_d) (!!((_d)->arch.paging.mode & PG_SH_forced))
 #define paging_mode_hap(_d)       (!!((_d)->arch.paging.mode & PG_HAP_enable))
 
 #define paging_mode_refcounts(_d) (!!((_d)->arch.paging.mode & PG_refcounts))
@@ -82,14 +86,6 @@ struct sh_emulate_ctxt;
 struct shadow_paging_mode {
 #ifdef CONFIG_SHADOW_PAGING
     void          (*detach_old_tables     )(struct vcpu *v);
-    int           (*x86_emulate_write     )(struct vcpu *v, unsigned long va,
-                                            void *src, u32 bytes,
-                                            struct sh_emulate_ctxt *sh_ctxt);
-    int           (*x86_emulate_cmpxchg   )(struct vcpu *v, unsigned long va,
-                                            unsigned long old, 
-                                            unsigned long new,
-                                            unsigned int bytes,
-                                            struct sh_emulate_ctxt *sh_ctxt);
     bool          (*write_guest_entry     )(struct vcpu *v, intpte_t *p,
                                             intpte_t new, mfn_t gmfn);
     bool          (*cmpxchg_guest_entry   )(struct vcpu *v, intpte_t *p,
@@ -99,7 +95,9 @@ struct shadow_paging_mode {
     void          (*destroy_monitor_table )(struct vcpu *v, mfn_t mmfn);
     int           (*guess_wrmap           )(struct vcpu *v, 
                                             unsigned long vaddr, mfn_t gmfn);
-    void          (*pagetable_dying       )(struct vcpu *v, paddr_t gpa);
+    void          (*pagetable_dying       )(paddr_t gpa);
+    void          (*trace_emul_write_val  )(const void *ptr, unsigned long vaddr,
+                                            const void *src, unsigned int bytes);
 #endif
     /* For outsiders to tell what mode we're in */
     unsigned int shadow_levels;
@@ -112,7 +110,8 @@ struct shadow_paging_mode {
 struct paging_mode {
     int           (*page_fault            )(struct vcpu *v, unsigned long va,
                                             struct cpu_user_regs *regs);
-    bool          (*invlpg                )(struct vcpu *v, unsigned long va);
+    bool          (*invlpg                )(struct vcpu *v,
+                                            unsigned long linear);
     unsigned long (*gva_to_gfn            )(struct vcpu *v,
                                             struct p2m_domain *p2m,
                                             unsigned long va,
@@ -122,9 +121,11 @@ struct paging_mode {
                                             unsigned long cr3,
                                             paddr_t ga, uint32_t *pfec,
                                             unsigned int *page_order);
-    void          (*update_cr3            )(struct vcpu *v, int do_locking);
+    void          (*update_cr3            )(struct vcpu *v, int do_locking,
+                                            bool noflush);
     void          (*update_paging_modes   )(struct vcpu *v);
-    void          (*write_p2m_entry       )(struct domain *d, unsigned long gfn,
+    int           (*write_p2m_entry       )(struct p2m_domain *p2m,
+                                            unsigned long gfn,
                                             l1_pgentry_t *p, l1_pgentry_t new,
                                             unsigned int level);
 
@@ -276,9 +277,9 @@ static inline unsigned long paging_ga_to_gfn_cr3(struct vcpu *v,
 /* Update all the things that are derived from the guest's CR3.
  * Called when the guest changes CR3; the caller can then use v->arch.cr3
  * as the value to load into the host CR3 to schedule this vcpu */
-static inline void paging_update_cr3(struct vcpu *v)
+static inline void paging_update_cr3(struct vcpu *v, bool noflush)
 {
-    paging_get_hostmode(v)->update_cr3(v, 1);
+    paging_get_hostmode(v)->update_cr3(v, 1, noflush);
 }
 
 /* Update all the things that are derived from the guest's CR0/CR3/CR4.
@@ -339,13 +340,15 @@ static inline void safe_write_pte(l1_pgentry_t *p, l1_pgentry_t new)
  * we are writing. */
 struct p2m_domain;
 
-void paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
-                            l1_pgentry_t *p, l1_pgentry_t new,
-                            unsigned int level);
+int paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
+                           l1_pgentry_t *p, l1_pgentry_t new,
+                           unsigned int level);
 
-/* Called from the guest to indicate that the a process is being
- * torn down and its pagetables will soon be discarded */
-void pagetable_dying(struct domain *d, paddr_t gpa);
+/*
+ * Called from the guest to indicate that the a process is being
+ * torn down and its pagetables will soon be discarded.
+ */
+void pagetable_dying(paddr_t gpa);
 
 /* Print paging-assistance info to the console */
 void paging_dump_domain_info(struct domain *d);
@@ -369,7 +372,8 @@ static inline unsigned int paging_max_paddr_bits(const struct domain *d)
 {
     unsigned int bits = paging_mode_hap(d) ? hap_paddr_bits : paddr_bits;
 
-    if ( !IS_ENABLED(BIGMEM) && paging_mode_shadow(d) && !is_pv_domain(d) )
+    if ( !IS_ENABLED(CONFIG_BIGMEM) && paging_mode_shadow(d) &&
+         !is_pv_domain(d) )
     {
         /* Shadowed superpages store GFNs in 32-bit page_info fields. */
         bits = min(bits, 32U + PAGE_SHIFT);

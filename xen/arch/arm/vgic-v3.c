@@ -58,21 +58,18 @@ static struct {
     /* Re-distributor regions */
     unsigned int nr_rdist_regions;
     const struct rdist_region *regions;
-    uint32_t rdist_stride; /* Re-distributor stride */
     unsigned int intid_bits;  /* Number of interrupt ID bits */
 } vgic_v3_hw;
 
 void vgic_v3_setup_hw(paddr_t dbase,
                       unsigned int nr_rdist_regions,
                       const struct rdist_region *regions,
-                      uint32_t rdist_stride,
                       unsigned int intid_bits)
 {
     vgic_v3_hw.enabled = true;
     vgic_v3_hw.dbase = dbase;
     vgic_v3_hw.nr_rdist_regions = nr_rdist_regions;
     vgic_v3_hw.regions = regions;
-    vgic_v3_hw.rdist_stride = rdist_stride;
     vgic_v3_hw.intid_bits = intid_bits;
 }
 
@@ -328,7 +325,6 @@ static int __vgic_v3_rdistr_rd_mmio_read(struct vcpu *v, mmio_info_t *info,
 bad_width:
     printk(XENLOG_G_ERR "%pv vGICR: bad read width %d r%d offset %#08x\n",
            v, dabt.size, dabt.reg, gicr_reg);
-    domain_crash_synchronous();
     return 0;
 
 read_as_zero_64:
@@ -648,7 +644,6 @@ bad_width:
     printk(XENLOG_G_ERR
           "%pv: vGICR: bad write width %d r%d=%"PRIregister" offset %#08x\n",
           v, dabt.size, dabt.reg, r, gicr_reg);
-    domain_crash_synchronous();
     return 0;
 
 write_ignore_64:
@@ -760,7 +755,6 @@ static int __vgic_v3_distr_common_mmio_read(const char *name, struct vcpu *v,
 bad_width:
     printk(XENLOG_G_ERR "%pv: %s: bad read width %d r%d offset %#08x\n",
            v, name, dabt.size, dabt.reg, reg);
-    domain_crash_synchronous();
     return 0;
 
 read_as_zero:
@@ -876,7 +870,6 @@ bad_width:
     printk(XENLOG_G_ERR
            "%pv: %s: bad write width %d r%d=%"PRIregister" offset %#08x\n",
            v, name, dabt.size, dabt.reg, r, reg);
-    domain_crash_synchronous();
     return 0;
 
 write_ignore_32:
@@ -937,7 +930,6 @@ static int vgic_v3_rdistr_sgi_mmio_read(struct vcpu *v, mmio_info_t *info,
 bad_width:
     printk(XENLOG_G_ERR "%pv: vGICR: SGI: bad read width %d r%d offset %#08x\n",
            v, dabt.size, dabt.reg, gicr_reg);
-    domain_crash_synchronous();
     return 0;
 
 read_as_zero_32:
@@ -1017,7 +1009,6 @@ bad_width:
     printk(XENLOG_G_ERR
            "%pv: vGICR: SGI: bad write width %d r%d=%"PRIregister" offset %#08x\n",
            v, dabt.size, dabt.reg, r, gicr_reg);
-    domain_crash_synchronous();
     return 0;
 
 write_ignore_32:
@@ -1030,10 +1021,9 @@ static struct vcpu *get_vcpu_from_rdist(struct domain *d,
     paddr_t gpa, uint32_t *offset)
 {
     struct vcpu *v;
-    uint32_t stride = d->arch.vgic.rdist_stride;
     unsigned int vcpu_id;
 
-    vcpu_id = region->first_cpu + ((gpa - region->base) / stride);
+    vcpu_id = region->first_cpu + ((gpa - region->base) / GICV3_GICR_SIZE);
     if ( unlikely(vcpu_id >= d->max_vcpus) )
         return NULL;
 
@@ -1268,7 +1258,6 @@ static int vgic_v3_distr_mmio_read(struct vcpu *v, mmio_info_t *info,
 bad_width:
     printk(XENLOG_G_ERR "%pv: vGICD: bad read width %d r%d offset %#08x\n",
            v, dabt.size, dabt.reg, gicd_reg);
-    domain_crash_synchronous();
     return 0;
 
 read_as_zero_32:
@@ -1456,7 +1445,6 @@ bad_width:
     printk(XENLOG_G_ERR
            "%pv: vGICD: bad write width %d r%d=%"PRIregister" offset %#08x\n",
            v, dabt.size, dabt.reg, r, gicd_reg);
-    domain_crash_synchronous();
     return 0;
 
 write_ignore_32:
@@ -1486,6 +1474,7 @@ static bool vgic_v3_to_sgi(struct vcpu *v, register_t sgir)
     enum gic_sgi_mode sgi_mode;
     struct sgi_target target;
 
+    sgi_target_init(&target);
     irqmode = (sgir >> ICH_SGI_IRQMODE_SHIFT) & ICH_SGI_IRQMODE_MASK;
     virq = (sgir >> ICH_SGI_IRQ_SHIFT ) & ICH_SGI_IRQ_MASK;
 
@@ -1493,7 +1482,6 @@ static bool vgic_v3_to_sgi(struct vcpu *v, register_t sgir)
     switch ( irqmode )
     {
     case ICH_SGI_TARGET_LIST:
-        sgi_target_init(&target);
         /* We assume that only AFF1 is used in ICC_SGI1R_EL1. */
         target.aff1 = (sgir >> ICH_SGI_AFFINITY_LEVEL(1)) & ICH_SGI_AFFx_MASK;
         target.list = sgir & ICH_SGI_TARGETLIST_MASK;
@@ -1594,7 +1582,6 @@ static int vgic_v3_vcpu_init(struct vcpu *v)
 
     /* Convenient alias */
     struct domain *d = v->domain;
-    uint32_t rdist_stride = d->arch.vgic.rdist_stride;
 
     /*
      * Find the region where the re-distributor lives. For this purpose,
@@ -1610,11 +1597,11 @@ static int vgic_v3_vcpu_init(struct vcpu *v)
 
     /* Get the base address of the redistributor */
     rdist_base = region->base;
-    rdist_base += (v->vcpu_id - region->first_cpu) * rdist_stride;
+    rdist_base += (v->vcpu_id - region->first_cpu) * GICV3_GICR_SIZE;
 
     /* Check if a valid region was found for the re-distributor */
     if ( (rdist_base < region->base) ||
-         ((rdist_base + rdist_stride) > (region->base + region->size)) )
+         ((rdist_base + GICV3_GICR_SIZE) > (region->base + region->size)) )
     {
         dprintk(XENLOG_ERR,
                 "d%u: Unable to find a re-distributor for VCPU %u\n",
@@ -1630,7 +1617,7 @@ static int vgic_v3_vcpu_init(struct vcpu *v)
      * VGIC_V3_RDIST_LAST flags.
      * Note that we are assuming max_vcpus will never change.
      */
-    last_cpu = (region->size / rdist_stride) + region->first_cpu - 1;
+    last_cpu = (region->size / GICV3_GICR_SIZE) + region->first_cpu - 1;
 
     if ( v->vcpu_id == last_cpu || (v->vcpu_id == (d->max_vcpus - 1)) )
         v->arch.vgic.flags |= VGIC_V3_RDIST_LAST;
@@ -1638,8 +1625,22 @@ static int vgic_v3_vcpu_init(struct vcpu *v)
     return 0;
 }
 
-static inline unsigned int vgic_v3_rdist_count(struct domain *d)
+/*
+ * Return the maximum number possible of re-distributor regions for
+ * a given domain.
+ */
+static inline unsigned int vgic_v3_max_rdist_count(struct domain *d)
 {
+    /*
+     * Normally there is only one GICv3 redistributor region.
+     * The GICv3 DT binding provisions for multiple regions, since there are
+     * platforms out there which need those (multi-socket systems).
+     * For Dom0 we have to live with the MMIO layout the hardware provides,
+     * so we have to copy the multiple regions - as the first region may not
+     * provide enough space to hold all redistributors we need.
+     * However DomU get a constructed memory map, so we can go with
+     * the architected single redistributor region.
+     */
     return is_hardware_domain(d) ? vgic_v3_hw.nr_rdist_regions :
                GUEST_GICV3_RDIST_REGIONS;
 }
@@ -1650,7 +1651,7 @@ static int vgic_v3_domain_init(struct domain *d)
     int rdist_count, i, ret;
 
     /* Allocate memory for Re-distributor regions */
-    rdist_count = vgic_v3_rdist_count(d);
+    rdist_count = vgic_v3_max_rdist_count(d);
 
     rdist_regions = xzalloc_array(struct vgic_rdist_region, rdist_count);
     if ( !rdist_regions )
@@ -1672,15 +1673,6 @@ static int vgic_v3_domain_init(struct domain *d)
 
         d->arch.vgic.dbase = vgic_v3_hw.dbase;
 
-        d->arch.vgic.rdist_stride = vgic_v3_hw.rdist_stride;
-        /*
-         * If the stride is not set, the default stride for GICv3 is 2 * 64K:
-         *     - first 64k page for Control and Physical LPIs
-         *     - second 64k page for Control and Generation of SGIs
-         */
-        if ( !d->arch.vgic.rdist_stride )
-            d->arch.vgic.rdist_stride = 2 * SZ_64K;
-
         for ( i = 0; i < vgic_v3_hw.nr_rdist_regions; i++ )
         {
             paddr_t size = vgic_v3_hw.regions[i].size;
@@ -1691,8 +1683,19 @@ static int vgic_v3_domain_init(struct domain *d)
             /* Set the first CPU handled by this region */
             d->arch.vgic.rdist_regions[i].first_cpu = first_cpu;
 
-            first_cpu += size / d->arch.vgic.rdist_stride;
+            first_cpu += size / GICV3_GICR_SIZE;
+
+            if ( first_cpu >= d->max_vcpus )
+                break;
         }
+
+        /*
+         * The hardware domain may not use all the re-distributors
+         * regions (e.g when the number of vCPUs does not match the
+         * number of pCPUs). Update the number of regions to avoid
+         * exposing unused region as they will not get emulated.
+         */
+        d->arch.vgic.nr_regions = i + 1;
 
         d->arch.vgic.intid_bits = vgic_v3_hw.intid_bits;
     }
@@ -1700,13 +1703,11 @@ static int vgic_v3_domain_init(struct domain *d)
     {
         d->arch.vgic.dbase = GUEST_GICV3_GICD_BASE;
 
-        /* XXX: Only one Re-distributor region mapped for the guest */
+        /* A single Re-distributor region is mapped for the guest. */
         BUILD_BUG_ON(GUEST_GICV3_RDIST_REGIONS != 1);
 
-        d->arch.vgic.rdist_stride = GUEST_GICV3_RDIST_STRIDE;
-
         /* The first redistributor should contain enough space for all CPUs */
-        BUILD_BUG_ON((GUEST_GICV3_GICR0_SIZE / GUEST_GICV3_RDIST_STRIDE) < MAX_VIRT_CPUS);
+        BUILD_BUG_ON((GUEST_GICV3_GICR0_SIZE / GICV3_GICR_SIZE) < MAX_VIRT_CPUS);
         d->arch.vgic.rdist_regions[0].base = GUEST_GICV3_GICR0_BASE;
         d->arch.vgic.rdist_regions[0].size = GUEST_GICV3_GICR0_SIZE;
         d->arch.vgic.rdist_regions[0].first_cpu = 0;
@@ -1796,11 +1797,6 @@ static const struct vgic_ops v3_ops = {
     .emulate_reg  = vgic_v3_emulate_reg,
     .lpi_to_pending = vgic_v3_lpi_to_pending,
     .lpi_get_priority = vgic_v3_lpi_get_priority,
-    /*
-     * We use both AFF1 and AFF0 in (v)MPIDR. Thus, the max number of CPU
-     * that can be supported is up to 4096(==256*16) in theory.
-     */
-    .max_vcpus = 4096,
 };
 
 int vgic_v3_init(struct domain *d, int *mmio_count)
@@ -1814,7 +1810,7 @@ int vgic_v3_init(struct domain *d, int *mmio_count)
     }
 
     /* GICD region + number of Redistributors */
-    *mmio_count = vgic_v3_rdist_count(d) + 1;
+    *mmio_count = vgic_v3_max_rdist_count(d) + 1;
 
     /* one region per ITS */
     *mmio_count += vgic_v3_its_count(d);

@@ -108,32 +108,34 @@ struct efi_rs_state efi_rs_enter(void)
                                      FIRST_RESERVED_GDT_ENTRY)
         };
 
-        asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+        lgdt(&gdt_desc);
     }
 
-    write_cr3(virt_to_maddr(efi_l4_pgtable));
+    switch_cr3_cr4(virt_to_maddr(efi_l4_pgtable), read_cr4());
 
     return state;
 }
 
 void efi_rs_leave(struct efi_rs_state *state)
 {
+    struct vcpu *curr = current;
+
     if ( !state->cr3 )
         return;
-    write_cr3(state->cr3);
-    if ( is_pv_vcpu(current) && !is_idle_vcpu(current) )
+    switch_cr3_cr4(state->cr3, read_cr4());
+    if ( is_pv_vcpu(curr) && !is_idle_vcpu(curr) )
     {
         struct desc_ptr gdt_desc = {
             .limit = LAST_RESERVED_GDT_BYTE,
-            .base  = GDT_VIRT_START(current)
+            .base  = GDT_VIRT_START(curr)
         };
 
-        asm volatile ( "lgdt %0" : : "m" (gdt_desc) );
+        lgdt(&gdt_desc);
     }
     irq_exit();
     efi_rs_on_cpu = NR_CPUS;
     spin_unlock(&efi_rs_lock);
-    stts();
+    vcpu_restore_fpu_nonlazy(curr, true);
 }
 
 bool efi_rs_using_pgtables(void)

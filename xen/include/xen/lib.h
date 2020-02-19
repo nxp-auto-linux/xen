@@ -66,8 +66,6 @@
 
 #define ROUNDUP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
-#define reserve_bootmem(_p,_l) ((void)0)
-
 struct domain;
 
 void cmdline_parse(const char *cmdline);
@@ -80,6 +78,13 @@ int parse_bool(const char *s, const char *e);
  * returning 0 or 1 for a recognised boolean, or -1 for an error.
  */
 int parse_boolean(const char *name, const char *s, const char *e);
+
+/**
+ * Very similar to strcmp(), but will declare a match if the NUL in 'name'
+ * lines up with comma, colon or semicolon in 'frag'.  Designed for picking
+ * exact string matches out of a delimited command line list.
+ */
+int cmdline_strcmp(const char *frag, const char *name);
 
 /*#define DEBUG_TRACE_DUMP*/
 #ifdef DEBUG_TRACE_DUMP

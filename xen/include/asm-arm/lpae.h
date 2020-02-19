@@ -128,35 +128,36 @@ typedef union {
     lpae_walk_t walk;
 } lpae_t;
 
-static inline bool lpae_valid(lpae_t pte)
+static inline bool lpae_is_valid(lpae_t pte)
 {
     return pte.walk.valid;
 }
 
 /*
- * These two can only be used on L0..L2 ptes because L3 mappings set
- * the table bit and therefore these would return the opposite to what
- * you would expect.
+ * lpae_is_* don't check the valid bit. This gives an opportunity for the
+ * callers to operate on the entry even if they are not valid. For
+ * instance to store information in advance.
  */
-static inline bool lpae_table(lpae_t pte)
+static inline bool lpae_is_table(lpae_t pte, unsigned int level)
 {
-    return lpae_valid(pte) && pte.walk.table;
+    return (level < 3) && pte.walk.table;
 }
 
-static inline bool lpae_mapping(lpae_t pte)
+static inline bool lpae_is_mapping(lpae_t pte, unsigned int level)
 {
-    return lpae_valid(pte) && !pte.walk.table;
+    if ( level == 3 )
+        return pte.walk.table;
+    else
+        return !pte.walk.table;
 }
 
 static inline bool lpae_is_superpage(lpae_t pte, unsigned int level)
 {
-    return (level < 3) && lpae_mapping(pte);
+    return (level < 3) && lpae_is_mapping(pte, level);
 }
 
-static inline bool lpae_is_page(lpae_t pte, unsigned int level)
-{
-    return (level == 3) && lpae_valid(pte) && pte.walk.table;
-}
+#define lpae_get_mfn(pte)    (_mfn((pte).walk.base))
+#define lpae_set_mfn(pte, mfn)  ((pte).walk.base = mfn_x(mfn))
 
 /*
  * AArch64 supports pages with different sizes (4K, 16K, and 64K). To enable

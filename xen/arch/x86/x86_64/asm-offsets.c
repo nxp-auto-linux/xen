@@ -41,55 +41,37 @@ void __dummy__(void)
     OFFSET(UREGS_rdi, struct cpu_user_regs, rdi);
     OFFSET(UREGS_error_code, struct cpu_user_regs, error_code);
     OFFSET(UREGS_entry_vector, struct cpu_user_regs, entry_vector);
-    OFFSET(UREGS_saved_upcall_mask, struct cpu_user_regs, saved_upcall_mask);
     OFFSET(UREGS_rip, struct cpu_user_regs, rip);
     OFFSET(UREGS_cs, struct cpu_user_regs, cs);
     OFFSET(UREGS_eflags, struct cpu_user_regs, rflags);
     OFFSET(UREGS_rsp, struct cpu_user_regs, rsp);
     OFFSET(UREGS_ss, struct cpu_user_regs, ss);
-    OFFSET(UREGS_ds, struct cpu_user_regs, ds);
-    OFFSET(UREGS_es, struct cpu_user_regs, es);
-    OFFSET(UREGS_fs, struct cpu_user_regs, fs);
-    OFFSET(UREGS_gs, struct cpu_user_regs, gs);
     OFFSET(UREGS_kernel_sizeof, struct cpu_user_regs, es);
-    DEFINE(UREGS_user_sizeof, sizeof(struct cpu_user_regs));
     BLANK();
 
-    OFFSET(irq_caps_offset, struct domain, irq_caps);
-    OFFSET(next_in_list_offset, struct domain, next_in_list);
     OFFSET(VCPU_processor, struct vcpu, processor);
     OFFSET(VCPU_domain, struct vcpu, domain);
     OFFSET(VCPU_vcpu_info, struct vcpu, vcpu_info);
-    OFFSET(VCPU_trap_bounce, struct vcpu, arch.pv_vcpu.trap_bounce);
-    OFFSET(VCPU_int80_bounce, struct vcpu, arch.pv_vcpu.int80_bounce);
+    OFFSET(VCPU_trap_bounce, struct vcpu, arch.pv.trap_bounce);
     OFFSET(VCPU_thread_flags, struct vcpu, arch.flags);
-    OFFSET(VCPU_event_addr, struct vcpu, arch.pv_vcpu.event_callback_eip);
-    OFFSET(VCPU_event_sel, struct vcpu, arch.pv_vcpu.event_callback_cs);
-    OFFSET(VCPU_failsafe_addr, struct vcpu,
-           arch.pv_vcpu.failsafe_callback_eip);
-    OFFSET(VCPU_failsafe_sel, struct vcpu,
-           arch.pv_vcpu.failsafe_callback_cs);
-    OFFSET(VCPU_syscall_addr, struct vcpu,
-           arch.pv_vcpu.syscall_callback_eip);
-    OFFSET(VCPU_syscall32_addr, struct vcpu,
-           arch.pv_vcpu.syscall32_callback_eip);
-    OFFSET(VCPU_syscall32_sel, struct vcpu,
-           arch.pv_vcpu.syscall32_callback_cs);
-    OFFSET(VCPU_syscall32_disables_events, struct vcpu,
-           arch.pv_vcpu.syscall32_disables_events);
-    OFFSET(VCPU_sysenter_addr, struct vcpu,
-           arch.pv_vcpu.sysenter_callback_eip);
-    OFFSET(VCPU_sysenter_sel, struct vcpu,
-           arch.pv_vcpu.sysenter_callback_cs);
-    OFFSET(VCPU_sysenter_disables_events, struct vcpu,
-           arch.pv_vcpu.sysenter_disables_events);
-    OFFSET(VCPU_trap_ctxt, struct vcpu, arch.pv_vcpu.trap_ctxt);
-    OFFSET(VCPU_kernel_sp, struct vcpu, arch.pv_vcpu.kernel_sp);
-    OFFSET(VCPU_kernel_ss, struct vcpu, arch.pv_vcpu.kernel_ss);
-    OFFSET(VCPU_iopl, struct vcpu, arch.pv_vcpu.iopl);
+    OFFSET(VCPU_event_addr, struct vcpu, arch.pv.event_callback_eip);
+    OFFSET(VCPU_event_sel, struct vcpu, arch.pv.event_callback_cs);
+    OFFSET(VCPU_syscall_addr, struct vcpu, arch.pv.syscall_callback_eip);
+    OFFSET(VCPU_syscall32_addr, struct vcpu, arch.pv.syscall32_callback_eip);
+    OFFSET(VCPU_syscall32_sel, struct vcpu, arch.pv.syscall32_callback_cs);
+    OFFSET(VCPU_syscall32_disables_events,
+           struct vcpu, arch.pv.syscall32_disables_events);
+    OFFSET(VCPU_sysenter_addr, struct vcpu, arch.pv.sysenter_callback_eip);
+    OFFSET(VCPU_sysenter_sel, struct vcpu, arch.pv.sysenter_callback_cs);
+    OFFSET(VCPU_sysenter_disables_events,
+           struct vcpu, arch.pv.sysenter_disables_events);
+    OFFSET(VCPU_trap_ctxt, struct vcpu, arch.pv.trap_ctxt);
+    OFFSET(VCPU_kernel_sp, struct vcpu, arch.pv.kernel_sp);
+    OFFSET(VCPU_kernel_ss, struct vcpu, arch.pv.kernel_ss);
+    OFFSET(VCPU_iopl, struct vcpu, arch.pv.iopl);
     OFFSET(VCPU_guest_context_flags, struct vcpu, arch.vgc_flags);
     OFFSET(VCPU_cr3, struct vcpu, arch.cr3);
-    OFFSET(VCPU_arch_msr, struct vcpu, arch.msr);
+    OFFSET(VCPU_arch_msrs, struct vcpu, arch.msrs);
     OFFSET(VCPU_nmi_pending, struct vcpu, nmi_pending);
     OFFSET(VCPU_mce_pending, struct vcpu, mce_pending);
     OFFSET(VCPU_nmi_old_mask, struct vcpu, nmi_state.old_mask);
@@ -97,34 +79,26 @@ void __dummy__(void)
     OFFSET(VCPU_async_exception_mask, struct vcpu, async_exception_mask);
     DEFINE(VCPU_TRAP_NMI, VCPU_TRAP_NMI);
     DEFINE(VCPU_TRAP_MCE, VCPU_TRAP_MCE);
-    DEFINE(_VGCF_failsafe_disables_events, _VGCF_failsafe_disables_events);
     DEFINE(_VGCF_syscall_disables_events,  _VGCF_syscall_disables_events);
     BLANK();
 
-    OFFSET(VCPU_svm_vmcb_pa, struct vcpu, arch.hvm_svm.vmcb_pa);
-    OFFSET(VCPU_svm_vmcb, struct vcpu, arch.hvm_svm.vmcb);
-    OFFSET(VCPU_svm_vmcb_in_sync, struct vcpu, arch.hvm_svm.vmcb_in_sync);
+    OFFSET(VCPU_svm_vmcb_pa, struct vcpu, arch.hvm.svm.vmcb_pa);
+    OFFSET(VCPU_svm_vmcb, struct vcpu, arch.hvm.svm.vmcb);
     BLANK();
 
-    OFFSET(VCPU_vmx_launched, struct vcpu, arch.hvm_vmx.launched);
-    OFFSET(VCPU_vmx_realmode, struct vcpu, arch.hvm_vmx.vmx_realmode);
-    OFFSET(VCPU_vmx_emulate, struct vcpu, arch.hvm_vmx.vmx_emulate);
-    OFFSET(VCPU_vm86_seg_mask, struct vcpu, arch.hvm_vmx.vm86_segment_mask);
-    OFFSET(VCPU_hvm_guest_cr2, struct vcpu, arch.hvm_vcpu.guest_cr[2]);
+    OFFSET(VCPU_vmx_launched, struct vcpu, arch.hvm.vmx.launched);
+    OFFSET(VCPU_vmx_realmode, struct vcpu, arch.hvm.vmx.vmx_realmode);
+    OFFSET(VCPU_vmx_emulate, struct vcpu, arch.hvm.vmx.vmx_emulate);
+    OFFSET(VCPU_vm86_seg_mask, struct vcpu, arch.hvm.vmx.vm86_segment_mask);
+    OFFSET(VCPU_hvm_guest_cr2, struct vcpu, arch.hvm.guest_cr[2]);
     BLANK();
 
-    OFFSET(VCPU_nhvm_guestmode, struct vcpu, arch.hvm_vcpu.nvcpu.nv_guestmode);
-    OFFSET(VCPU_nhvm_p2m, struct vcpu, arch.hvm_vcpu.nvcpu.nv_p2m);
-    OFFSET(VCPU_nsvm_hap_enabled, struct vcpu, arch.hvm_vcpu.nvcpu.u.nsvm.ns_hap_enabled);
+    OFFSET(VCPU_nhvm_guestmode, struct vcpu, arch.hvm.nvcpu.nv_guestmode);
+    OFFSET(VCPU_nhvm_p2m, struct vcpu, arch.hvm.nvcpu.nv_p2m);
+    OFFSET(VCPU_nsvm_hap_enabled, struct vcpu, arch.hvm.nvcpu.u.nsvm.ns_hap_enabled);
     BLANK();
 
     OFFSET(DOMAIN_is_32bit_pv, struct domain, arch.is_32bit_pv);
-    BLANK();
-
-    OFFSET(VMCB_rax, struct vmcb_struct, rax);
-    OFFSET(VMCB_rip, struct vmcb_struct, rip);
-    OFFSET(VMCB_rsp, struct vmcb_struct, rsp);
-    OFFSET(VMCB_rflags, struct vmcb_struct, rflags);
     BLANK();
 
     OFFSET(VCPUINFO_upcall_pending, struct vcpu_info, evtchn_upcall_pending);
@@ -136,14 +110,15 @@ void __dummy__(void)
     BLANK();
 
     OFFSET(CPUINFO_guest_cpu_user_regs, struct cpu_info, guest_cpu_user_regs);
-    OFFSET(CPUINFO_processor_id, struct cpu_info, processor_id);
     OFFSET(CPUINFO_current_vcpu, struct cpu_info, current_vcpu);
     OFFSET(CPUINFO_cr4, struct cpu_info, cr4);
     OFFSET(CPUINFO_xen_cr3, struct cpu_info, xen_cr3);
     OFFSET(CPUINFO_pv_cr3, struct cpu_info, pv_cr3);
     OFFSET(CPUINFO_shadow_spec_ctrl, struct cpu_info, shadow_spec_ctrl);
-    OFFSET(CPUINFO_use_shadow_spec_ctrl, struct cpu_info, use_shadow_spec_ctrl);
-    OFFSET(CPUINFO_bti_ist_info, struct cpu_info, bti_ist_info);
+    OFFSET(CPUINFO_xen_spec_ctrl, struct cpu_info, xen_spec_ctrl);
+    OFFSET(CPUINFO_spec_ctrl_flags, struct cpu_info, spec_ctrl_flags);
+    OFFSET(CPUINFO_root_pgt_changed, struct cpu_info, root_pgt_changed);
+    OFFSET(CPUINFO_use_pv_cr3, struct cpu_info, use_pv_cr3);
     DEFINE(CPUINFO_sizeof, sizeof(struct cpu_info));
     BLANK();
 
@@ -159,7 +134,7 @@ void __dummy__(void)
     OFFSET(TRAPBOUNCE_eip, struct trap_bounce, eip);
     BLANK();
 
-    OFFSET(VCPUMSR_spec_ctrl_raw, struct msr_vcpu_policy, spec_ctrl.raw);
+    OFFSET(VCPUMSR_spec_ctrl_raw, struct vcpu_msrs, spec_ctrl.raw);
     BLANK();
 
 #ifdef CONFIG_PERF_COUNTERS
@@ -167,7 +142,7 @@ void __dummy__(void)
     BLANK();
 #endif
 
-    DEFINE(IRQSTAT_shift, LOG_2(sizeof(irq_cpustat_t)));
+    DEFINE(IRQSTAT_shift, ilog2(sizeof(irq_cpustat_t)));
     OFFSET(IRQSTAT_softirq_pending, irq_cpustat_t, __softirq_pending);
     BLANK();
 

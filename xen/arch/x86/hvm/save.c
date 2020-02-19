@@ -39,7 +39,7 @@ void arch_hvm_save(struct domain *d, struct hvm_save_header *hdr)
     hdr->gtsc_khz = d->arch.tsc_khz;
 
     /* Time when saving started */
-    d->arch.hvm_domain.sync_tsc = rdtsc();
+    d->arch.hvm.sync_tsc = rdtsc();
 }
 
 int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
@@ -74,10 +74,10 @@ int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
         hvm_set_rdtsc_exiting(d, 1);
 
     /* Time when restore started  */
-    d->arch.hvm_domain.sync_tsc = rdtsc();
+    d->arch.hvm.sync_tsc = rdtsc();
 
     /* VGA state is not saved/restored, so we nobble the cache. */
-    d->arch.hvm_domain.stdvga.cache = STDVGA_CACHE_DISABLED;
+    d->arch.hvm.stdvga.cache = STDVGA_CACHE_DISABLED;
 
     return 0;
 }
@@ -89,7 +89,7 @@ static struct {
     const char *name;
     size_t size;
     int kind;
-} hvm_sr_handlers[HVM_SAVE_CODE_MAX + 1] = { {NULL, NULL, "<?>"}, };
+} hvm_sr_handlers[HVM_SAVE_CODE_MAX + 1];
 
 /* Init-time function to add entries to that list */
 void __init hvm_register_savevm(uint16_t typecode,
@@ -138,6 +138,7 @@ int hvm_save_one(struct domain *d, unsigned int typecode, unsigned int instance,
     int rv;
     hvm_domain_context_t ctxt = { };
     const struct hvm_save_descriptor *desc;
+    struct vcpu *v;
 
     if ( d->is_dying ||
          typecode > HVM_SAVE_CODE_MAX ||
@@ -145,17 +146,27 @@ int hvm_save_one(struct domain *d, unsigned int typecode, unsigned int instance,
          !hvm_sr_handlers[typecode].save )
         return -EINVAL;
 
+    if ( hvm_sr_handlers[typecode].kind != HVMSR_PER_VCPU )
+        v = d->vcpu[0];
+    else if ( instance >= d->max_vcpus || !d->vcpu[instance] )
+        return -ENOENT;
+    else
+        v = d->vcpu[instance];
     ctxt.size = hvm_sr_handlers[typecode].size;
-    if ( hvm_sr_handlers[typecode].kind == HVMSR_PER_VCPU )
-        ctxt.size *= d->max_vcpus;
     ctxt.data = xmalloc_bytes(ctxt.size);
     if ( !ctxt.data )
         return -ENOMEM;
 
-    if ( (rv = hvm_sr_handlers[typecode].save(d, &ctxt)) != 0 )
+    if ( hvm_sr_handlers[typecode].kind == HVMSR_PER_VCPU )
+        vcpu_pause(v);
+    else
+        domain_pause(d);
+
+    if ( (rv = hvm_sr_handlers[typecode].save(v, &ctxt)) != 0 )
         printk(XENLOG_G_ERR "HVM%d save: failed to save type %"PRIu16" (%d)\n",
                d->domain_id, typecode, rv);
-    else if ( rv = -ENOENT, ctxt.cur >= sizeof(*desc) )
+    else if ( (rv = hvm_sr_handlers[typecode].kind == HVMSR_PER_VCPU ?
+               -ENODATA : -ENOENT), ctxt.cur >= sizeof(*desc) )
     {
         uint32_t off;
 
@@ -183,6 +194,11 @@ int hvm_save_one(struct domain *d, unsigned int typecode, unsigned int instance,
         }
     }
 
+    if ( hvm_sr_handlers[typecode].kind == HVMSR_PER_VCPU )
+        vcpu_unpause(v);
+    else
+        domain_unpause(d);
+
     xfree(ctxt.data);
     return rv;
 }
@@ -192,7 +208,6 @@ int hvm_save(struct domain *d, hvm_domain_context_t *h)
     char *c;
     struct hvm_save_header hdr;
     struct hvm_save_end end;
-    hvm_save_handler handler;
     unsigned int i;
 
     if ( d->is_dying )
@@ -220,17 +235,38 @@ int hvm_save(struct domain *d, hvm_domain_context_t *h)
     /* Save all available kinds of state */
     for ( i = 0; i <= HVM_SAVE_CODE_MAX; i++ )
     {
-        handler = hvm_sr_handlers[i].save;
-        if ( handler != NULL )
+        hvm_save_handler handler = hvm_sr_handlers[i].save;
+
+        if ( !handler )
+            continue;
+
+        if ( hvm_sr_handlers[i].kind == HVMSR_PER_VCPU )
         {
-            printk(XENLOG_G_INFO "HVM%d save: %s\n",
+            struct vcpu *v;
+
+            for_each_vcpu ( d, v )
+            {
+                printk(XENLOG_G_INFO "HVM %pv save: %s\n",
+                       v, hvm_sr_handlers[i].name);
+                if ( handler(v, h) != 0 )
+                {
+                    printk(XENLOG_G_ERR
+                           "HVM %pv save: failed to save type %"PRIu16"\n",
+                           v, i);
+                    return -ENODATA;
+                }
+            }
+        }
+        else
+        {
+            printk(XENLOG_G_INFO "HVM d%d save: %s\n",
                    d->domain_id, hvm_sr_handlers[i].name);
-            if ( handler(d, h) != 0 )
+            if ( handler(d->vcpu[0], h) != 0 )
             {
                 printk(XENLOG_G_ERR
-                       "HVM%d save: failed to save type %"PRIu16"\n",
+                       "HVM d%d save: failed to save type %"PRIu16"\n",
                        d->domain_id, i);
-                return -EFAULT;
+                return -ENODATA;
             }
         }
     }
@@ -268,7 +304,7 @@ int hvm_load(struct domain *d, hvm_domain_context_t *h)
 
     /* Down all the vcpus: we only re-enable the ones that had state saved. */
     for_each_vcpu(d, v)
-        if ( test_and_set_bit(_VPF_down, &v->pause_flags) )
+        if ( !test_and_set_bit(_VPF_down, &v->pause_flags) )
             vcpu_sleep_nosync(v);
 
     for ( ; ; )

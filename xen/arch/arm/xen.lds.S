@@ -5,7 +5,6 @@
 #include <xen/cache.h>
 #include <asm/page.h>
 #include <asm/percpu.h>
-#include <asm/arm64/image.h>
 #undef ENTRY
 #undef ALIGN
 
@@ -66,6 +65,10 @@ SECTIONS
        __param_start = .;
        *(.data.param)
        __param_end = .;
+
+       __proc_info_start = .;
+       *(.proc.info)
+       __proc_info_end = .;
 
 #if defined(CONFIG_HAS_VPCI) && defined(CONFIG_LATE_HWDOM)
        . = ALIGN(POINTER_ALIGN);
@@ -134,13 +137,6 @@ SECTIONS
       _aedevice = .;
   } :text
 
-  . = ALIGN(8);
-  .teemediator.info : {
-      _steemediator = .;
-      *(.teemediator.info)
-      _eteemediator = .;
-  } :text
-
   . = ALIGN(PAGE_SIZE);             /* Init code and data */
   __init_begin = .;
   .init.text : {
@@ -158,10 +154,6 @@ SECTIONS
        __setup_start = .;
        *(.init.setup)
        __setup_end = .;
-
-       __proc_info_start = .;
-       *(.init.proc.info)
-       __proc_info_end = .;
 
        __initcall_start = .;
        *(.initcallpresmp.init)
@@ -219,10 +211,6 @@ SECTIONS
   /* Section for the device tree blob (if any). */
   _sdtb = .;
   .dtb : { *(.dtb) } :text
-#endif
-
-#if defined(__aarch64__)
-  HEAD_SYMBOLS
 #endif
 
   /* Sections to be discarded */

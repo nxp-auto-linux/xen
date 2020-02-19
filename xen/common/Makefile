@@ -1,3 +1,4 @@
+obj-$(CONFIG_ARGO) += argo.o
 obj-y += bitmap.o
 obj-y += bsearch.o
 obj-$(CONFIG_CORE_PARKING) += core_parking.o
@@ -19,9 +20,10 @@ obj-y += keyhandler.o
 obj-$(CONFIG_KEXEC) += kexec.o
 obj-$(CONFIG_KEXEC) += kimage.o
 obj-y += lib.o
+obj-$(CONFIG_NEEDS_LIST_SORT) += list_sort.o
 obj-$(CONFIG_LIVEPATCH) += livepatch.o livepatch_elf.o
-obj-y += lzo.o
-obj-$(CONFIG_HAS_MEM_ACCESS) += mem_access.o
+obj-$(CONFIG_TMEM) += lzo.o
+obj-$(CONFIG_MEM_ACCESS) += mem_access.o
 obj-y += memory.o
 obj-y += monitor.o
 obj-y += multicall.o
@@ -65,8 +67,9 @@ obj-bin-y += warning.init.o
 obj-$(CONFIG_XENOPROF) += xenoprof.o
 obj-y += xmalloc_tlsf.o
 
-obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma unlzo unlz4 earlycpio,$(n).init.o)
-
+lzo-y := lzo
+lzo-$(CONFIG_TMEM) :=
+obj-bin-$(CONFIG_X86) += $(foreach n,decompress bunzip2 unxz unlzma $(lzo-y) unlzo unlz4 earlycpio,$(n).init.o)
 
 obj-$(CONFIG_COMPAT) += $(addprefix compat/,domain.o kernel.o memory.o multicall.o xlat.o)
 
@@ -74,8 +77,10 @@ tmem-y := tmem.o tmem_xen.o tmem_control.o
 tmem-$(CONFIG_COMPAT) += compat/tmem_xen.o
 obj-$(CONFIG_TMEM) += $(tmem-y)
 
-subdir-$(CONFIG_GCOV) += gcov
+extra-y := symbols-dummy.o
+
+subdir-$(CONFIG_COVERAGE) += coverage
 subdir-$(CONFIG_UBSAN) += ubsan
 
-subdir-y += libelf
+subdir-$(CONFIG_NEEDS_LIBELF) += libelf
 subdir-$(CONFIG_HAS_DEVICE_TREE) += libfdt

@@ -993,6 +993,8 @@ static void * __init allocate_ppr_log(struct amd_iommu *iommu)
 
 static int __init amd_iommu_init_one(struct amd_iommu *iommu)
 {
+    pci_hide_device(iommu->seg, PCI_BUS(iommu->bdf), PCI_DEVFN2(iommu->bdf));
+
     if ( map_iommu_mmio_region(iommu) != 0 )
         goto error_out;
 
@@ -1062,7 +1064,7 @@ static void __init amd_iommu_init_cleanup(void)
     radix_tree_destroy(&ivrs_maps, xfree);
 
     iommu_enabled = 0;
-    iommu_passthrough = 0;
+    iommu_hwdom_passthrough = false;
     iommu_intremap = 0;
     iommuv2_enabled = 0;
 }

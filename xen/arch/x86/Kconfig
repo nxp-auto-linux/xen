@@ -15,7 +15,7 @@ config X86
 	select HAS_GDBSX
 	select HAS_IOPORTS
 	select HAS_KEXEC
-	select HAS_MEM_ACCESS
+	select MEM_ACCESS_ALWAYS_ON
 	select HAS_MEM_PAGING
 	select HAS_MEM_SHARING
 	select HAS_NS16550
@@ -23,6 +23,8 @@ config X86
 	select HAS_PCI
 	select HAS_PDX
 	select HAS_UBSAN
+	select HAS_VPCI if !PV_SHIM_EXCLUSIVE && HVM
+	select NEEDS_LIBELF
 	select NUMA
 
 config ARCH_DEFCONFIG
@@ -35,6 +37,14 @@ source "arch/Kconfig"
 
 config PV
 	def_bool y
+	prompt "PV support"
+	---help---
+	  Interfaces to support PV domains. These require guest kernel support
+	  to run as a PV guest, but don't require any specific hardware support.
+
+	  This option is needed if you want to run PV domains.
+
+	  If unsure, say Y.
 
 config PV_LINEAR_PT
        bool "Support for PV linear pagetables"
@@ -57,7 +67,16 @@ config PV_LINEAR_PT
          If unsure, say Y.
 
 config HVM
-	def_bool y
+	def_bool !PV_SHIM_EXCLUSIVE
+	prompt "HVM support"
+	---help---
+	  Interfaces to support HVM domains.  HVM domains require hardware
+	  virtualisation extensions (e.g. Intel VT-x, AMD SVM), but can boot
+	  guests which have no specific Xen knowledge.
+
+	  This option is needed if you want to run HVM or PVH domains.
+
+	  If unsure, say Y.
 
 config SHADOW_PAGING
         bool "Shadow Paging"
@@ -71,6 +90,7 @@ config SHADOW_PAGING
             * Running HVM guests on hardware lacking hardware paging support
               (First-generation Intel VT-x or AMD SVM).
             * Live migration of PV guests.
+            * L1TF sidechannel mitigation for PV guests.
 
           Under a small number of specific workloads, shadow paging may be
           deliberately used as a performance optimisation.
@@ -91,6 +111,7 @@ config BIGMEM
 config HVM_FEP
 	bool "HVM Forced Emulation Prefix support" if EXPERT = "y"
 	default DEBUG
+	depends on HVM
 	---help---
 
 	  Compiles in a feature that allows HVM guest to arbitrarily
@@ -160,3 +181,26 @@ endmenu
 source "common/Kconfig"
 
 source "drivers/Kconfig"
+
+menu "Deprecated Functionality"
+
+config PV_LDT_PAGING
+	bool "PV LDT Paging-out support"
+	depends on PV
+	---help---
+	  For a very long time, the PV ABI has included the ability to page
+	  out the LDT by transitioning its mapping to not-present.  This
+	  functionality is believed to only exist for the PV Windows XP port
+	  which never came to anything.
+
+	  The implementation contains a vCPU scalability limitation in a
+	  position which is prohibitively complicated to resolve.  As the
+	  feature is believed to be unused in practice, removing the feature
+	  is the easiest remediation.
+
+	  If you discover a usecase which is broken by this option being off,
+	  please contact xen-devel@lists.xenproject.org urgently.  Baring
+	  something unexpected, the code and this option will be deleted 2
+	  releases after Xen 4.12.
+
+endmenu

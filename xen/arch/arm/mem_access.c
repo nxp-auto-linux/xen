@@ -47,6 +47,7 @@ static int __p2m_get_mem_access(struct domain *d, gfn_t gfn,
     };
 
     ASSERT(p2m_is_locked(p2m));
+    *access = p2m->default_access;
 
     /* If no setting was ever set, just return rwx. */
     if ( !p2m->mem_access_enabled )
@@ -70,7 +71,7 @@ static int __p2m_get_mem_access(struct domain *d, gfn_t gfn,
          * No setting was found in the Radix tree. Check if the
          * entry exists in the page-tables.
          */
-        mfn_t mfn = p2m_get_entry(p2m, gfn, NULL, NULL, NULL);
+        mfn_t mfn = p2m_get_entry(p2m, gfn, NULL, NULL, NULL, NULL);
 
         if ( mfn_eq(mfn, INVALID_MFN) )
             return -ESRCH;
@@ -125,8 +126,8 @@ p2m_mem_access_check_and_get_page(vaddr_t gva, unsigned long flag,
          * The software gva to ipa translation can still fail, e.g., if the gva
          * is not mapped.
          */
-        if ( guest_walk_tables(v, gva, &ipa, &perms) < 0 )
-            goto err;
+        if ( !guest_walk_tables(v, gva, &ipa, &perms) )
+            return NULL;
 
         /*
          * Check permissions that are assumed by the caller. For instance in
@@ -139,10 +140,12 @@ p2m_mem_access_check_and_get_page(vaddr_t gva, unsigned long flag,
          * test for execute permissions this check can be left out.
          */
         if ( (flag & GV2M_WRITE) && !(perms & GV2M_WRITE) )
-            goto err;
+            return NULL;
     }
 
     gfn = gaddr_to_gfn(ipa);
+
+    p2m_read_lock(p2m);
 
     /*
      * We do this first as this is faster in the default case when no
@@ -197,7 +200,7 @@ p2m_mem_access_check_and_get_page(vaddr_t gva, unsigned long flag,
      * We had a mem_access permission limiting the access, but the page type
      * could also be limiting, so we need to check that as well.
      */
-    mfn = p2m_get_entry(p2m, gfn, &t, NULL, NULL);
+    mfn = p2m_get_entry(p2m, gfn, &t, NULL, NULL, NULL);
     if ( mfn_eq(mfn, INVALID_MFN) )
         goto err;
 
@@ -210,12 +213,14 @@ p2m_mem_access_check_and_get_page(vaddr_t gva, unsigned long flag,
     if ( t != p2m_ram_rw )
         goto err;
 
-    page = mfn_to_page(mfn_x(mfn));
+    page = mfn_to_page(mfn);
 
     if ( unlikely(!get_page(page, v->domain)) )
         page = NULL;
 
 err:
+    p2m_read_unlock(p2m);
+
     return page;
 }
 
@@ -232,7 +237,7 @@ bool p2m_mem_access_check(paddr_t gpa, vaddr_t gla, const struct npfec npfec)
     if ( !p2m->mem_access_enabled )
         return true;
 
-    rc = p2m_get_mem_access(v->domain, gaddr_to_gfn(gpa), &xma);
+    rc = p2m_get_mem_access(v->domain, gaddr_to_gfn(gpa), &xma, 0);
     if ( rc )
         return true;
 
@@ -401,7 +406,7 @@ long p2m_set_mem_access(struct domain *d, gfn_t gfn, uint32_t nr,
           gfn = gfn_next_boundary(gfn, order) )
     {
         p2m_type_t t;
-        mfn_t mfn = p2m_get_entry(p2m, gfn, &t, NULL, &order);
+        mfn_t mfn = p2m_get_entry(p2m, gfn, &t, NULL, &order, NULL);
 
 
         if ( !mfn_eq(mfn, INVALID_MFN) )
@@ -437,16 +442,25 @@ long p2m_set_mem_access_multi(struct domain *d,
 }
 
 int p2m_get_mem_access(struct domain *d, gfn_t gfn,
-                       xenmem_access_t *access)
+                       xenmem_access_t *access, unsigned int altp2m_idx)
 {
     int ret;
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
+
+    /* altp2m is not yet implemented on Arm. The altp2m_idx should be 0. */
+    ASSERT(altp2m_idx == 0);
 
     p2m_read_lock(p2m);
     ret = __p2m_get_mem_access(d, gfn, access);
     p2m_read_unlock(p2m);
 
     return ret;
+}
+
+void arch_p2m_set_access_required(struct domain *d, bool access_required)
+{
+    ASSERT(atomic_read(&d->pause_count));
+    p2m_get_hostp2m(d)->access_required = access_required;
 }
 
 /*

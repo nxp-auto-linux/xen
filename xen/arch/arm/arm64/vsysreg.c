@@ -21,7 +21,53 @@
 #include <asm/current.h>
 #include <asm/regs.h>
 #include <asm/traps.h>
+#include <asm/vreg.h>
 #include <asm/vtimer.h>
+
+/*
+ * Macro to help generating helpers for registers trapped when
+ * HCR_EL2.TVM is set.
+ *
+ * Note that it only traps NS write access from EL1.
+ */
+#define TVM_REG(reg)                                                \
+static bool vreg_emulate_##reg(struct cpu_user_regs *regs,          \
+                               uint64_t *r, bool read)              \
+{                                                                   \
+    struct vcpu *v = current;                                       \
+    bool cache_enabled = vcpu_has_cache_enabled(v);                 \
+                                                                    \
+    GUEST_BUG_ON(read);                                             \
+    WRITE_SYSREG64(*r, reg);                                        \
+                                                                    \
+    p2m_toggle_cache(v, cache_enabled);                             \
+                                                                    \
+    return true;                                                    \
+}
+
+/* Defining helpers for emulating sysreg registers. */
+TVM_REG(SCTLR_EL1)
+TVM_REG(TTBR0_EL1)
+TVM_REG(TTBR1_EL1)
+TVM_REG(TCR_EL1)
+TVM_REG(ESR_EL1)
+TVM_REG(FAR_EL1)
+TVM_REG(AFSR0_EL1)
+TVM_REG(AFSR1_EL1)
+TVM_REG(MAIR_EL1)
+TVM_REG(AMAIR_EL1)
+TVM_REG(CONTEXTIDR_EL1)
+
+/* Macro to generate easily case for co-processor emulation */
+#define GENERATE_CASE(reg)                                              \
+    case HSR_SYSREG_##reg:                                              \
+    {                                                                   \
+        bool res;                                                       \
+                                                                        \
+        res = vreg_emulate_sysreg64(regs, hsr, vreg_emulate_##reg);     \
+        ASSERT(res);                                                    \
+        break;                                                          \
+    }
 
 void do_sysreg(struct cpu_user_regs *regs,
                const union hsr hsr)
@@ -44,6 +90,35 @@ void do_sysreg(struct cpu_user_regs *regs,
         break;
 
     /*
+     * HCR_EL2.TSW
+     *
+     * ARMv8 (DDI 0487B.b): Table D1-42
+     */
+    case HSR_SYSREG_DCISW:
+    case HSR_SYSREG_DCCSW:
+    case HSR_SYSREG_DCCISW:
+        if ( !hsr.sysreg.read )
+            p2m_set_way_flush(current);
+        break;
+
+    /*
+     * HCR_EL2.TVM
+     *
+     * ARMv8 (DDI 0487D.a): Table D1-38
+     */
+    GENERATE_CASE(SCTLR_EL1)
+    GENERATE_CASE(TTBR0_EL1)
+    GENERATE_CASE(TTBR1_EL1)
+    GENERATE_CASE(TCR_EL1)
+    GENERATE_CASE(ESR_EL1)
+    GENERATE_CASE(FAR_EL1)
+    GENERATE_CASE(AFSR0_EL1)
+    GENERATE_CASE(AFSR1_EL1)
+    GENERATE_CASE(MAIR_EL1)
+    GENERATE_CASE(AMAIR_EL1)
+    GENERATE_CASE(CONTEXTIDR_EL1)
+
+    /*
      * MDCR_EL2.TDRA
      *
      * ARMv8 (DDI 0487A.d): D1-1508 Table D1-57
@@ -57,13 +132,15 @@ void do_sysreg(struct cpu_user_regs *regs,
      * ARMv8 (DDI 0487A.d): D1-1509 Table D1-58
      *
      * Unhandled:
-     *    OSLSR_EL1
      *    DBGPRCR_EL1
      */
     case HSR_SYSREG_OSLAR_EL1:
         return handle_wo_wi(regs, regidx, hsr.sysreg.read, hsr, 1);
     case HSR_SYSREG_OSDLR_EL1:
         return handle_raz_wi(regs, regidx, hsr.sysreg.read, hsr, 1);
+    case HSR_SYSREG_OSLSR_EL1:
+        return handle_ro_read_val(regs, regidx, hsr.sysreg.read, hsr, 1,
+                                  1 << 3);
 
     /*
      * MDCR_EL2.TDA

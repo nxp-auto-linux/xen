@@ -28,6 +28,7 @@
 #include <asm/tboot.h>
 #include <asm/apic.h>
 #include <asm/io_apic.h>
+#include <asm/spec_ctrl.h>
 #include <acpi/cpufreq/cpufreq.h>
 
 uint32_t system_reset_counter = 1;
@@ -163,6 +164,7 @@ static int enter_state(u32 state)
 {
     unsigned long flags;
     int error;
+    struct cpu_info *ci;
     unsigned long cr4;
 
     if ( (state <= ACPI_STATE_S0) || (state > ACPI_S_STATES_MAX) )
@@ -203,11 +205,17 @@ static int enter_state(u32 state)
         printk(XENLOG_ERR "Some devices failed to power down.");
         system_state = SYS_STATE_resume;
         device_power_up(error);
+        console_end_sync();
         error = -EIO;
         goto done;
     }
     else
         error = 0;
+
+    ci = get_cpu_info();
+    spec_ctrl_enter_idle(ci);
+    /* Avoid NMI/#MC using MSR_SPEC_CTRL until we've reloaded microcode. */
+    ci->spec_ctrl_flags &= ~SCF_ist_wrmsr;
 
     ACPI_FLUSH_CPU_CACHE();
 
@@ -243,17 +251,26 @@ static int enter_state(u32 state)
     if ( (state == ACPI_STATE_S3) && error )
         tboot_s3_error(error);
 
+    console_end_sync();
+
+    microcode_resume_cpu(0);
+
+    if ( !recheck_cpu_features(0) )
+        panic("Missing previously available feature(s)\n");
+
+    /* Re-enabled default NMI/#MC use of MSR_SPEC_CTRL. */
+    ci->spec_ctrl_flags |= (default_spec_ctrl_flags & SCF_ist_wrmsr);
+    spec_ctrl_exit_idle(ci);
+
  done:
     spin_debug_enable();
     local_irq_restore(flags);
-    console_end_sync();
     acpi_sleep_post(state);
     if ( hvm_cpu_up() )
         BUG();
+    cpufreq_add_cpu(0);
 
  enable_cpu:
-    cpufreq_add_cpu(0);
-    microcode_resume_cpu(0);
     rcu_barrier();
     mtrr_aps_sync_begin();
     enable_nonboot_cpus();

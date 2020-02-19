@@ -84,10 +84,10 @@ void _hvm_read_entry(struct hvm_domain_context *h,
     _hvm_load_entry(_x, _h, _dst, 0)
 
 /* Unmarshalling: what is the instance ID of the next entry? */
-static inline uint16_t hvm_load_instance(struct hvm_domain_context *h)
+static inline unsigned int hvm_load_instance(const struct hvm_domain_context *h)
 {
-    struct hvm_save_descriptor *d 
-        = (struct hvm_save_descriptor *)&h->data[h->cur];
+    const struct hvm_save_descriptor *d = (const void *)&h->data[h->cur];
+
     return d->instance;
 }
 
@@ -95,7 +95,7 @@ static inline uint16_t hvm_load_instance(struct hvm_domain_context *h)
  * The save handler may save multiple instances of a type into the buffer;
  * the load handler will be called once for each instance found when
  * restoring.  Both return non-zero on error. */
-typedef int (*hvm_save_handler) (struct domain *d, 
+typedef int (*hvm_save_handler) (struct vcpu *v,
                                  hvm_domain_context_t *h);
 typedef int (*hvm_load_handler) (struct domain *d,
                                  hvm_domain_context_t *h);

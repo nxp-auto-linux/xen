@@ -31,7 +31,7 @@ let create () = {
 	watches = Trie.create ()
 }
 
-let add_anonymous cons fd can_write =
+let add_anonymous cons fd _can_write =
 	let xbcon = Xenbus.Xb.open_fd fd in
 	let con = Connection.create xbcon None in
 	Hashtbl.add cons.anonymous (Xenbus.Xb.get_fd xbcon) con
@@ -65,7 +65,7 @@ let find_domain_by_port cons port =
 let del_watches_of_con con watches =
 	match List.filter (fun w -> Connection.get_con w != con) watches with
 	| [] -> None
-	| ws -> Some ws 
+	| ws -> Some ws
 
 let del_anonymous cons con =
 	try
@@ -91,7 +91,7 @@ let del_domain cons id =
 		debug "del domain %u: %s" id (Printexc.to_string exn)
 
 let iter_domains cons fct =
-	Hashtbl.iter (fun k c -> fct c) cons.domains
+	Hashtbl.iter (fun _ c -> fct c) cons.domains
 
 let iter_anonymous cons fct =
 	Hashtbl.iter (fun _ c -> fct c) cons.anonymous
@@ -101,7 +101,7 @@ let iter cons fct =
 
 let has_more_work cons =
 	Hashtbl.fold
-		(fun id con acc ->
+		(fun _id con acc ->
 		 if Connection.has_more_work con then con :: acc else acc)
 		cons.domains []
 
@@ -142,9 +142,9 @@ let fire_watches cons path recurse =
 		| None         -> ()
 		| Some watches -> List.iter (fun w -> Connection.fire_watch w path) watches
 	in
-	let fire_rec x = function
+	let fire_rec _x = function
 		| None         -> ()
-		| Some watches -> 
+		| Some watches ->
 			  List.iter (fun w -> Connection.fire_single_watch w) watches
 	in
 	Trie.iter_path fire_watch cons.watches key;
@@ -161,14 +161,14 @@ let set_target cons domain target_domain =
 
 let number_of_transactions cons =
 	let res = ref 0 in
-	let aux con = 
+	let aux con =
 		res := Connection.number_of_transactions con + !res
 	in
 	iter cons aux;
 	!res
 
 let stats cons =
-	let nb_ops_anon = ref 0 
+	let nb_ops_anon = ref 0
 	and nb_watchs_anon = ref 0
 	and nb_ops_dom = ref 0
 	and nb_watchs_dom = ref 0 in

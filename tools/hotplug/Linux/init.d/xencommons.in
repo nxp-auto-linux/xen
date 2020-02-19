@@ -7,7 +7,7 @@
 # chkconfig: 2345 70 10
 # description: Starts and stops xenstored and xenconsoled
 ### BEGIN INIT INFO
-# Provides:          xenstored xenconsoled
+# Provides:          xenstored xenconsoled xen
 # Required-Start:    $syslog $remote_fs
 # Should-Start:
 # Required-Stop:     $syslog $remote_fs
@@ -15,7 +15,7 @@
 # Default-Start:     2 3 5
 # Default-Stop:      0 1 6
 # Short-Description: Start/stop xenstored and xenconsoled
-# Description:       Starts and stops the daemons neeeded for xl/xend
+# Description:       Starts and stops the daemons needed for xl
 ### END INIT INFO
 
 BACKEND_MODULES="@LINUX_BACKEND_MODULES@"
@@ -56,14 +56,14 @@ do_start () {
 
 	for mod in $BACKEND_MODULES ; do modprobe "$mod" &>/dev/null ; done
 
-	mkdir -p ${XEN_RUN_DIR}
-	mkdir -p ${XEN_LOCK_DIR}
+	mkdir -m700 -p ${XEN_RUN_DIR}
+	mkdir -m700 -p ${XEN_LOCK_DIR}
 	mkdir -p ${XEN_LOG_DIR}
 
 	@XEN_SCRIPT_DIR@/launch-xenstore || exit 1
 
 	echo Setting domain 0 name, domid and JSON config...
-	${LIBEXEC_BIN}/xen-init-dom0
+	${LIBEXEC_BIN}/xen-init-dom0 ${XEN_DOM0_UUID}
 
 	echo Starting xenconsoled...
 	test -z "$XENCONSOLED_TRACE" || XENCONSOLED_ARGS=" --log=$XENCONSOLED_TRACE"

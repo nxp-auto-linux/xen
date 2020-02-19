@@ -218,6 +218,12 @@ static int apply_microcode(unsigned int cpu)
 
     spin_unlock_irqrestore(&microcode_update_lock, flags);
 
+    /*
+     * Some processors leave the ucode blob mapping as UC after the update.
+     * Flush the mapping to regain normal cacheability.
+     */
+    flush_area_local(hdr, FLUSH_TLB_GLOBAL | FLUSH_ORDER(0));
+
     /* check current patch id and patch's id for match */
     if ( hw_err || (rev != hdr->patch_id) )
     {
@@ -550,7 +556,9 @@ static int cpu_request_microcode(unsigned int cpu, const void *buf,
         xfree(mc_old);
 
   out:
+#if CONFIG_HVM
     svm_host_osvw_init();
+#endif
 
     /*
      * In some cases we may return an error even if processor's microcode has
@@ -609,6 +617,7 @@ err1:
 
 static int start_update(void)
 {
+#if CONFIG_HVM
     /*
      * We assume here that svm_host_osvw_init() will be called on each cpu (from
      * cpu_request_microcode()).
@@ -619,6 +628,7 @@ static int start_update(void)
      * supporting OSVW so we will not deal with this possibility.
      */
     svm_host_osvw_reset();
+#endif
 
     return 0;
 }

@@ -21,17 +21,23 @@
 
 #include <xen/lib.h>
 #include <xen/rwlock.h>
-#include <asm/processor.h>
-#include <asm/regs.h>
+
+#include <asm/hsr.h>
 
 #define MAX_IO_HANDLER  16
 
 typedef struct
 {
     struct hsr_dabt dabt;
-    vaddr_t gva;
     paddr_t gpa;
 } mmio_info_t;
+
+enum io_state
+{
+    IO_ABORT,       /* The IO was handled by the helper and led to an abort. */
+    IO_HANDLED,     /* The IO was successfully handled by the helper. */
+    IO_UNHANDLED,   /* The IO was not handled by the helper. */
+};
 
 typedef int (*mmio_read_t)(struct vcpu *v, mmio_info_t *info,
                            register_t *r, void *priv);
@@ -57,7 +63,9 @@ struct vmmio {
     struct mmio_handler *handlers;
 };
 
-extern int handle_mmio(mmio_info_t *info);
+enum io_state try_handle_mmio(struct cpu_user_regs *regs,
+                              const union hsr hsr,
+                              paddr_t gpa);
 void register_mmio_handler(struct domain *d,
                            const struct mmio_handler_ops *ops,
                            paddr_t addr, paddr_t size, void *priv);

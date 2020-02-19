@@ -41,6 +41,7 @@ struct domain_create {
     int vncautopass;
     int console_autoconnect;
     int checkpointed_stream;
+    int ignore_global_affinity_masks;
     const char *config_file;
     char *extra_config; /* extra config string */
     const char *restore_file;
@@ -170,6 +171,12 @@ int main_vtpmdetach(int argc, char **argv);
 int main_vdisplattach(int argc, char **argv);
 int main_vdispllist(int argc, char **argv);
 int main_vdispldetach(int argc, char **argv);
+int main_vsndattach(int argc, char **argv);
+int main_vsndlist(int argc, char **argv);
+int main_vsnddetach(int argc, char **argv);
+int main_vkbattach(int argc, char **argv);
+int main_vkblist(int argc, char **argv);
+int main_vkbdetach(int argc, char **argv);
 int main_usbctrl_attach(int argc, char **argv);
 int main_usbctrl_detach(int argc, char **argv);
 int main_usbdev_attach(int argc, char **argv);
@@ -208,6 +215,8 @@ int main_psr_cmt_detach(int argc, char **argv);
 int main_psr_cmt_show(int argc, char **argv);
 int main_psr_cat_cbm_set(int argc, char **argv);
 int main_psr_cat_show(int argc, char **argv);
+int main_psr_mba_set(int argc, char **argv);
+int main_psr_mba_show(int argc, char **argv);
 #endif
 int main_qemu_monitor_command(int argc, char **argv);
 
@@ -277,6 +286,9 @@ extern char *default_colo_proxy_script;
 extern char *blkdev_start;
 extern int max_grant_frames;
 extern int max_maptrack_frames;
+extern libxl_bitmap global_vm_affinity_mask;
+extern libxl_bitmap global_hvm_affinity_mask;
+extern libxl_bitmap global_pv_affinity_mask;
 
 enum output_format {
     OUTPUT_FORMAT_JSON,
@@ -292,6 +304,9 @@ typedef enum {
 } domain_restart_type;
 
 extern void printf_info_sexp(int domid, libxl_domain_config *d_config, FILE *fh);
+extern void apply_global_affinity_masks(libxl_domain_type type,
+                                        libxl_bitmap *vcpu_affinity_array,
+                                        unsigned int size);
 
 #define XL_GLOBAL_CONFIG XEN_CONFIG_DIR "/xl.conf"
 #define XL_LOCK_FILE XEN_LOCK_DIR "/xl"

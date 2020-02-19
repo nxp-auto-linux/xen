@@ -40,18 +40,27 @@ static inline void svm_vmsave_pa(paddr_t vmcb)
         : : "a" (vmcb) : "memory" );
 }
 
-static inline void svm_invlpga(unsigned long vaddr, uint32_t asid)
+static inline void svm_invlpga(unsigned long linear, uint32_t asid)
 {
     asm volatile (
         ".byte 0x0f,0x01,0xdf"
         : /* output */
         : /* input */
-        "a" (vaddr), "c" (asid));
+        "a" (linear), "c" (asid));
 }
 
 unsigned long *svm_msrbit(unsigned long *msr_bitmap, uint32_t msr);
 void __update_guest_eip(struct cpu_user_regs *regs, unsigned int inst_len);
-void svm_update_guest_cr(struct vcpu *, unsigned int cr);
+void svm_update_guest_cr(struct vcpu *, unsigned int cr, unsigned int flags);
+
+/*
+ * PV context switch helper. Calls with zero ldt_base request a prefetch of
+ * the VMCB area to be loaded from, instead of an actual load of state.
+ */
+bool svm_load_segs(unsigned int ldt_ents, unsigned long ldt_base,
+                   unsigned int fs_sel, unsigned long fs_base,
+                   unsigned int gs_sel, unsigned long gs_base,
+                   unsigned long gs_shadow);
 
 extern u32 svm_feature_flags;
 
@@ -64,6 +73,9 @@ extern u32 svm_feature_flags;
 #define SVM_FEATURE_FLUSHBYASID    6 /* TLB flush by ASID support */
 #define SVM_FEATURE_DECODEASSISTS  7 /* Decode assists support */
 #define SVM_FEATURE_PAUSEFILTER   10 /* Pause intercept filter support */
+#define SVM_FEATURE_PAUSETHRESH   12 /* Pause intercept filter support */
+#define SVM_FEATURE_VLOADSAVE     15 /* virtual vmload/vmsave */
+#define SVM_FEATURE_VGIF          16 /* Virtual GIF */
 
 #define cpu_has_svm_feature(f) test_bit(f, &svm_feature_flags)
 #define cpu_has_svm_npt       cpu_has_svm_feature(SVM_FEATURE_NPT)
@@ -72,10 +84,14 @@ extern u32 svm_feature_flags;
 #define cpu_has_svm_nrips     cpu_has_svm_feature(SVM_FEATURE_NRIPS)
 #define cpu_has_svm_cleanbits cpu_has_svm_feature(SVM_FEATURE_VMCBCLEAN)
 #define cpu_has_svm_decode    cpu_has_svm_feature(SVM_FEATURE_DECODEASSISTS)
+#define cpu_has_svm_vgif      cpu_has_svm_feature(SVM_FEATURE_VGIF)
 #define cpu_has_pause_filter  cpu_has_svm_feature(SVM_FEATURE_PAUSEFILTER)
+#define cpu_has_pause_thresh  cpu_has_svm_feature(SVM_FEATURE_PAUSETHRESH)
 #define cpu_has_tsc_ratio     cpu_has_svm_feature(SVM_FEATURE_TSCRATEMSR)
+#define cpu_has_svm_vloadsave cpu_has_svm_feature(SVM_FEATURE_VLOADSAVE)
 
-#define SVM_PAUSEFILTER_INIT    3000
+#define SVM_PAUSEFILTER_INIT    4000
+#define SVM_PAUSETHRESH_INIT    1000
 
 /* TSC rate */
 #define DEFAULT_TSC_RATIO       0x0000000100000000ULL

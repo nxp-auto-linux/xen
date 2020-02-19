@@ -100,9 +100,6 @@ enum hvm_translation_result hvm_copy_to_guest_linear(
 enum hvm_translation_result hvm_copy_from_guest_linear(
     void *buf, unsigned long addr, int size, uint32_t pfec,
     pagefault_info_t *pfinfo);
-enum hvm_translation_result hvm_fetch_from_guest_linear(
-    void *buf, unsigned long addr, int size, uint32_t pfec,
-    pagefault_info_t *pfinfo);
 
 /*
  * Get a reference on the page under an HVM physical or linear address.  If
@@ -137,9 +134,9 @@ void hvm_shadow_handle_cd(struct vcpu *v, unsigned long value);
  * returned.
  */
 int hvm_set_efer(uint64_t value);
-int hvm_set_cr0(unsigned long value, bool_t may_defer);
-int hvm_set_cr3(unsigned long value, bool_t may_defer);
-int hvm_set_cr4(unsigned long value, bool_t may_defer);
+int hvm_set_cr0(unsigned long value, bool may_defer);
+int hvm_set_cr3(unsigned long value, bool may_defer);
+int hvm_set_cr4(unsigned long value, bool may_defer);
 int hvm_descriptor_access_intercept(uint64_t exit_info,
                                     uint64_t vmx_exit_qualification,
                                     unsigned int descriptor, bool is_write);
@@ -154,7 +151,7 @@ void hvm_ud_intercept(struct cpu_user_regs *);
 int __must_check hvm_msr_read_intercept(
     unsigned int msr, uint64_t *msr_content);
 int __must_check hvm_msr_write_intercept(
-    unsigned int msr, uint64_t msr_content, bool_t may_defer);
+    unsigned int msr, uint64_t msr_content, bool may_defer);
 
 #endif /* __ASM_X86_HVM_SUPPORT_H__ */
 

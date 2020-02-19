@@ -52,14 +52,20 @@ int amd_iommu_init(void);
 int amd_iommu_update_ivrs_mapping_acpi(void);
 
 /* mapping functions */
-int __must_check amd_iommu_map_page(struct domain *d, unsigned long gfn,
-                                    unsigned long mfn, unsigned int flags);
-int __must_check amd_iommu_unmap_page(struct domain *d, unsigned long gfn);
-u64 amd_iommu_get_next_table_from_pte(u32 *entry);
+int __must_check amd_iommu_map_page(struct domain *d, dfn_t dfn,
+                                    mfn_t mfn, unsigned int flags,
+                                    unsigned int *flush_flags);
+int __must_check amd_iommu_unmap_page(struct domain *d, dfn_t dfn,
+                                      unsigned int *flush_flags);
+uint64_t amd_iommu_get_address_from_pte(void *entry);
 int __must_check amd_iommu_alloc_root(struct domain_iommu *hd);
 int amd_iommu_reserve_domain_unity_map(struct domain *domain,
-                                       u64 phys_addr, unsigned long size,
+                                       paddr_t phys_addr, unsigned long size,
                                        int iw, int ir);
+int __must_check amd_iommu_flush_iotlb_pages(struct domain *d, dfn_t dfn,
+                                             unsigned int page_count,
+                                             unsigned int flush_flags);
+int __must_check amd_iommu_flush_iotlb_all(struct domain *d);
 
 /* Share p2m table with iommu */
 void amd_iommu_share_p2m(struct domain *d);
@@ -77,7 +83,7 @@ void iommu_dte_set_guest_cr3(u32 *dte, u16 dom_id, u64 gcr3,
 
 /* send cmd to iommu */
 void amd_iommu_flush_all_pages(struct domain *d);
-void amd_iommu_flush_pages(struct domain *d, unsigned long gfn,
+void amd_iommu_flush_pages(struct domain *d, unsigned long dfn,
                            unsigned int order);
 void amd_iommu_flush_iotlb(u8 devfn, const struct pci_dev *pdev,
                            uint64_t gaddr, unsigned int order);
@@ -153,11 +159,6 @@ static inline u32 set_field_in_reg_u32(u32 field, u32 reg_value,
     if (reg)
         *reg = reg_value;
     return reg_value;
-}
-
-static inline u8 get_field_from_byte(u8 value, u8 mask)
-{
-    return (value & mask) / (mask & -mask);
 }
 
 static inline unsigned long region_to_pages(unsigned long addr, unsigned long size)

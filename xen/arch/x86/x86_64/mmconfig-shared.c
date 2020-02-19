@@ -46,8 +46,8 @@ static int __init parse_mmcfg(const char *s)
         case 1:
             break;
         default:
-            if ( !strncmp(s, "amd_fam10", ss - s) ||
-                 !strncmp(s, "amd-fam10", ss - s) )
+            if ( !cmdline_strcmp(s, "amd_fam10") ||
+                 !cmdline_strcmp(s, "amd-fam10") )
                 pci_probe |= PCI_CHECK_ENABLE_AMD_MMCONF;
             else
                 rc = -EINVAL;
@@ -371,8 +371,6 @@ static bool_t __init pci_mmcfg_reject_broken(void)
         (pci_mmcfg_config[0].address == 0))
         return 0;
 
-    cfg = &pci_mmcfg_config[0];
-
     for (i = 0; i < pci_mmcfg_config_num; i++) {
         u64 addr, size;
 
@@ -401,6 +399,8 @@ static bool_t __init pci_mmcfg_reject_broken(void)
 void __init acpi_mmcfg_init(void)
 {
     bool_t valid = 1;
+
+    pci_segments_init();
 
     /* MMCONFIG disabled */
     if ((pci_probe & PCI_PROBE_MMCONF) == 0)

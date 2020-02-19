@@ -1,6 +1,6 @@
 /******************************************************************************
  * include/public/trace.h
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
  * deal in the Software without restriction, including without limitation the
@@ -235,6 +235,8 @@
 #define TRC_HVM_TRAP             (TRC_HVM_HANDLER + 0x23)
 #define TRC_HVM_TRAP_DEBUG       (TRC_HVM_HANDLER + 0x24)
 #define TRC_HVM_VLAPIC           (TRC_HVM_HANDLER + 0x25)
+#define TRC_HVM_XCR_READ64      (TRC_HVM_HANDLER + TRC_64_FLAG + 0x26)
+#define TRC_HVM_XCR_WRITE64     (TRC_HVM_HANDLER + TRC_64_FLAG + 0x27)
 
 #define TRC_HVM_IOPORT_WRITE    (TRC_HVM_HANDLER + 0x216)
 #define TRC_HVM_IOMEM_WRITE     (TRC_HVM_HANDLER + 0x217)

@@ -25,12 +25,13 @@ typedef struct {
 
 extern const hypercall_args_t hypercall_args_table[NR_hypercalls];
 
+#ifdef CONFIG_PV
+extern const hypercall_table_t pv_hypercall_table[];
 void pv_hypercall(struct cpu_user_regs *regs);
+#endif
+
 void hypercall_page_initialise_ring3_kernel(void *hypercall_page);
 void hypercall_page_initialise_ring1_kernel(void *hypercall_page);
-void pv_hypercall_table_replace(unsigned int hypercall, hypercall_fn_t * native,
-                                hypercall_fn_t *compat);
-hypercall_fn_t *pv_get_hypercall_handler(unsigned int hypercall, bool compat);
 
 /*
  * Both do_mmuext_op() and do_mmu_update():
@@ -87,8 +88,7 @@ do_get_debugreg(
 
 extern long
 do_update_descriptor(
-    u64 pa,
-    u64 desc);
+    uint64_t gaddr, seg_desc_t desc);
 
 extern long
 do_mca(XEN_GUEST_HANDLE_PARAM(xen_mc_t) u_xen_mc);
@@ -165,7 +165,7 @@ extern int compat_update_va_mapping(
     unsigned int va, u32 lo, u32 hi, unsigned int flags);
 
 extern int compat_update_va_mapping_otherdomain(
-    unsigned long va, u32 lo, u32 hi, unsigned long flags, domid_t domid);
+    unsigned int va, u32 lo, u32 hi, unsigned int flags, domid_t domid);
 
 DEFINE_XEN_GUEST_HANDLE(trap_info_compat_t);
 extern int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps);

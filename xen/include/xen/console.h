@@ -15,6 +15,7 @@ long read_console_ring(struct xen_sysctl_readconsole *op);
 
 void console_init_preirq(void);
 void console_init_ring(void);
+void console_init_irq(void);
 void console_init_postirq(void);
 void console_endboot(void);
 int console_has(const char *device);
@@ -31,6 +32,8 @@ void console_end_sync(void);
 void console_start_log_everything(void);
 void console_end_log_everything(void);
 
+struct domain *console_input_domain(void);
+
 /*
  * Steal output from the console. Returns +ve identifier, else -ve error.
  * Takes the handle of the serial line to steal, and steal callback function.
@@ -42,5 +45,7 @@ void console_giveback(int id);
 
 int console_suspend(void);
 int console_resume(void);
+
+extern int8_t opt_console_xen;
 
 #endif /* __CONSOLE_H__ */

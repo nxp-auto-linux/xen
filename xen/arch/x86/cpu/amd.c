@@ -8,7 +8,7 @@
 #include <asm/processor.h>
 #include <asm/amd.h>
 #include <asm/hvm/support.h>
-#include <asm/setup.h> /* amd_init_cpu */
+#include <asm/spec_ctrl.h>
 #include <asm/acpi.h>
 #include <asm/apic.h>
 
@@ -43,6 +43,9 @@ integer_param("cpuid_mask_thermal_ecx", opt_cpuid_mask_thermal_ecx);
 /* 1 = allow, 0 = don't allow guest creation, -1 = don't allow boot */
 s8 __read_mostly opt_allow_unsafe;
 boolean_param("allow_unsafe", opt_allow_unsafe);
+
+/* Signal whether the ACPI C1E quirk is required. */
+bool __read_mostly amd_acpi_c1e_quirk;
 
 static inline int rdmsr_amd_safe(unsigned int msr, unsigned int *lo,
 				 unsigned int *hi)
@@ -208,8 +211,8 @@ static void amd_ctxt_switch_masking(const struct vcpu *next)
 	struct cpuidmasks *these_masks = &this_cpu(cpuidmasks);
 	const struct domain *nextd = next ? next->domain : NULL;
 	const struct cpuidmasks *masks =
-		(nextd && is_pv_domain(nextd) && nextd->arch.pv_domain.cpuidmasks)
-		? nextd->arch.pv_domain.cpuidmasks : &cpuidmask_defaults;
+		(nextd && is_pv_domain(nextd) && nextd->arch.pv.cpuidmasks)
+		? nextd->arch.pv.cpuidmasks : &cpuidmask_defaults;
 
 	if ((levelling_caps & LCAP_1cd) == LCAP_1cd) {
 		uint64_t val = masks->_1cd;
@@ -220,7 +223,7 @@ static void amd_ctxt_switch_masking(const struct vcpu *next)
 		 * kernel.
 		 */
 		if (next && is_pv_vcpu(next) && !is_idle_vcpu(next) &&
-		    !(next->arch.pv_vcpu.ctrlreg[4] & X86_CR4_OSXSAVE))
+		    !(next->arch.pv.ctrlreg[4] & X86_CR4_OSXSAVE))
 			val &= ~((uint64_t)cpufeat_mask(X86_FEATURE_OSXSAVE) << 32);
 
 		if (unlikely(these_masks->_1cd != val)) {
@@ -443,7 +446,7 @@ static void disable_c1e(void *unused)
 		       smp_processor_id(), msr_content);
 }
 
-static void check_disable_c1e(unsigned int port, u8 value)
+void amd_check_disable_c1e(unsigned int port, u8 value)
 {
 	/* C1E is sometimes enabled during entry to ACPI mode. */
 	if ((port == acpi_smi_cmd) && (value == acpi_enable_value))
@@ -504,17 +507,23 @@ static void amd_get_topology(struct cpuinfo_x86 *c)
                 u32 eax, ebx, ecx, edx;
 
                 cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
-                c->compute_unit_id = ebx & 0xFF;
                 c->x86_num_siblings = ((ebx >> 8) & 0x3) + 1;
+
+                if (c->x86 < 0x17)
+                        c->compute_unit_id = ebx & 0xFF;
+                else {
+                        c->cpu_core_id = ebx & 0xFF;
+                        c->x86_max_cores /= c->x86_num_siblings;
+                }
         }
         
         if (opt_cpu_info)
                 printk("CPU %d(%d) -> Processor %d, %s %d\n",
                        cpu, c->x86_max_cores, c->phys_proc_id,
-                       cpu_has(c, X86_FEATURE_TOPOEXT) ? "Compute Unit" : 
-                                                         "Core",
-                       cpu_has(c, X86_FEATURE_TOPOEXT) ? c->compute_unit_id :
-                                                         c->cpu_core_id);
+                       c->compute_unit_id != INVALID_CUID ? "Compute Unit"
+                                                          : "Core",
+                       c->compute_unit_id != INVALID_CUID ? c->compute_unit_id
+                                                          : c->cpu_core_id);
 }
 
 static void early_init_amd(struct cpuinfo_x86 *c)
@@ -594,6 +603,25 @@ static void init_amd(struct cpuinfo_x86 *c)
 				  c->x86_capability);
 	}
 
+	/*
+	 * If the user has explicitly chosen to disable Memory Disambiguation
+	 * to mitigiate Speculative Store Bypass, poke the appropriate MSR.
+	 */
+	if (opt_ssbd) {
+		int bit = -1;
+
+		switch (c->x86) {
+		case 0x15: bit = 54; break;
+		case 0x16: bit = 33; break;
+		case 0x17: bit = 10; break;
+		}
+
+		if (bit >= 0 && !rdmsr_safe(MSR_AMD64_LS_CFG, value)) {
+			value |= 1ull << bit;
+			wrmsr_safe(MSR_AMD64_LS_CFG, value);
+		}
+	}
+
 	/* MFENCE stops RDTSC speculation */
 	if (!cpu_has_lfence_dispatch)
 		__set_bit(X86_FEATURE_MFENCE_RDTSC, c->x86_capability);
@@ -603,7 +631,7 @@ static void init_amd(struct cpuinfo_x86 *c)
 	case 0xf ... 0x17:
 		disable_c1e(NULL);
 		if (acpi_smi_cmd && (acpi_enable_value | acpi_disable_value))
-			pv_post_outb_hook = check_disable_c1e;
+			amd_acpi_c1e_quirk = true;
 		break;
 	}
 

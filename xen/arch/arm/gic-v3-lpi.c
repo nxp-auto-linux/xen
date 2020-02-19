@@ -30,6 +30,7 @@
 #include <asm/gic_v3_its.h>
 #include <asm/io.h>
 #include <asm/page.h>
+#include <asm/sysregs.h>
 
 /*
  * There could be a lot of LPIs on the host side, and they always go to
@@ -153,7 +154,7 @@ void vgic_vcpu_inject_lpi(struct domain *d, unsigned int virq)
     if ( vcpu_id >= d->max_vcpus )
           return;
 
-    vgic_vcpu_inject_irq(d->vcpu[vcpu_id], virq);
+    vgic_inject_irq(d, d->vcpu[vcpu_id], virq, true);
 }
 
 /*

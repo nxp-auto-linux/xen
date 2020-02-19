@@ -145,7 +145,6 @@ int get_free_pirqs(struct domain *, unsigned int nr);
 void free_domain_pirqs(struct domain *d);
 int map_domain_emuirq_pirq(struct domain *d, int pirq, int irq);
 int unmap_domain_pirq_emuirq(struct domain *d, int pirq);
-bool hvm_domain_use_pirq(const struct domain *, const struct pirq *);
 
 /* Reset irq affinities to match the given CPU mask. */
 void fixup_irqs(const cpumask_t *mask, bool verbose);
@@ -188,8 +187,7 @@ void cleanup_domain_irq_mapping(struct domain *);
 #define domain_pirq_to_emuirq(d, pirq) pirq_field(d, pirq,              \
     arch.hvm.emuirq, IRQ_UNBOUND)
 #define domain_emuirq_to_pirq(d, emuirq) ({                             \
-    void *__ret = radix_tree_lookup(&(d)->arch.hvm_domain.emuirq_pirq,  \
-                                    emuirq);                            \
+    void *__ret = radix_tree_lookup(&(d)->arch.hvm.emuirq_pirq, emuirq);\
     __ret ? radix_tree_ptr_to_int(__ret) : IRQ_UNBOUND;                 \
 })
 #define IRQ_UNBOUND -1

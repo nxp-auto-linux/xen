@@ -65,6 +65,244 @@ static int libxl__create_qemu_logfile(libxl__gc *gc, char *name)
     return logfile_w;
 }
 
+/*
+ *  userlookup_helper_getpwnam(libxl__gc*, const char *user,
+ *                             struct passwd **pwd_r);
+ *
+ *  userlookup_helper_getpwuid(libxl__gc*, uid_t uid,
+ *                             struct passwd **pwd_r);
+ *
+ *  If the user is found, return 0 and set *pwd_r to the appropriat
+ *  value.
+ *
+ *  If the user is not found but there are no errors, return 0
+ *  and set *pwd_r to NULL.
+ *
+ *  On error, return a libxl-style error code.
+ */
+#define DEFINE_USERLOOKUP_HELPER(NAME,SPEC_TYPE,STRUCTNAME,SYSCONF)     \
+    static int userlookup_helper_##NAME(libxl__gc *gc,                  \
+                                        SPEC_TYPE spec,                 \
+                                        struct STRUCTNAME *resultbuf,   \
+                                        struct STRUCTNAME **out)        \
+    {                                                                   \
+        struct STRUCTNAME *resultp = NULL;                              \
+        char *buf = NULL;                                               \
+        long buf_size;                                                  \
+        int r;                                                          \
+                                                                        \
+        buf_size = sysconf(SYSCONF);                                    \
+        if (buf_size < 0) {                                             \
+            buf_size = 2048;                                            \
+            LOG(DEBUG,                                                  \
+    "sysconf failed, setting the initial buffer size to %ld",           \
+                buf_size);                                              \
+        }                                                               \
+                                                                        \
+        while (1) {                                                     \
+            buf = libxl__realloc(gc, buf, buf_size);                    \
+            r = NAME##_r(spec, resultbuf, buf, buf_size, &resultp);     \
+            if (r == ERANGE) {                                          \
+                buf_size += 128;                                        \
+                continue;                                               \
+            }                                                           \
+            if (r != 0) {                                               \
+                LOGEV(ERROR, r, "Looking up username/uid with " #NAME); \
+                return ERROR_FAIL;                                      \
+            }                                                           \
+            *out = resultp;                                             \
+            return 0;                                                   \
+        }                                                               \
+    }
+
+DEFINE_USERLOOKUP_HELPER(getpwnam, const char*, passwd, _SC_GETPW_R_SIZE_MAX);
+DEFINE_USERLOOKUP_HELPER(getpwuid, uid_t,       passwd, _SC_GETPW_R_SIZE_MAX);
+
+static int libxl__domain_get_device_model_uid(libxl__gc *gc,
+                                              libxl__dm_spawn_state *dmss)
+{
+    int guest_domid = dmss->guest_domid;
+    libxl__domain_build_state *const state = dmss->build_state;
+    const libxl_domain_build_info *b_info = &dmss->guest_config->b_info;
+
+    struct passwd *user_base, user_pwbuf;
+    int rc;
+    char *user;
+    uid_t intended_uid = -1;
+    bool kill_by_uid;
+
+    /* Only qemu-upstream can run as a different uid */
+    if (b_info->device_model_version != LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN)
+        return 0;
+
+    /*
+     * From this point onward, all paths should go through the `out`
+     * label.  The invariants should be:
+     * - rc may be 0, or an error code.
+     * - if rc is an error code, user and intended_uid are ignored.
+     * - if rc is 0, user may be set or not set.
+     * - if user is set, then intended_uid must be set to a UID matching
+     *   the username `user`, and kill_by_uid must be set to the appropriate
+     *   value.  intended_uid will be checked for root (0).
+     */
+    
+    /*
+     * If device_model_user is present, set `-runas` even if
+     * dm_restrict isn't in use
+     */
+    user = b_info->device_model_user;
+    if (user) {
+        rc = userlookup_helper_getpwnam(gc, user, &user_pwbuf, &user_base);
+        if (rc)
+            goto out;
+
+        if (!user_base) {
+            LOGD(ERROR, guest_domid, "Couldn't find device_model_user %s",
+                 user);
+            rc = ERROR_INVAL;
+            goto out;
+        }
+
+        intended_uid = user_base->pw_uid;
+        kill_by_uid = true;
+        rc = 0;
+        goto out;
+    }
+
+    /*
+     * If dm_restrict isn't set, and we don't have a specified user, don't
+     * bother setting a `-runas` parameter.
+     */
+    if (!libxl_defbool_val(b_info->dm_restrict)) {
+        LOGD(DEBUG, guest_domid,
+             "dm_restrict disabled, starting QEMU as root");
+        user = NULL; /* Should already be null, but just in case */
+        kill_by_uid = false; /* Keep older versions of gcc happy */
+        rc = 0;
+        goto out;
+    }
+
+    /*
+     * dm_restrict is set, but device_model_user isn't set; look for
+     * QEMU_USER_BASE_RANGE
+     */
+    rc = userlookup_helper_getpwnam(gc, LIBXL_QEMU_USER_RANGE_BASE,
+                                         &user_pwbuf, &user_base);
+    if (rc)
+        goto out;
+    if (user_base) {
+        struct passwd *user_clash, user_clash_pwbuf;
+
+        intended_uid = user_base->pw_uid + guest_domid;
+        rc = userlookup_helper_getpwuid(gc, intended_uid,
+                                         &user_clash_pwbuf, &user_clash);
+        if (rc)
+            goto out;
+        if (user_clash) {
+            LOGD(ERROR, guest_domid,
+                 "wanted to use uid %ld (%s + %d) but that is user %s !",
+                 (long)intended_uid, LIBXL_QEMU_USER_RANGE_BASE,
+                 guest_domid, user_clash->pw_name);
+            rc = ERROR_INVAL;
+            goto out;
+        }
+
+        LOGD(DEBUG, guest_domid, "using uid %ld", (long)intended_uid);
+        user = GCSPRINTF("%ld:%ld", (long)intended_uid,
+                         (long)user_base->pw_gid);
+        kill_by_uid = true;
+        rc = 0;
+        goto out;
+    }
+
+    /*
+     * We couldn't find QEMU_USER_BASE_RANGE; look for
+     * QEMU_USER_SHARED.  NB for QEMU_USER_SHARED, all QEMU will run
+     * as the same UID, we can't kill by uid; therefore don't set uid.
+     */
+    user = LIBXL_QEMU_USER_SHARED;
+    rc = userlookup_helper_getpwnam(gc, user, &user_pwbuf, &user_base);
+    if (rc)
+        goto out;
+    if (user_base) {
+        LOGD(WARN, guest_domid, "Could not find user %s, falling back to %s",
+             LIBXL_QEMU_USER_RANGE_BASE, LIBXL_QEMU_USER_SHARED);
+        intended_uid = user_base->pw_uid;
+        kill_by_uid = false;
+        rc = 0;
+        goto out;
+    }
+
+    /*
+     * dm_depriv is set, but we can't find a non-root uid to run as;
+     * fail domain creation
+     */
+    LOGD(ERROR, guest_domid,
+         "Could not find user %s or range base pseudo-user %s, cannot restrict",
+         LIBXL_QEMU_USER_SHARED, LIBXL_QEMU_USER_RANGE_BASE);
+    rc = ERROR_INVAL;
+
+out:
+    /* First, do a root check if appropriate */
+    if (!rc) {
+        if (user && intended_uid == 0) {
+            LOGD(ERROR, guest_domid, "intended_uid is 0 (root)!");
+            rc = ERROR_INVAL;
+        }
+    }
+
+    /* Then do the final set, if still appropriate */
+    if (!rc && user) {
+        state->dm_runas = user;
+        if (kill_by_uid)
+            state->dm_kill_uid = GCSPRINTF("%ld", (long)intended_uid);
+    }
+
+    return rc;
+}
+
+/*
+ * Look up "reaper UID".  If present and non-root, returns 0 and sets
+ * reaper_uid.  Otherwise returns libxl-style error.
+ */
+static int libxl__get_reaper_uid(libxl__gc *gc, uid_t *reaper_uid)
+{
+    struct passwd *user_base, user_pwbuf;
+    int rc;
+
+    rc = userlookup_helper_getpwnam(gc, LIBXL_QEMU_USER_REAPER,
+                                         &user_pwbuf, &user_base);
+    /* 
+     * Either there was an error, or we found a suitable user; stop
+     * looking
+     */
+    if (rc || user_base)
+        goto out;
+
+    rc = userlookup_helper_getpwnam(gc, LIBXL_QEMU_USER_RANGE_BASE,
+                                         &user_pwbuf, &user_base);
+    if (rc || user_base)
+        goto out;
+
+    LOG(WARN, "Couldn't find uid for reaper process");
+    rc = ERROR_INVAL;
+
+ out:
+    /* First check to see if the discovered user maps to root */
+    if (!rc) {
+        if (user_base->pw_uid == 0) {
+            LOG(ERROR, "UID for reaper process maps to root!");
+            rc = ERROR_INVAL;
+        }
+    }
+
+    /* If everything is OK, set reaper_uid as appropriate */
+    if (!rc)
+        *reaper_uid = user_base->pw_uid;
+
+    return rc;
+}
+
 const char *libxl__domain_device_model(libxl__gc *gc,
                                        const libxl_domain_build_info *info)
 {
@@ -432,6 +670,8 @@ static int libxl__build_device_model_args_old(libxl__gc *gc,
     dm_args = flexarray_make(gc, 16, 1);
     dm_envs = flexarray_make(gc, 16, 1);
 
+    assert(state->dm_monitor_fd == -1);
+
     libxl__set_qemu_env_for_xsa_180(gc, dm_envs);
 
     flexarray_vappend(dm_args, dm,
@@ -737,54 +977,6 @@ libxl__detect_gfx_passthru_kind(libxl__gc *gc,
     return LIBXL_GFX_PASSTHRU_KIND_DEFAULT;
 }
 
-/*
- *  userlookup_helper_getpwnam(libxl__gc*, const char *user,
- *                             struct passwd **pwd_r);
- *
- *  userlookup_helper_getpwuid(libxl__gc*, uid_t uid,
- *                             struct passwd **pwd_r);
- *
- *  returns 1 if the user was found, 0 if it was not, -1 on error
- */
-#define DEFINE_USERLOOKUP_HELPER(NAME,SPEC_TYPE,STRUCTNAME,SYSCONF)     \
-    static int userlookup_helper_##NAME(libxl__gc *gc,                  \
-                                        SPEC_TYPE spec,                 \
-                                        struct STRUCTNAME *resultbuf,   \
-                                        struct STRUCTNAME **out)        \
-    {                                                                   \
-        struct STRUCTNAME *resultp = NULL;                              \
-        char *buf = NULL;                                               \
-        long buf_size;                                                  \
-        int ret;                                                        \
-                                                                        \
-        buf_size = sysconf(SYSCONF);                                    \
-        if (buf_size < 0) {                                             \
-            buf_size = 2048;                                            \
-            LOG(DEBUG,                                                  \
-    "sysconf failed, setting the initial buffer size to %ld",           \
-                buf_size);                                              \
-        }                                                               \
-                                                                        \
-        while (1) {                                                     \
-            buf = libxl__realloc(gc, buf, buf_size);                    \
-            ret = NAME##_r(spec, resultbuf, buf, buf_size, &resultp);   \
-            if (ret == ERANGE) {                                        \
-                buf_size += 128;                                        \
-                continue;                                               \
-            }                                                           \
-            if (ret != 0)                                               \
-                return ERROR_FAIL;                                      \
-            if (resultp != NULL) {                                      \
-                if (out) *out = resultp;                                \
-                return 1;                                               \
-            }                                                           \
-            return 0;                                                   \
-        }                                                               \
-    }
-
-DEFINE_USERLOOKUP_HELPER(getpwnam, const char*, passwd, _SC_GETPW_R_SIZE_MAX);
-DEFINE_USERLOOKUP_HELPER(getpwuid, uid_t,       passwd, _SC_GETPW_R_SIZE_MAX);
-
 /* colo mode */
 enum {
     LIBXL__COLO_NONE = 0,
@@ -795,52 +987,36 @@ enum {
 static char *qemu_disk_scsi_drive_string(libxl__gc *gc, const char *target_path,
                                          int unit, const char *format,
                                          const libxl_device_disk *disk,
-                                         int colo_mode)
+                                         int colo_mode, const char **id_ptr)
 {
     char *drive = NULL;
+    char *common = GCSPRINTF("if=none,readonly=%s,cache=writeback",
+                             disk->readwrite ? "off" : "on");
     const char *exportname = disk->colo_export;
     const char *active_disk = disk->active_disk;
     const char *hidden_disk = disk->hidden_disk;
+    const char *id;
 
     switch (colo_mode) {
     case LIBXL__COLO_NONE:
-        drive = libxl__sprintf
-            (gc, "file=%s,if=scsi,bus=0,unit=%d,format=%s,cache=writeback",
-             target_path, unit, format);
+        id = GCSPRINTF("scsi0-hd%d", unit);
+        drive = GCSPRINTF("file=%s,id=%s,format=%s,%s",
+                          target_path, id, format, common);
         break;
     case LIBXL__COLO_PRIMARY:
-        /*
-         * primary:
-         *  -dirve if=scsi,bus=0,unit=x,cache=writeback,driver=quorum,\
-         *  id=exportname,\
-         *  children.0.file.filename=target_path,\
-         *  children.0.driver=format,\
-         *  read-pattern=fifo,\
-         *  vote-threshold=1
-         */
+        id = exportname;
         drive = GCSPRINTF(
-            "if=scsi,bus=0,unit=%d,cache=writeback,driver=quorum,"
-            "id=%s,"
+            "%s,id=%s,driver=quorum,"
             "children.0.file.filename=%s,"
             "children.0.driver=%s,"
             "read-pattern=fifo,"
             "vote-threshold=1",
-            unit, exportname, target_path, format);
+            common, id, target_path, format);
         break;
     case LIBXL__COLO_SECONDARY:
-        /*
-         * secondary:
-         *  -drive if=scsi,bus=0,unit=x,cache=writeback,driver=replication,\
-         *  mode=secondary,\
-         *  file.driver=qcow2,\
-         *  file.file.filename=active_disk,\
-         *  file.backing.driver=qcow2,\
-         *  file.backing.file.filename=hidden_disk,\
-         *  file.backing.backing=exportname,
-         */
+        id = "top-colo";
         drive = GCSPRINTF(
-            "if=scsi,id=top-colo,bus=0,unit=%d,cache=writeback,"
-            "driver=replication,"
+            "%s,id=%s,driver=replication,"
             "mode=secondary,"
             "top-id=top-colo,"
             "file.driver=qcow2,"
@@ -848,11 +1024,13 @@ static char *qemu_disk_scsi_drive_string(libxl__gc *gc, const char *target_path,
             "file.backing.driver=qcow2,"
             "file.backing.file.filename=%s,"
             "file.backing.backing=%s",
-            unit, active_disk, hidden_disk, exportname);
+            common, id, active_disk, hidden_disk, exportname);
         break;
     default:
         abort();
     }
+
+    *id_ptr = id;
 
     return drive;
 }
@@ -866,6 +1044,8 @@ static char *qemu_disk_ide_drive_string(libxl__gc *gc, const char *target_path,
     const char *exportname = disk->colo_export;
     const char *active_disk = disk->active_disk;
     const char *hidden_disk = disk->hidden_disk;
+
+    assert(disk->readwrite); /* should have been checked earlier */
 
     switch (colo_mode) {
     case LIBXL__COLO_NONE:
@@ -922,6 +1102,51 @@ static char *qemu_disk_ide_drive_string(libxl__gc *gc, const char *target_path,
     return drive;
 }
 
+static int libxl__pre_open_qmp_socket(libxl__gc *gc, libxl_domid domid,
+                                      int *fd_r)
+{
+    int rc, r;
+    int fd;
+    struct sockaddr_un un;
+    const char *path = libxl__qemu_qmp_path(gc, domid);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOGED(ERROR, domid, "socket() failed");
+        return ERROR_FAIL;
+    }
+
+    rc = libxl__prepare_sockaddr_un(gc, &un, path, "QEMU's QMP socket");
+    if (rc)
+        goto out;
+
+    rc = libxl__remove_file(gc, path);
+    if (rc)
+        goto out;
+
+    r = bind(fd, (struct sockaddr *) &un, sizeof(un));
+    if (r < 0) {
+        LOGED(ERROR, domid, "bind('%s') failed", path);
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    r = listen(fd, 1);
+    if (r < 0) {
+        LOGED(ERROR, domid, "listen() failed");
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    *fd_r = fd;
+    rc = 0;
+
+out:
+    if (rc && fd >= 0)
+        close(fd);
+    return rc;
+}
+
 static int libxl__build_device_model_args_new(libxl__gc *gc,
                                         const char *dm, int guest_domid,
                                         const libxl_domain_config *guest_config,
@@ -940,11 +1165,9 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
     const char *keymap = dm_keymap(guest_config);
     char *machinearg;
     flexarray_t *dm_args, *dm_envs;
-    int i, connection, devid, ret;
+    int i, connection, devid;
     uint64_t ram_size;
     const char *path, *chardev;
-    char *user = NULL;
-    struct passwd *user_base, user_pwbuf;
 
     dm_args = flexarray_make(gc, 16, 1);
     dm_envs = flexarray_make(gc, 16, 1);
@@ -956,10 +1179,24 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                       GCSPRINTF("%d", guest_domid), NULL);
 
     flexarray_append(dm_args, "-chardev");
-    flexarray_append(dm_args,
-                     GCSPRINTF("socket,id=libxl-cmd,"
-                                    "path=%s/qmp-libxl-%d,server,nowait",
-                                    libxl__run_dir_path(), guest_domid));
+    if (state->dm_monitor_fd >= 0) {
+        flexarray_append(dm_args,
+            GCSPRINTF("socket,id=libxl-cmd,fd=%d,server,nowait",
+                      state->dm_monitor_fd));
+
+        /*
+         * Start QEMU with its "CPU" paused, it will not start any emulation
+         * until the QMP command "cont" is used. This also prevent QEMU from
+         * writing "running" to the "state" xenstore node so we only use this
+         * flag when we have the QMP based startup notification.
+         * */
+        flexarray_append(dm_args, "-S");
+    } else {
+        flexarray_append(dm_args,
+                         GCSPRINTF("socket,id=libxl-cmd,"
+                                   "path=%s,server,nowait",
+                                   libxl__qemu_qmp_path(gc, guest_domid)));
+    }
 
     flexarray_append(dm_args, "-no-shutdown");
     flexarray_append(dm_args, "-mon");
@@ -1004,7 +1241,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
 
     /*
      * Do not use any of the user-provided config files in sysconfdir,
-     * avoiding unkown and uncontrolled configuration.
+     * avoiding unknown and uncontrolled configuration.
      */
     flexarray_append(dm_args, "-no-user-config");
 
@@ -1090,6 +1327,19 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
 
         if (b_info->cmdline)
             flexarray_vappend(dm_args, "-append", b_info->cmdline, NULL);
+
+        /* Find out early if one of the disk is on the scsi bus and add a scsi
+         * controller. This is done ahead to keep the same behavior as previous
+         * version of QEMU (have the controller on the same PCI slot). */
+        for (i = 0; i < num_disks; i++) {
+            if (disks[i].is_cdrom) {
+                continue;
+            }
+            if (strncmp(disks[i].vdev, "sd", 2) == 0) {
+                flexarray_vappend(dm_args, "-device", "lsi53c895a", NULL);
+                break;
+            }
+        }
 
         if (b_info->u.hvm.serial || b_info->u.hvm.serial_list) {
             if ( b_info->u.hvm.serial && b_info->u.hvm.serial_list )
@@ -1409,8 +1659,47 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
         }
     }
 
-    if (libxl_defbool_val(b_info->dm_restrict))
+    if (libxl_defbool_val(b_info->dm_restrict)) {
+        char *chroot_dir = GCSPRINTF("%s/qemu-root-%d",
+                                      libxl__run_dir_path(), guest_domid);
+        int r;
+
         flexarray_append(dm_args, "-xen-domid-restrict");
+
+        /*
+         * Run QEMU in a chroot at XEN_RUN_DIR/qemu-root-<domid>
+         *
+         * There is no library function to do the equivalent of `rm
+         * -rf`.  However deprivileged QEMU in theory shouldn't be
+         * able to write any files, as the chroot would be owned by
+         * root, but it would be running as an unprivileged process.
+         * So in theory, old chroots should always be empty.
+         *
+         * rmdir the directory before attempting to create
+         * it; if it returns anything other than ENOENT, fail domain
+         * creation.
+         */
+        r = rmdir(chroot_dir);
+        if (r != 0 && errno != ENOENT) {
+            LOGED(ERROR, guest_domid,
+                  "failed to remove existing chroot dir %s", chroot_dir);
+            return ERROR_FAIL;
+        }
+
+        for (;;) {
+            r = mkdir(chroot_dir, 0000);
+            if (!r)
+                break;
+            if (errno == EINTR) continue;
+            LOGED(ERROR, guest_domid,
+                  "failed to create chroot dir %s", chroot_dir);
+            return ERROR_FAIL;
+        }
+
+        /* Add "-chroot [dir]" to command-line */
+        flexarray_append(dm_args, "-chroot");
+        flexarray_append(dm_args, chroot_dir);
+    }
 
     if (state->saved_state) {
         /* This file descriptor is meant to be used by QEMU */
@@ -1498,7 +1787,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                 continue;
             }
 
-            /* 
+            /*
              * If qemu isn't doing the interpreting, the parameter is
              * always raw
              */
@@ -1523,7 +1812,7 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                     continue;
                 }
 
-                /* 
+                /*
                  * We can't call libxl__blktap_devpath from
                  * libxl__device_disk_find_local_path for now because
                  * the bootloader is called before the disks are set
@@ -1573,10 +1862,12 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                 }
 
                 if (strncmp(disks[i].vdev, "sd", 2) == 0) {
+                    const char *drive_id;
                     if (colo_mode == LIBXL__COLO_SECONDARY) {
                         drive = libxl__sprintf
-                            (gc, "if=none,driver=%s,file=%s,id=%s",
-                             format, target_path, disks[i].colo_export);
+                            (gc, "if=none,driver=%s,file=%s,id=%s,readonly=%s",
+                             format, target_path, disks[i].colo_export,
+                             disks[i].readwrite ? "off" : "on");
 
                         flexarray_append(dm_args, "-drive");
                         flexarray_append(dm_args, drive);
@@ -1584,7 +1875,14 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
                     drive = qemu_disk_scsi_drive_string(gc, target_path, disk,
                                                         format,
                                                         &disks[i],
-                                                        colo_mode);
+                                                        colo_mode,
+                                                        &drive_id),
+                    flexarray_vappend(dm_args,
+                        "-drive", drive,
+                        "-device", GCSPRINTF("scsi-disk,drive=%s,scsi-id=%d",
+                                             drive_id, disk),
+                        NULL);
+                    continue;
                 } else if (disk < 6 && b_info->u.hvm.hdtype == LIBXL_HDTYPE_AHCI) {
                     if (!disks[i].readwrite) {
                         LOGD(ERROR, guest_domid,
@@ -1636,70 +1934,9 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
             break;
         }
 
-        if (b_info->device_model_user) {
-            user = b_info->device_model_user;
-            goto end_search;
-        }
-
-        if (!libxl_defbool_val(b_info->dm_restrict)) {
-            LOGD(DEBUG, guest_domid,
-                 "dm_restrict disabled, starting QEMU as root");
-            goto end_search;
-        }
-
-        user = GCSPRINTF("%s%d", LIBXL_QEMU_USER_BASE, guest_domid);
-        ret = userlookup_helper_getpwnam(gc, user, &user_pwbuf, 0);
-        if (ret < 0)
-            return ret;
-        if (ret > 0)
-            goto end_search;
-
-        ret = userlookup_helper_getpwnam(gc, LIBXL_QEMU_USER_RANGE_BASE,
-                                         &user_pwbuf, &user_base);
-        if (ret < 0)
-            return ret;
-        if (ret > 0) {
-            struct passwd *user_clash, user_clash_pwbuf;
-            uid_t intended_uid = user_base->pw_uid + guest_domid;
-            ret = userlookup_helper_getpwuid(gc, intended_uid,
-                                             &user_clash_pwbuf, &user_clash);
-            if (ret < 0)
-                return ret;
-            if (ret > 0) {
-                LOGD(ERROR, guest_domid,
-                     "wanted to use uid %ld (%s + %d) but that is user %s !",
-                     (long)intended_uid, LIBXL_QEMU_USER_RANGE_BASE,
-                     guest_domid, user_clash->pw_name);
-                return ERROR_FAIL;
-            }
-            LOGD(DEBUG, guest_domid, "using uid %ld", (long)intended_uid);
+        if (state->dm_runas) {
             flexarray_append(dm_args, "-runas");
-            flexarray_append(dm_args,
-                             GCSPRINTF("%ld:%ld", (long)intended_uid,
-                                       (long)user_base->pw_gid));
-            user = NULL; /* we have taken care of it */
-            goto end_search;
-        }
-
-        user = LIBXL_QEMU_USER_SHARED;
-        ret = userlookup_helper_getpwnam(gc, user, &user_pwbuf, 0);
-        if (ret < 0)
-            return ret;
-        if (ret > 0) {
-            LOGD(WARN, guest_domid, "Could not find user %s%d, falling back to %s",
-                    LIBXL_QEMU_USER_BASE, guest_domid, LIBXL_QEMU_USER_SHARED);
-            goto end_search;
-        }
-
-        LOGD(ERROR, guest_domid,
-             "Could not find user %s%d or %s, cannot restrict",
-             LIBXL_QEMU_USER_BASE, guest_domid, LIBXL_QEMU_USER_SHARED);
-        return ERROR_INVAL;
-
-end_search:
-        if (user != NULL && strcmp(user, "root")) {
-            flexarray_append(dm_args, "-runas");
-            flexarray_append(dm_args, user);
+            flexarray_append(dm_args, state->dm_runas);
         }
     }
     flexarray_append(dm_args, NULL);
@@ -1779,6 +2016,7 @@ static int libxl__vfb_and_vkb_from_hvm_guest_config(libxl__gc *gc,
 
     vkb->backend_domid = 0;
     vkb->devid = 0;
+
     return 0;
 }
 
@@ -1831,6 +2069,16 @@ retry_transaction:
     return 0;
 }
 
+static void dmss_init(libxl__dm_spawn_state *dmss)
+{
+    libxl__ev_qmp_init(&dmss->qmp);
+}
+
+static void dmss_dispose(libxl__gc *gc, libxl__dm_spawn_state *dmss)
+{
+    libxl__ev_qmp_dispose(gc, &dmss->qmp);
+}
+
 static void spawn_stubdom_pvqemu_cb(libxl__egc *egc,
                                 libxl__dm_spawn_state *stubdom_dmss,
                                 int rc);
@@ -1867,6 +2115,9 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
     const int guest_domid = sdss->dm.guest_domid;
     libxl__domain_build_state *const d_state = sdss->dm.build_state;
     libxl__domain_build_state *const stubdom_state = &sdss->dm_state;
+
+    libxl__domain_build_state_init(stubdom_state);
+    dmss_init(&sdss->dm);
 
     if (guest_config->b_info.device_model_version !=
         LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL) {
@@ -1940,8 +2191,8 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
     stubdom_state->pv_ramdisk.path = "";
 
     /* fixme: this function can leak the stubdom if it fails */
-    ret = libxl__domain_make(gc, dm_config, &sdss->pvqemu.guest_domid,
-                             &stubdom_state->config);
+    ret = libxl__domain_make(gc, dm_config, stubdom_state,
+                             &sdss->pvqemu.guest_domid);
     if (ret)
         goto out;
     uint32_t dm_domid = sdss->pvqemu.guest_domid;
@@ -2196,7 +2447,9 @@ static void stubdom_xswait_cb(libxl__egc *egc, libxl__xswait_state *xswait,
     if (strcmp(p, "running"))
         return;
  out:
+    libxl__domain_build_state_dispose(&sdss->dm_state);
     libxl__xswait_stop(gc, xswait);
+    dmss_dispose(gc, &sdss->dm);
     sdss->callback(egc, &sdss->dm, rc);
 }
 
@@ -2208,6 +2461,9 @@ static void device_model_startup_failed(libxl__egc *egc,
                                         int rc);
 static void device_model_detached(libxl__egc *egc,
                                   libxl__spawn_state *spawn);
+static void device_model_qmp_cb(libxl__egc *egc, libxl__ev_qmp *ev,
+                                const libxl__json_object *response,
+                                int rc);
 
 /* our "next step" function, called from those callbacks and elsewhere */
 static void device_model_spawn_outcome(libxl__egc *egc,
@@ -2238,6 +2494,8 @@ void libxl__spawn_local_dm(libxl__egc *egc, libxl__dm_spawn_state *dmss)
     const char *dm;
     int dm_state_fd = -1;
 
+    dmss_init(dmss);
+
     if (libxl_defbool_val(b_info->device_model_stubdomain)) {
         abort();
     }
@@ -2252,6 +2510,21 @@ void libxl__spawn_local_dm(libxl__egc *egc, libxl__dm_spawn_state *dmss)
         rc = ERROR_FAIL;
         goto out;
     }
+
+    rc = libxl__domain_get_device_model_uid(gc, dmss);
+    if (rc)
+        goto out;
+
+    if (b_info->device_model_version
+            == LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN &&
+        libxl_defbool_val(b_info->dm_restrict)) {
+        /* If we have to use dm_restrict, QEMU needs to be new enough
+         * and will have the new interface where we can pre-open the
+         * QMP socket. */
+        rc = libxl__pre_open_qmp_socket(gc, domid, &state->dm_monitor_fd);
+        if (rc) goto out;
+    }
+
     rc = libxl__build_device_model_args(gc, dm, domid, guest_config,
                                           &args, &envs, state,
                                           &dm_state_fd);
@@ -2297,7 +2570,15 @@ void libxl__spawn_local_dm(libxl__egc *egc, libxl__dm_spawn_state *dmss)
     }
 
     const char *dom_path = libxl__xs_get_dompath(gc, domid);
-    spawn->pidpath = GCSPRINTF("%s/%s", dom_path, "image/device-model-pid");
+
+    /*
+     * If we're starting the dm with a non-root UID, save the UID so
+     * that we can reliably kill it and any subprocesses
+     */
+    if (state->dm_kill_uid)
+        libxl__xs_printf(gc, XBT_NULL,
+                         GCSPRINTF("%s/image/device-model-kill-uid", dom_path),
+                         "%s", state->dm_kill_uid);
 
     if (vnc && vnc->passwd) {
         /* This xenstore key will only be used by qemu-xen-traditionnal.
@@ -2337,11 +2618,27 @@ retry_transaction:
     spawn->failure_cb = device_model_startup_failed;
     spawn->detached_cb = device_model_detached;
 
+    if (state->dm_monitor_fd >= 0) {
+        /* There is a valid QMP socket available now,
+         * use it to find out when QEMU is ready */
+        dmss->qmp.ao = ao;
+        dmss->qmp.callback = device_model_qmp_cb;
+        dmss->qmp.domid = domid;
+        dmss->qmp.payload_fd = -1;
+        rc = libxl__ev_qmp_send(gc, &dmss->qmp, "query-status", NULL);
+        if (rc) goto out_close;
+    }
+
     rc = libxl__spawn_spawn(egc, spawn);
     if (rc < 0)
         goto out_close;
     if (!rc) { /* inner child */
         setsid();
+        if (libxl_defbool_val(b_info->dm_restrict)) {
+            rc = libxl__local_dm_preexec_restrict(gc);
+            if (rc)
+                _exit(-1);
+        }
         libxl__exec(gc, null, logfile_w, logfile_w, dm, args, envs);
     }
 
@@ -2405,6 +2702,48 @@ static void device_model_detached(libxl__egc *egc,
     device_model_spawn_outcome(egc, dmss, 0);
 }
 
+static void device_model_qmp_cb(libxl__egc *egc, libxl__ev_qmp *ev,
+                                const libxl__json_object *response,
+                                int rc)
+{
+    EGC_GC;
+    libxl__dm_spawn_state *dmss = CONTAINER_OF(ev, *dmss, qmp);
+    const libxl__json_object *o;
+    const char *status;
+    const char *expected_state;
+
+    libxl__ev_qmp_dispose(gc, ev);
+
+    if (rc)
+        goto failed;
+
+    o = libxl__json_map_get("status", response, JSON_STRING);
+    if (!o) {
+        LOGD(ERROR, ev->domid,
+             "Missing 'status' in response to 'query-status'");
+        LOGD(DEBUG, ev->domid, ".. instead, got: %s", JSON(response));
+        rc = ERROR_QEMU_API;
+        goto failed;
+    }
+    status = libxl__json_object_get_string(o);
+    if (!dmss->build_state->saved_state)
+        expected_state = "prelaunch";
+    else
+        expected_state = "paused";
+    if (strcmp(status, expected_state)) {
+        LOGD(ERROR, ev->domid, "Unexpected QEMU status: %s", status);
+        rc = ERROR_NOT_READY;
+        goto failed;
+    }
+
+    libxl__spawn_initiate_detach(gc, &dmss->spawn);
+    return;
+
+failed:
+    LOGD(ERROR, ev->domid, "QEMU did not start properly, rc=%d", rc);
+    libxl__spawn_initiate_failure(egc, &dmss->spawn, rc);
+}
+
 static void device_model_spawn_outcome(libxl__egc *egc,
                                        libxl__dm_spawn_state *dmss,
                                        int rc)
@@ -2429,6 +2768,7 @@ static void device_model_spawn_outcome(libxl__egc *egc,
     }
 
  out:
+    dmss_dispose(gc, dmss);
     dmss->callback(egc, dmss, rc);
 }
 
@@ -2440,6 +2780,8 @@ void libxl__spawn_qdisk_backend(libxl__egc *egc, libxl__dm_spawn_state *dmss)
     const char *dm;
     int logfile_w, null = -1, rc;
     uint32_t domid = dmss->guest_domid;
+
+    dmss_init(dmss);
 
     /* Always use qemu-xen as device model */
     dm = qemu_xen_path(gc);
@@ -2505,6 +2847,7 @@ void libxl__spawn_qdisk_backend(libxl__egc *egc, libxl__dm_spawn_state *dmss)
 
     rc = 0;
 out:
+    dmss_dispose(gc, dmss);
     if (logfile_w >= 0) close(logfile_w);
     if (null >= 0) close(null);
     /* callback on error only, success goes via dmss->spawn.*_cb */
@@ -2563,14 +2906,272 @@ out:
     return rc;
 }
 
-int libxl__destroy_device_model(libxl__gc *gc, uint32_t domid)
+/* Asynchronous device model destroy functions */
+
+static int kill_device_model_uid_child(libxl__destroy_devicemodel_state *ddms,
+                                       const char *dm_kill_uid_str);
+
+static void kill_device_model_uid_cb(libxl__egc *egc,
+                                     libxl__ev_child *destroyer,
+                                     pid_t pid, int status);
+
+/*
+ * If we have a uid, we shouldn't kill by pid.  This is because a
+ * hostile QEMU might have exited, in which case the pid we have may
+ * be that of another process.
+ *
+ * The running devicemodel has permission over a specific domain id;
+ * this means that ideally we wouldn't the domain in question (freeing
+ * up the domain id for reuse) until we're confident that we've killed
+ * the domain.
+ *
+ * In general, destroy as much as we can; but return an error if there
+ * are any errors, so that the domain destroy will be aborted, and the
+ * domain itself will remain, giving the admin an opportunity to fix
+ * any issues and re-try the domain destroy.
+ */
+void libxl__destroy_device_model(libxl__egc *egc,
+                                 libxl__destroy_devicemodel_state *ddms)
 {
-    char *path = DEVICE_MODEL_XS_PATH(gc, LIBXL_TOOLSTACK_DOMID, domid, "");
-    if (!xs_rm(CTX->xsh, XBT_NULL, path))
+    STATE_AO_GC(ddms->ao);
+    int rc;
+    int domid = ddms->domid;
+    char *path;
+    const char *dm_kill_uid_str = NULL;
+    int reaper_pid;
+
+    ddms->rc = 0;
+
+    path = DEVICE_MODEL_XS_PATH(gc, LIBXL_TOOLSTACK_DOMID, domid, "");
+    rc = libxl__xs_rm_checked(gc, XBT_NULL, path);
+    if (rc) {
+        ACCUMULATE_RC(ddms->rc);
         LOGD(ERROR, domid, "xs_rm failed for %s", path);
-    /* We should try to destroy the device model anyway. */
-    return kill_device_model(gc,
-                GCSPRINTF("/local/domain/%d/image/device-model-pid", domid));
+    }
+
+    /*
+     * See if we should try to kill by uid
+     */
+    path = GCSPRINTF("/local/domain/%d/image/device-model-kill-uid", domid);
+    rc = libxl__xs_read_checked(gc, XBT_NULL, path, &dm_kill_uid_str);
+
+    /*
+     * If there was an error here, accumulate the error and fall back
+     * to killing by pid.
+     */
+    if (rc) {
+        /* 
+         * Technically the state of the string passed to libxl__xs_read_checked() is
+         * "undefined" in the case rc == 0 (according to libxl_internal.h).  Set it to
+         * NULL to prevent undefined behavior.
+         */
+        dm_kill_uid_str = NULL;
+        ACCUMULATE_RC(ddms->rc);
+        LOGD(ERROR, domid, "Reading dm UID path failed for %s", path);
+    }
+
+    /* The DM has its own uid; Attempt to kill all processes with that UID */
+    if (dm_kill_uid_str) {
+        LOGD(DEBUG, domid, "Found DM uid %s, destroying by uid",
+             dm_kill_uid_str);
+
+        reaper_pid = libxl__ev_child_fork(gc, &ddms->destroyer,
+                                          kill_device_model_uid_cb);
+        if (reaper_pid < 0) {
+            rc = ERROR_FAIL;
+            ACCUMULATE_RC(ddms->rc);
+            /*
+             * Note that if this fails, we still don't kill by pid, to
+             * make sure that an untrusted DM has not "maliciously"
+             * exited (potentially causing us to kill an unrelated
+             * process which happened to get the same pid).
+             */
+            goto out;
+        }
+
+        if (!reaper_pid) {  /* child */
+            rc = kill_device_model_uid_child(ddms, dm_kill_uid_str);
+            assert(rc <= 0 && rc >= -125);
+            _exit(-rc);
+        }
+
+        /*
+         * Parent of successful fork; execution will pick up in
+         * kill_device_model_uid_cb when child exits
+         */
+        return;
+    }
+
+    /*
+     * No uid to kill; attept to kill by pid.
+     */
+    LOGD(DEBUG, domid, "Didn't find dm UID; destroying by pid");
+
+    path = GCSPRINTF("/local/domain/%d/image/device-model-pid", domid);
+    rc = kill_device_model(gc, path);
+
+    if (rc) {
+        ACCUMULATE_RC(ddms->rc);
+        LOGD(ERROR, domid, "Killing device model pid from path %s", path);
+    }
+
+out:
+    /*
+     * NB that we always pass '0' here for the "status of exited
+     * process"; since there is no process, it always "succeeds".
+     * Errors are accumulated in ddms->rc and will be handled
+     * correctly.
+     */
+    kill_device_model_uid_cb(egc, &ddms->destroyer, -1, 0);
+    return;
+}
+
+/* 
+ * Note that this attempts to grab a file lock, so must be called from
+ * a sub-process.
+ */
+static int get_reaper_lock_and_uid(libxl__destroy_devicemodel_state *ddms,
+                                   uid_t *reaper_uid)
+{
+    STATE_AO_GC(ddms->ao);
+    int domid = ddms->domid;
+    int r;
+    const char * lockfile;
+    int fd; /* "leaked" into the general process context (even on failure) */
+
+    /* Try to lock the "reaper uid" */
+    lockfile = GCSPRINTF("%s/dm-reaper-lock", libxl__run_dir_path());
+
+    /*
+     * NB that since we've just forked, we can't have any
+     * threads; so we don't need the libxl__carefd
+     * infrastructure here.
+     */
+    fd = open(lockfile, O_RDWR|O_CREAT, 0644);
+    if (fd < 0) {
+        LOGED(ERROR, domid,
+              "unexpected error while trying to open lockfile %s, errno=%d",
+              lockfile, errno);
+        return ERROR_FAIL;
+    }
+
+    /* Try to lock the file, retrying on EINTR */
+    for (;;) {
+        r = flock(fd, LOCK_EX);
+        if (!r)
+            break;
+        if (errno != EINTR) {
+            /* All other errno: EBADF, EINVAL, ENOLCK, EWOULDBLOCK */
+            LOGED(ERROR, domid,
+                  "unexpected error while trying to lock %s, fd=%d, errno=%d",
+                  lockfile, fd, errno);
+            return ERROR_FAIL;
+        }
+    }
+
+    /*
+     * Get reaper_uid.  If we can't find such a uid, return an error.
+     */
+    return libxl__get_reaper_uid(gc, reaper_uid);
+}
+
+
+/*
+ * Destroy all processes of the given uid by setresuid to the
+ * specified uid and kill(-1).  NB this MUST BE CALLED FROM A SEPARATE
+ * PROCESS from the normal libxl process, and should exit immediately
+ * after return.  Returns a libxl-style error code that is guaranteed
+ * to be >= -125.
+ */
+static int kill_device_model_uid_child(libxl__destroy_devicemodel_state *ddms,
+                                       const char *dm_kill_uid_str) {
+    STATE_AO_GC(ddms->ao);
+    int domid = ddms->domid;
+    int r, rc = 0;
+    uid_t dm_kill_uid = atoi(dm_kill_uid_str);
+    uid_t reaper_uid;
+
+    /*
+     * Try to kill the devicemodel by uid.  The safest way to do this
+     * is to set euid == dm_uid, but the ruid to something else.  If
+     * we can't get a separate ruid, carry on trying to kill the
+     * process anyway using dm_uid for the ruid.  This is racy (the dm
+     * may be able to kill(-1) us before we kill them), but worth
+     * trying.
+     *
+     * NB: Even if we don't have a separate reaper_uid, the parent can
+     * know whether we won the race by looking at the status variable;
+     * so we don't strictly need to return failure in this case.  But
+     * if there's a misconfiguration, it's better to alert the
+     * administator sooner rather than later; so if we fail to get a
+     * reaper uid, report an error even if the kill succeeds.
+     */
+    rc = get_reaper_lock_and_uid(ddms, &reaper_uid);
+    if (rc) {
+        reaper_uid = dm_kill_uid;
+        LOGD(WARN, domid, "Couldn't get separate reaper uid;"
+            "carrying on with unsafe kill");
+    }
+
+    /*
+     * Should never happen; but if it does, better to have the
+     * toolstack crash with an error than nuking dom0.
+      */
+    assert(reaper_uid);
+    assert(dm_kill_uid);
+
+    LOGD(DEBUG, domid, "DM reaper: calling setresuid(%d, %d, 0)",
+         reaper_uid, dm_kill_uid);
+    r = setresuid(reaper_uid, dm_kill_uid, 0);
+    if (r) {
+        LOGED(ERROR, domid, "setresuid to (%d, %d, 0)",
+              reaper_uid, dm_kill_uid);
+        rc = rc ?: ERROR_FAIL;
+        goto out;
+    }
+
+    /*
+     * And kill everyone but me.
+     *
+     * NB that it's not clear from either POSIX or the Linux man page
+     * that ESRCH would be returned with a pid value of -1, but it
+     * doesn't hurt to check.
+     */
+    r = kill(-1, 9);
+    if (r && errno != ESRCH) {
+        LOGED(ERROR, domid, "kill(-1,9)");
+        rc = rc ?: ERROR_FAIL;
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    return rc;
+}
+
+static void kill_device_model_uid_cb(libxl__egc *egc,
+                                    libxl__ev_child *destroyer,
+                                    pid_t pid, int status)
+{
+    libxl__destroy_devicemodel_state *ddms = CONTAINER_OF(destroyer, *ddms, destroyer);
+    STATE_AO_GC(ddms->ao);
+
+    if (status) {
+        int rc = ERROR_FAIL;
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) <= 125)
+            rc = -WEXITSTATUS(status);
+
+        ACCUMULATE_RC(ddms->rc);
+        libxl_report_child_exitstatus(CTX, XTL_ERROR,
+                                      "async domain destroy", pid, status);
+    }
+
+    /* Always try to clean up qmp, even if something went wrong */
+    libxl__qmp_cleanup(gc, ddms->domid);
+
+    ddms->callback(egc, ddms, ddms->rc);
 }
 
 /* Return 0 if no dm needed, 1 if needed and <0 if error. */
@@ -2586,7 +3187,7 @@ int libxl__need_xenpv_qemu(libxl__gc *gc, libxl_domain_config *d_config)
         goto out;
     }
 
-    if (d_config->num_vfbs > 0) {
+    if (d_config->num_vfbs > 0 || d_config->num_p9s > 0) {
         ret = 1;
         goto out;
     }

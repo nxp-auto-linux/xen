@@ -48,12 +48,6 @@
 #include <mach_wakecpu.h>
 #include <smpboot_hooks.h>
 
-/* Override macros from asm/page.h to make them work with mfn_t */
-#undef mfn_to_page
-#define mfn_to_page(mfn) __mfn_to_page(mfn_x(mfn))
-#undef page_to_mfn
-#define page_to_mfn(pg) _mfn(__page_to_mfn(pg))
-
 #define setup_trampoline()    (bootsym_phys(trampoline_realmode_entry))
 
 unsigned long __read_mostly trampoline_phys;
@@ -68,6 +62,8 @@ static cpumask_t scratch_cpu0mask;
 
 cpumask_t cpu_online_map __read_mostly;
 EXPORT_SYMBOL(cpu_online_map);
+
+bool __read_mostly park_offline_cpus;
 
 unsigned int __read_mostly nr_sockets;
 cpumask_t **__read_mostly socket_cpumask;
@@ -87,7 +83,7 @@ static enum cpu_state {
     CPU_STATE_CALLIN,   /* slave -> master: Completed phase 2 */
     CPU_STATE_ONLINE    /* master -> slave: Go fully online now. */
 } cpu_state;
-#define set_cpu_state(state) do { mb(); cpu_state = (state); } while (0)
+#define set_cpu_state(state) do { smp_mb(); cpu_state = (state); } while (0)
 
 void *stack_base[NR_CPUS];
 
@@ -96,11 +92,14 @@ void initialize_cpu_data(unsigned int cpu)
     cpu_data[cpu] = boot_cpu_data;
 }
 
-static void smp_store_cpu_info(int id)
+static bool smp_store_cpu_info(unsigned int id)
 {
     unsigned int socket;
 
-    identify_cpu(&cpu_data[id]);
+    if ( system_state != SYS_STATE_resume )
+        identify_cpu(&cpu_data[id]);
+    else if ( !recheck_cpu_features(id) )
+        return false;
 
     socket = cpu_to_socket(id);
     if ( !socket_cpumask[socket] )
@@ -108,6 +107,8 @@ static void smp_store_cpu_info(int id)
         socket_cpumask[socket] = secondary_socket_cpumask;
         secondary_socket_cpumask = NULL;
     }
+
+    return true;
 }
 
 /*
@@ -134,7 +135,7 @@ static void synchronize_tsc_master(unsigned int slave)
     for ( i = 1; i <= 5; i++ )
     {
         tsc_value = rdtsc_ordered();
-        wmb();
+        smp_wmb();
         atomic_inc(&tsc_count);
         while ( atomic_read(&tsc_count) != (i<<1) )
             cpu_relax();
@@ -159,7 +160,7 @@ static void synchronize_tsc_slave(unsigned int slave)
     {
         while ( atomic_read(&tsc_count) != ((i<<1)-1) )
             cpu_relax();
-        rmb();
+        smp_rmb();
         /*
          * If a CPU has been physically hotplugged, we may as well write
          * to its TSC in spite of X86_FEATURE_TSC_RELIABLE. The platform does
@@ -193,12 +194,19 @@ static void smp_callin(void)
     setup_local_APIC();
 
     /* Save our processor parameters. */
-    smp_store_cpu_info(cpu);
+    if ( !smp_store_cpu_info(cpu) )
+    {
+        printk("CPU%u: Failed to validate features - not coming back online\n",
+               cpu);
+        cpu_error = -ENXIO;
+        goto halt;
+    }
 
     if ( (rc = hvm_cpu_up()) != 0 )
     {
         printk("CPU%d: Failed to initialise HVM. Not coming online.\n", cpu);
         cpu_error = rc;
+    halt:
         clear_local_APIC();
         spin_debug_enable();
         cpu_exit_clear(cpu);
@@ -228,32 +236,40 @@ static void link_thread_siblings(int cpu1, int cpu2)
     cpumask_set_cpu(cpu2, per_cpu(cpu_core_mask, cpu1));
 }
 
-static void set_cpu_sibling_map(int cpu)
+static void set_cpu_sibling_map(unsigned int cpu)
 {
-    int i;
+    unsigned int i;
     struct cpuinfo_x86 *c = cpu_data;
 
     cpumask_set_cpu(cpu, &cpu_sibling_setup_map);
 
     cpumask_set_cpu(cpu, socket_cpumask[cpu_to_socket(cpu)]);
+    cpumask_set_cpu(cpu, per_cpu(cpu_core_mask, cpu));
+    cpumask_set_cpu(cpu, per_cpu(cpu_sibling_mask, cpu));
 
     if ( c[cpu].x86_num_siblings > 1 )
     {
         for_each_cpu ( i, &cpu_sibling_setup_map )
         {
-            if ( cpu_has(c, X86_FEATURE_TOPOEXT) ) {
-                if ( (c[cpu].phys_proc_id == c[i].phys_proc_id) &&
-                     (c[cpu].compute_unit_id == c[i].compute_unit_id) )
+            if ( cpu == i || c[cpu].phys_proc_id != c[i].phys_proc_id )
+                continue;
+            if ( c[cpu].compute_unit_id != INVALID_CUID &&
+                 c[i].compute_unit_id != INVALID_CUID )
+            {
+                if ( c[cpu].compute_unit_id == c[i].compute_unit_id )
                     link_thread_siblings(cpu, i);
-            } else if ( (c[cpu].phys_proc_id == c[i].phys_proc_id) &&
-                        (c[cpu].cpu_core_id == c[i].cpu_core_id) ) {
-                link_thread_siblings(cpu, i);
             }
+            else if ( c[cpu].cpu_core_id != XEN_INVALID_CORE_ID &&
+                      c[i].cpu_core_id != XEN_INVALID_CORE_ID )
+            {
+                if ( c[cpu].cpu_core_id == c[i].cpu_core_id )
+                    link_thread_siblings(cpu, i);
+            }
+            else
+                printk(XENLOG_WARNING
+                       "CPU%u: unclear relationship with CPU%u\n",
+                       cpu, i);
         }
-    }
-    else
-    {
-        cpumask_set_cpu(cpu, per_cpu(cpu_sibling_mask, cpu));
     }
 
     if ( c[cpu].x86_max_cores == 1 )
@@ -330,8 +346,9 @@ void start_secondary(void *unused)
      */
     spin_debug_disable();
 
+    get_cpu_info()->use_pv_cr3 = false;
     get_cpu_info()->xen_cr3 = 0;
-    get_cpu_info()->pv_cr3 = this_cpu(root_pgt) ? __pa(this_cpu(root_pgt)) : 0;
+    get_cpu_info()->pv_cr3 = 0;
 
     load_system_tables();
 
@@ -351,10 +368,20 @@ void start_secondary(void *unused)
     else
         microcode_resume_cpu(cpu);
 
+    /*
+     * If MSR_SPEC_CTRL is available, apply Xen's default setting and discard
+     * any firmware settings.  Note: MSR_SPEC_CTRL may only become available
+     * after loading microcode.
+     */
+    if ( boot_cpu_has(X86_FEATURE_IBRSB) )
+        wrmsrl(MSR_SPEC_CTRL, default_xen_spec_ctrl);
+
     if ( xen_guest )
         hypervisor_ap_setup();
 
     smp_callin();
+
+    set_cpu_sibling_map(cpu);
 
     init_percpu_time();
 
@@ -368,9 +395,7 @@ void start_secondary(void *unused)
 
     /* This must be done before setting cpu_online_map */
     spin_debug_enable();
-    set_cpu_sibling_map(cpu);
     notify_cpu_starting(cpu);
-    wmb();
 
     /*
      * We need to hold vector_lock so there the set of online cpus
@@ -386,7 +411,6 @@ void start_secondary(void *unused)
     local_irq_enable();
     mtrr_ap_init();
 
-    wmb();
     startup_cpu_idle_loop();
 }
 
@@ -570,13 +594,13 @@ static int do_boot_cpu(int apicid, int cpu)
         }
         else if ( cpu_state == CPU_STATE_DEAD )
         {
-            rmb();
+            smp_rmb();
             rc = cpu_error;
         }
         else
         {
             boot_error = 1;
-            mb();
+            smp_mb();
             if ( bootsym(trampoline_cpu_started) == 0xA5 )
                 /* trampoline started but...? */
                 printk("Stuck ??\n");
@@ -594,7 +618,7 @@ static int do_boot_cpu(int apicid, int cpu)
 
     /* mark "stuck" area as not stuck */
     bootsym(trampoline_cpu_started) = 0;
-    mb();
+    smp_mb();
 
     smpboot_restore_warm_reset_vector();
 
@@ -625,7 +649,7 @@ unsigned long alloc_stub_page(unsigned int cpu, unsigned long *mfn)
     }
 
     stub_va = XEN_VIRT_END - (cpu + 1) * PAGE_SIZE;
-    if ( map_pages_to_xen(stub_va, mfn_x(page_to_mfn(pg)), 1,
+    if ( map_pages_to_xen(stub_va, page_to_mfn(pg), 1,
                           PAGE_HYPERVISOR_RX | MAP_SMALL_PAGES) )
     {
         if ( !*mfn )
@@ -766,7 +790,7 @@ static int setup_cpu_root_pgt(unsigned int cpu)
     unsigned int off;
     int rc;
 
-    if ( cpu_has_no_xpti )
+    if ( !opt_xpti_hwdom && !opt_xpti_domu )
         return 0;
 
     rpt = alloc_xen_pagetable();
@@ -870,11 +894,18 @@ static void cleanup_cpu_root_pgt(unsigned int cpu)
         l2_pgentry_t *l2t = l3e_to_l2e(l3t[l3_table_offset(stub_linear)]);
         l1_pgentry_t *l1t = l2e_to_l1e(l2t[l2_table_offset(stub_linear)]);
 
-        l1t[l2_table_offset(stub_linear)] = l1e_empty();
+        l1t[l1_table_offset(stub_linear)] = l1e_empty();
     }
 }
 
-static void cpu_smpboot_free(unsigned int cpu)
+/*
+ * The 'remove' boolean controls whether a CPU is just getting offlined (and
+ * parked), or outright removed / offlined without parking. Parked CPUs need
+ * things like their stack, GDT, IDT, TSS, and per-CPU data still available.
+ * A few other items, in particular CPU masks, are also retained, as it's
+ * difficult to prove that they're entirely unreferenced from parked CPUs.
+ */
+static void cpu_smpboot_free(unsigned int cpu, bool remove)
 {
     unsigned int order, socket = cpu_to_socket(cpu);
     struct cpuinfo_x86 *c = cpu_data;
@@ -885,15 +916,19 @@ static void cpu_smpboot_free(unsigned int cpu)
         socket_cpumask[socket] = NULL;
     }
 
-    c[cpu].phys_proc_id = XEN_INVALID_SOCKET_ID;
-    c[cpu].cpu_core_id = XEN_INVALID_CORE_ID;
-    c[cpu].compute_unit_id = INVALID_CUID;
     cpumask_clear_cpu(cpu, &cpu_sibling_setup_map);
 
-    free_cpumask_var(per_cpu(cpu_sibling_mask, cpu));
-    free_cpumask_var(per_cpu(cpu_core_mask, cpu));
-    if ( per_cpu(scratch_cpumask, cpu) != &scratch_cpu0mask )
-        free_cpumask_var(per_cpu(scratch_cpumask, cpu));
+    if ( remove )
+    {
+        c[cpu].phys_proc_id = XEN_INVALID_SOCKET_ID;
+        c[cpu].cpu_core_id = XEN_INVALID_CORE_ID;
+        c[cpu].compute_unit_id = INVALID_CUID;
+
+        FREE_CPUMASK_VAR(per_cpu(cpu_sibling_mask, cpu));
+        FREE_CPUMASK_VAR(per_cpu(cpu_core_mask, cpu));
+        if ( per_cpu(scratch_cpumask, cpu) != &scratch_cpu0mask )
+            FREE_CPUMASK_VAR(per_cpu(scratch_cpumask, cpu));
+    }
 
     cleanup_cpu_root_pgt(cpu);
 
@@ -915,19 +950,21 @@ static void cpu_smpboot_free(unsigned int cpu)
     }
 
     order = get_order_from_pages(NR_RESERVED_GDT_PAGES);
-    free_xenheap_pages(per_cpu(gdt_table, cpu), order);
+    if ( remove )
+        FREE_XENHEAP_PAGES(per_cpu(gdt_table, cpu), order);
 
     free_xenheap_pages(per_cpu(compat_gdt_table, cpu), order);
 
-    order = get_order_from_bytes(IDT_ENTRIES * sizeof(idt_entry_t));
-    free_xenheap_pages(idt_tables[cpu], order);
-    idt_tables[cpu] = NULL;
-
-    if ( stack_base[cpu] != NULL )
+    if ( remove )
     {
-        memguard_unguard_stack(stack_base[cpu]);
-        free_xenheap_pages(stack_base[cpu], STACK_ORDER);
-        stack_base[cpu] = NULL;
+        order = get_order_from_bytes(IDT_ENTRIES * sizeof(idt_entry_t));
+        FREE_XENHEAP_PAGES(idt_tables[cpu], order);
+
+        if ( stack_base[cpu] )
+        {
+            memguard_unguard_stack(stack_base[cpu]);
+            FREE_XENHEAP_PAGES(stack_base[cpu], STACK_ORDER);
+        }
     }
 }
 
@@ -935,39 +972,41 @@ static int cpu_smpboot_alloc(unsigned int cpu)
 {
     unsigned int i, order, memflags = 0;
     nodeid_t node = cpu_to_node(cpu);
-    struct desc_struct *gdt;
+    seg_desc_t *gdt;
     unsigned long stub_page;
+    int rc = -ENOMEM;
 
     if ( node != NUMA_NO_NODE )
         memflags = MEMF_node(node);
 
-    stack_base[cpu] = alloc_xenheap_pages(STACK_ORDER, memflags);
     if ( stack_base[cpu] == NULL )
-        goto oom;
+        stack_base[cpu] = alloc_xenheap_pages(STACK_ORDER, memflags);
+    if ( stack_base[cpu] == NULL )
+        goto out;
     memguard_guard_stack(stack_base[cpu]);
 
     order = get_order_from_pages(NR_RESERVED_GDT_PAGES);
-    per_cpu(gdt_table, cpu) = gdt = alloc_xenheap_pages(order, memflags);
+    gdt = per_cpu(gdt_table, cpu) ?: alloc_xenheap_pages(order, memflags);
     if ( gdt == NULL )
-        goto oom;
+        goto out;
+    per_cpu(gdt_table, cpu) = gdt;
     memcpy(gdt, boot_cpu_gdt_table, NR_RESERVED_GDT_PAGES * PAGE_SIZE);
     BUILD_BUG_ON(NR_CPUS > 0x10000);
     gdt[PER_CPU_GDT_ENTRY - FIRST_RESERVED_GDT_ENTRY].a = cpu;
 
     per_cpu(compat_gdt_table, cpu) = gdt = alloc_xenheap_pages(order, memflags);
     if ( gdt == NULL )
-        goto oom;
+        goto out;
     memcpy(gdt, boot_cpu_compat_gdt_table, NR_RESERVED_GDT_PAGES * PAGE_SIZE);
     gdt[PER_CPU_GDT_ENTRY - FIRST_RESERVED_GDT_ENTRY].a = cpu;
 
     order = get_order_from_bytes(IDT_ENTRIES * sizeof(idt_entry_t));
-    idt_tables[cpu] = alloc_xenheap_pages(order, memflags);
     if ( idt_tables[cpu] == NULL )
-        goto oom;
+        idt_tables[cpu] = alloc_xenheap_pages(order, memflags);
+    if ( idt_tables[cpu] == NULL )
+        goto out;
     memcpy(idt_tables[cpu], idt_table, IDT_ENTRIES * sizeof(idt_entry_t));
-    set_ist(&idt_tables[cpu][TRAP_double_fault],  IST_NONE);
-    set_ist(&idt_tables[cpu][TRAP_nmi],           IST_NONE);
-    set_ist(&idt_tables[cpu][TRAP_machine_check], IST_NONE);
+    disable_each_ist(idt_tables[cpu]);
 
     for ( stub_page = 0, i = cpu & ~(STUBS_PER_PAGE - 1);
           i < nr_cpu_ids && i <= (cpu | (STUBS_PER_PAGE - 1)); ++i )
@@ -979,24 +1018,30 @@ static int cpu_smpboot_alloc(unsigned int cpu)
     BUG_ON(i == cpu);
     stub_page = alloc_stub_page(cpu, &per_cpu(stubs.mfn, cpu));
     if ( !stub_page )
-        goto oom;
+        goto out;
     per_cpu(stubs.addr, cpu) = stub_page + STUB_BUF_CPU_OFFS(cpu);
 
-    if ( setup_cpu_root_pgt(cpu) )
-        goto oom;
+    rc = setup_cpu_root_pgt(cpu);
+    if ( rc )
+        goto out;
+    rc = -ENOMEM;
 
     if ( secondary_socket_cpumask == NULL &&
          (secondary_socket_cpumask = xzalloc(cpumask_t)) == NULL )
-        goto oom;
+        goto out;
 
-    if ( zalloc_cpumask_var(&per_cpu(cpu_sibling_mask, cpu)) &&
-         zalloc_cpumask_var(&per_cpu(cpu_core_mask, cpu)) &&
-         alloc_cpumask_var(&per_cpu(scratch_cpumask, cpu)) )
-        return 0;
+    if ( !(cond_zalloc_cpumask_var(&per_cpu(cpu_sibling_mask, cpu)) &&
+           cond_zalloc_cpumask_var(&per_cpu(cpu_core_mask, cpu)) &&
+           cond_alloc_cpumask_var(&per_cpu(scratch_cpumask, cpu))) )
+        goto out;
 
- oom:
-    cpu_smpboot_free(cpu);
-    return -ENOMEM;
+    rc = 0;
+
+ out:
+    if ( rc )
+        cpu_smpboot_free(cpu, true);
+
+    return rc;
 }
 
 static int cpu_smpboot_callback(
@@ -1012,9 +1057,10 @@ static int cpu_smpboot_callback(
         break;
     case CPU_UP_CANCELED:
     case CPU_DEAD:
-        cpu_smpboot_free(cpu);
+        cpu_smpboot_free(cpu, !park_offline_cpus);
         break;
-    default:
+    case CPU_REMOVE:
+        cpu_smpboot_free(cpu, true);
         break;
     }
 
@@ -1025,7 +1071,7 @@ static struct notifier_block cpu_smpboot_nfb = {
     .notifier_call = cpu_smpboot_callback
 };
 
-void __init smp_prepare_cpus(unsigned int max_cpus)
+void __init smp_prepare_cpus(void)
 {
     int rc;
 
@@ -1047,14 +1093,16 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
         panic("Error %d setting up PV root page table\n", rc);
     if ( per_cpu(root_pgt, 0) )
     {
-        get_cpu_info()->pv_cr3 = __pa(per_cpu(root_pgt, 0));
+        get_cpu_info()->pv_cr3 = 0;
 
+#ifdef CONFIG_PV
         /*
          * All entry points which may need to switch page tables have to start
          * with interrupts off. Re-write what pv_trap_init() has put there.
          */
         _set_gate(idt_table + LEGACY_SYSCALL_VECTOR, SYS_DESC_irq_gate, 3,
                   &int80_direct_trap);
+#endif
     }
 
     set_nr_sockets();
@@ -1062,11 +1110,11 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
     socket_cpumask = xzalloc_array(cpumask_t *, nr_sockets);
     if ( socket_cpumask == NULL ||
          (socket_cpumask[cpu_to_socket(0)] = xzalloc(cpumask_t)) == NULL )
-        panic("No memory for socket CPU siblings map");
+        panic("No memory for socket CPU siblings map\n");
 
     if ( !zalloc_cpumask_var(&per_cpu(cpu_sibling_mask, 0)) ||
          !zalloc_cpumask_var(&per_cpu(cpu_core_mask, 0)) )
-        panic("No memory for boot CPU sibling/core maps");
+        panic("No memory for boot CPU sibling/core maps\n");
 
     set_cpu_sibling_map(0);
 
@@ -1126,6 +1174,7 @@ void __init smp_prepare_boot_cpu(void)
     per_cpu(scratch_cpumask, cpu) = &scratch_cpu0mask;
 #endif
 
+    get_cpu_info()->use_pv_cr3 = false;
     get_cpu_info()->xen_cr3 = 0;
     get_cpu_info()->pv_cr3 = 0;
 }

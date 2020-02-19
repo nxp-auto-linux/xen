@@ -18,9 +18,12 @@
 #ifndef __ASM_ARM_VGIC_H__
 #define __ASM_ARM_VGIC_H__
 
-#include <xen/bitops.h>
-#include <asm/mmio.h>
-#include <asm/vreg.h>
+#ifdef CONFIG_NEW_VGIC
+#include <asm/new_vgic.h>
+#else
+
+#include <xen/radix-tree.h>
+#include <xen/rbtree.h>
 
 struct pending_irq
 {
@@ -123,6 +126,91 @@ struct vgic_irq_rank {
     uint8_t vcpu[32];
 };
 
+struct vgic_dist {
+    /* Version of the vGIC */
+    enum gic_version version;
+    /* GIC HW version specific vGIC driver handler */
+    const struct vgic_ops *handler;
+    /*
+     * Covers access to other members of this struct _except_ for
+     * shared_irqs where each member contains its own locking.
+     *
+     * If both class of lock is required then this lock must be
+     * taken first. If multiple rank locks are required (including
+     * the per-vcpu private_irqs rank) then they must be taken in
+     * rank order.
+     */
+    spinlock_t lock;
+    uint32_t ctlr;
+    int nr_spis; /* Number of SPIs */
+    unsigned long *allocated_irqs; /* bitmap of IRQs allocated */
+    struct vgic_irq_rank *shared_irqs;
+    /*
+     * SPIs are domain global, SGIs and PPIs are per-VCPU and stored in
+     * struct arch_vcpu.
+     */
+    struct pending_irq *pending_irqs;
+    /* Base address for guest GIC */
+    paddr_t dbase; /* Distributor base address */
+#ifdef CONFIG_GICV3
+    /* GIC V3 addressing */
+    /* List of contiguous occupied by the redistributors */
+    struct vgic_rdist_region {
+        paddr_t base;                   /* Base address */
+        paddr_t size;                   /* Size */
+        unsigned int first_cpu;         /* First CPU handled */
+    } *rdist_regions;
+    int nr_regions;                     /* Number of rdist regions */
+    unsigned long int nr_lpis;
+    uint64_t rdist_propbase;
+    struct rb_root its_devices;         /* Devices mapped to an ITS */
+    spinlock_t its_devices_lock;        /* Protects the its_devices tree */
+    struct radix_tree_root pend_lpi_tree; /* Stores struct pending_irq's */
+    rwlock_t pend_lpi_tree_lock;        /* Protects the pend_lpi_tree */
+    struct list_head vits_list;         /* List of virtual ITSes */
+    unsigned int intid_bits;
+    /*
+     * TODO: if there are more bool's being added below, consider
+     * a flags variable instead.
+     */
+    bool rdists_enabled;                /* Is any redistributor enabled? */
+    bool has_its;
+#endif
+};
+
+struct vgic_cpu {
+    /*
+     * SGIs and PPIs are per-VCPU, SPIs are domain global and in
+     * struct arch_domain.
+     */
+    struct pending_irq pending_irqs[32];
+    struct vgic_irq_rank *private_irqs;
+
+    /* This list is ordered by IRQ priority and it is used to keep
+     * track of the IRQs that the VGIC injected into the guest.
+     * Depending on the availability of LR registers, the IRQs might
+     * actually be in an LR, and therefore injected into the guest,
+     * or queued in gic.lr_pending.
+     * As soon as an IRQ is EOI'd by the guest and removed from the
+     * corresponding LR it is also removed from this list. */
+    struct list_head inflight_irqs;
+    /* lr_pending is used to queue IRQs (struct pending_irq) that the
+     * vgic tried to inject in the guest (calling gic_set_guest_irq) but
+     * no LRs were available at the time.
+     * As soon as an LR is freed we remove the first IRQ from this
+     * list and write it to the LR register.
+     * lr_pending is a subset of vgic.inflight_irqs. */
+    struct list_head lr_pending;
+    spinlock_t lock;
+
+    /* GICv3: redistributor base and flags for this vCPU */
+    paddr_t rdist_base;
+    uint64_t rdist_pendbase;
+#define VGIC_V3_RDIST_LAST      (1 << 0)        /* last vCPU of the rdist */
+#define VGIC_V3_LPIS_ENABLED    (1 << 1)
+    uint8_t flags;
+};
+
 struct sgi_target {
     uint8_t aff1;
     uint16_t list;
@@ -146,8 +234,6 @@ struct vgic_ops {
     /* lookup the struct pending_irq for a given LPI interrupt */
     struct pending_irq *(*lpi_to_pending)(struct domain *d, unsigned int vlpi);
     int (*lpi_get_priority)(struct domain *d, uint32_t vlpi);
-    /* Maximum number of vCPU supported */
-    const unsigned int max_vcpus;
 };
 
 /* Number of ranks of interrupt registers for a domain */
@@ -191,6 +277,30 @@ enum gic_sgi_mode;
  */
 #define REG_RANK_INDEX(b, n, s) ((((n) >> s) & ((b)-1)) % 32)
 
+
+extern struct vcpu *vgic_get_target_vcpu(struct vcpu *v, unsigned int virq);
+extern void vgic_remove_irq_from_queues(struct vcpu *v, struct pending_irq *p);
+extern void gic_remove_from_lr_pending(struct vcpu *v, struct pending_irq *p);
+extern void vgic_init_pending_irq(struct pending_irq *p, unsigned int virq);
+extern struct pending_irq *irq_to_pending(struct vcpu *v, unsigned int irq);
+extern struct pending_irq *spi_to_pending(struct domain *d, unsigned int irq);
+extern struct vgic_irq_rank *vgic_rank_offset(struct vcpu *v, int b, int n, int s);
+extern struct vgic_irq_rank *vgic_rank_irq(struct vcpu *v, unsigned int irq);
+extern void vgic_disable_irqs(struct vcpu *v, uint32_t r, int n);
+extern void vgic_enable_irqs(struct vcpu *v, uint32_t r, int n);
+extern void register_vgic_ops(struct domain *d, const struct vgic_ops *ops);
+int vgic_v2_init(struct domain *d, int *mmio_count);
+int vgic_v3_init(struct domain *d, int *mmio_count);
+
+extern bool vgic_to_sgi(struct vcpu *v, register_t sgir,
+                        enum gic_sgi_mode irqmode, int virq,
+                        const struct sgi_target *target);
+extern bool vgic_migrate_irq(struct vcpu *old, struct vcpu *new, unsigned int irq);
+
+#endif /* !CONFIG_NEW_VGIC */
+
+/*** Common VGIC functions used by Xen arch code ****/
+
 /*
  * In the moment vgic_num_irqs() just covers SPIs and the private IRQs,
  * as it's mostly used for allocating the pending_irq and irq_desc array,
@@ -198,41 +308,15 @@ enum gic_sgi_mode;
  */
 #define vgic_num_irqs(d)        ((d)->arch.vgic.nr_spis + 32)
 
-extern int domain_vgic_init(struct domain *d, unsigned int nr_spis);
-extern void domain_vgic_free(struct domain *d);
-extern int vcpu_vgic_init(struct vcpu *v);
-extern struct vcpu *vgic_get_target_vcpu(struct vcpu *v, unsigned int virq);
-extern void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int virq);
-extern void vgic_vcpu_inject_spi(struct domain *d, unsigned int virq);
-extern void vgic_clear_pending_irqs(struct vcpu *v);
-extern void vgic_init_pending_irq(struct pending_irq *p, unsigned int virq);
-extern struct pending_irq *irq_to_pending(struct vcpu *v, unsigned int irq);
-extern struct pending_irq *spi_to_pending(struct domain *d, unsigned int irq);
-extern struct vgic_irq_rank *vgic_rank_offset(struct vcpu *v, int b, int n, int s);
-extern struct vgic_irq_rank *vgic_rank_irq(struct vcpu *v, unsigned int irq);
-extern bool vgic_emulate(struct cpu_user_regs *regs, union hsr hsr);
-extern void vgic_disable_irqs(struct vcpu *v, uint32_t r, int n);
-extern void vgic_enable_irqs(struct vcpu *v, uint32_t r, int n);
-extern void register_vgic_ops(struct domain *d, const struct vgic_ops *ops);
-int vgic_v2_init(struct domain *d, int *mmio_count);
-int vgic_v3_init(struct domain *d, int *mmio_count);
-
-extern int domain_vgic_register(struct domain *d, int *mmio_count);
-extern int vcpu_vgic_free(struct vcpu *v);
-extern bool vgic_to_sgi(struct vcpu *v, register_t sgir,
-                        enum gic_sgi_mode irqmode, int virq,
-                        const struct sgi_target *target);
-extern bool vgic_migrate_irq(struct vcpu *old, struct vcpu *new, unsigned int irq);
-
-/* Reserve a specific guest vIRQ */
-extern bool vgic_reserve_virq(struct domain *d, unsigned int virq);
-
 /*
  * Allocate a guest VIRQ
  *  - spi == 0 => allocate a PPI. It will be the same on every vCPU
  *  - spi == 1 => allocate an SPI
  */
 extern int vgic_allocate_virq(struct domain *d, bool spi);
+/* Reserve a specific guest vIRQ */
+extern bool vgic_reserve_virq(struct domain *d, unsigned int virq);
+extern void vgic_free_virq(struct domain *d, unsigned int virq);
 
 static inline int vgic_allocate_ppi(struct domain *d)
 {
@@ -244,19 +328,44 @@ static inline int vgic_allocate_spi(struct domain *d)
     return vgic_allocate_virq(d, true /* spi */);
 }
 
-extern void vgic_free_virq(struct domain *d, unsigned int virq);
+struct irq_desc *vgic_get_hw_irq_desc(struct domain *d, struct vcpu *v,
+                                      unsigned int virq);
+int vgic_connect_hw_irq(struct domain *d, struct vcpu *v, unsigned int virq,
+                        struct irq_desc *desc, bool connect);
+
+bool vgic_evtchn_irq_pending(struct vcpu *v);
+
+int domain_vgic_register(struct domain *d, int *mmio_count);
+int domain_vgic_init(struct domain *d, unsigned int nr_spis);
+void domain_vgic_free(struct domain *d);
+int vcpu_vgic_init(struct vcpu *vcpu);
+int vcpu_vgic_free(struct vcpu *vcpu);
+
+void vgic_inject_irq(struct domain *d, struct vcpu *v, unsigned int virq,
+                     bool level);
+
+extern void vgic_clear_pending_irqs(struct vcpu *v);
+
+extern bool vgic_emulate(struct cpu_user_regs *regs, union hsr hsr);
+
+/* Maximum vCPUs for a specific vGIC version, or 0 for unsupported. */
+unsigned int vgic_max_vcpus(unsigned int domctl_vgic_version);
 
 void vgic_v2_setup_hw(paddr_t dbase, paddr_t cbase, paddr_t csize,
                       paddr_t vbase, uint32_t aliased_offset);
 
-#ifdef CONFIG_HAS_GICV3
+#ifdef CONFIG_GICV3
 struct rdist_region;
 void vgic_v3_setup_hw(paddr_t dbase,
                       unsigned int nr_rdist_regions,
                       const struct rdist_region *regions,
-                      uint32_t rdist_stride,
                       unsigned int intid_bits);
 #endif
+
+void vgic_sync_to_lrs(void);
+void vgic_sync_from_lrs(struct vcpu *v);
+
+int vgic_vcpu_pending_irq(struct vcpu *v);
 
 #endif /* __ASM_ARM_VGIC_H__ */
 

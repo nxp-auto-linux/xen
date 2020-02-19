@@ -3,10 +3,14 @@
 #include <err.h>
 #include <getopt.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <inttypes.h>
 
 #include <xenctrl.h>
 
-#define ARRAY_SIZE(a) (sizeof a / sizeof *a)
+#include <xen-tools/libs.h>
+
 static uint32_t nr_features;
 
 static const char *str_1d[32] =
@@ -16,12 +20,12 @@ static const char *str_1d[32] =
     [ 4] = "tsc",  [ 5] = "msr",
     [ 6] = "pae",  [ 7] = "mce",
     [ 8] = "cx8",  [ 9] = "apic",
-    [10] = "REZ",  [11] = "sysenter",
+    /* [10] */     [11] = "sysenter",
     [12] = "mtrr", [13] = "pge",
     [14] = "mca",  [15] = "cmov",
     [16] = "pat",  [17] = "pse36",
     [18] = "psn",  [19] = "clflush",
-    [20] = "REZ",  [21] = "ds",
+    /* [20] */     [21] = "ds",
     [22] = "acpi", [23] = "mmx",
     [24] = "fxsr", [25] = "sse",
     [26] = "sse2", [27] = "ss",
@@ -39,7 +43,7 @@ static const char *str_1c[32] =
     [10] = "cntx-id", [11] = "sdgb",
     [12] = "fma",     [13] = "cx16",
     [14] = "xtpr",    [15] = "pdcm",
-    [16] = "REZ",     [17] = "pcid",
+    /* [16] */        [17] = "pcid",
     [18] = "dca",     [19] = "sse41",
     [20] = "sse42",   [21] = "x2apic",
     [22] = "movebe",  [23] = "popcnt",
@@ -56,16 +60,16 @@ static const char *str_e1d[32] =
     [ 4] = "tsc",    [ 5] = "msr",
     [ 6] = "pae",    [ 7] = "mce",
     [ 8] = "cx8",    [ 9] = "apic",
-    [10] = "REZ",    [11] = "syscall",
+    /* [10] */       [11] = "syscall",
     [12] = "mtrr",   [13] = "pge",
     [14] = "mca",    [15] = "cmov",
     [16] = "fcmov",  [17] = "pse36",
-    [18] = "REZ",    [19] = "mp",
-    [20] = "nx",     [21] = "REZ",
+    /* [18] */       [19] = "mp",
+    [20] = "nx",     /* [21] */
     [22] = "mmx+",   [23] = "mmx",
     [24] = "fxsr",   [25] = "fxsr+",
     [26] = "pg1g",   [27] = "rdtscp",
-    [28] = "REZ",    [29] = "lm",
+    /* [28] */       [29] = "lm",
     [30] = "3dnow+", [31] = "3dnow",
 };
 
@@ -78,16 +82,14 @@ static const char *str_e1c[32] =
     [ 8] = "3dnowpf",    [ 9] = "osvw",
     [10] = "ibs",        [11] = "xop",
     [12] = "skinit",     [13] = "wdt",
-    [14] = "REZ",        [15] = "lwp",
+    /* [14] */           [15] = "lwp",
     [16] = "fma4",       [17] = "tce",
-    [18] = "REZ",        [19] = "nodeid",
-    [20] = "REZ",        [21] = "tbm",
+    /* [18] */           [19] = "nodeid",
+    /* [20] */           [21] = "tbm",
     [22] = "topoext",    [23] = "perfctr_core",
-    [24] = "perfctr_nb", [25] = "REZ",
+    [24] = "perfctr_nb", /* [25] */
     [26] = "dbx",        [27] = "perftsc",
     [28] = "pcx_l2i",    [29] = "monitorx",
-
-    [30 ... 31] = "REZ",
 };
 
 static const char *str_7b0[32] =
@@ -114,8 +116,6 @@ static const char *str_Da1[32] =
 {
     [ 0] = "xsaveopt", [ 1] = "xsavec",
     [ 2] = "xgetbv1",  [ 3] = "xsaves",
-
-    [4 ... 31] = "REZ",
 };
 
 static const char *str_7c0[32] =
@@ -124,50 +124,31 @@ static const char *str_7c0[32] =
     [ 2] = "umip",     [ 3] = "pku",
     [ 4] = "ospke",
 
-    [5 ... 13] = "REZ",
-
     [14] = "avx512_vpopcntdq",
 
-    [15 ... 21] = "REZ",
-
     [22] = "rdpid",
-
-    [23 ... 31] = "REZ",
 };
 
 static const char *str_e7d[32] =
 {
-    [0 ... 7] = "REZ",
-
-    [ 8] = "itsc",     [ 9] = "REZ",
+    [ 8] = "itsc",
     [10] = "efro",
-
-    [11 ... 31] = "REZ",
 };
 
 static const char *str_e8b[32] =
 {
     [ 0] = "clzero",
 
-    [1 ... 11] = "REZ",
-
     [12] = "ibpb",
-
-    [13 ... 31] = "REZ",
 };
 
 static const char *str_7d0[32] =
 {
-    [0 ... 1] = "REZ",
-
     [ 2] = "avx512_4vnniw", [ 3] = "avx512_4fmaps",
 
-    [4 ... 25] = "REZ",
-
     [26] = "ibrsb",         [27] = "stibp",
-    [28] = "REZ",           [29] = "arch_caps",
-
-    [30 ... 31] = "REZ",
+    [28] = "l1d_flush",     [29] = "arch_caps",
+    /* 30 */                [31] = "ssbd",
 };
 
 static struct {
@@ -214,7 +195,12 @@ static void dump_leaf(uint32_t leaf, const char **strs)
 
     for ( i = 0; i < 32; ++i )
         if ( leaf & (1u << i) )
-            printf(" %s", strs[i] ?: "???" );
+        {
+            if ( strs[i] )
+                printf(" %s", strs[i]);
+            else
+                printf(" <%u>", i);
+        }
 }
 
 static void decode_featureset(const uint32_t *features,
@@ -245,7 +231,7 @@ static void get_featureset(xc_interface *xch, unsigned int idx)
 {
     struct fsinfo *f = &featuresets[idx];
 
-    f->len = xc_get_cpu_featureset_size();
+    f->len = nr_features;
     f->fs = calloc(nr_features, sizeof(*f->fs));
 
     if ( !f->fs )
@@ -294,15 +280,45 @@ static void dump_info(xc_interface *xch, bool detail)
         free(featuresets[i].fs);
 }
 
+static void print_policy(const char *name,
+                         xen_cpuid_leaf_t *leaves, uint32_t nr_leaves,
+                         xen_msr_entry_t *msrs, uint32_t nr_msrs)
+{
+    unsigned int l;
+
+    printf("%s policy: %u leaves, %u MSRs\n", name, nr_leaves, nr_msrs);
+    printf(" CPUID:\n");
+    printf("  %-8s %-8s -> %-8s %-8s %-8s %-8s\n",
+           "leaf", "subleaf", "eax", "ebx", "ecx", "edx");
+    for ( l = 0; l < nr_leaves; ++l )
+    {
+        /* Skip empty leaves. */
+        if ( !leaves[l].a && !leaves[l].b && !leaves[l].c && !leaves[l].d )
+            continue;
+
+        printf("  %08x:%08x -> %08x:%08x:%08x:%08x\n",
+               leaves[l].leaf, leaves[l].subleaf,
+               leaves[l].a, leaves[l].b, leaves[l].c, leaves[l].d);
+    }
+
+    printf(" MSRs:\n");
+    printf("  %-8s -> %-16s\n", "index", "value");
+    for ( l = 0; l < nr_msrs; ++l )
+        printf("  %08x -> %016"PRIx64"\n",
+               msrs[l].idx, msrs[l].val);
+}
+
 int main(int argc, char **argv)
 {
-    enum { MODE_UNKNOWN, MODE_INFO, MODE_DETAIL, MODE_INTERPRET }
+    enum { MODE_UNKNOWN, MODE_INFO, MODE_DETAIL, MODE_INTERPRET, MODE_POLICY }
     mode = MODE_UNKNOWN;
+    int domid = -1;
 
     nr_features = xc_get_cpu_featureset_size();
 
     for ( ;; )
     {
+        const char *tmp_optarg;
         int option_index = 0, c;
         static struct option long_options[] =
         {
@@ -310,10 +326,11 @@ int main(int argc, char **argv)
             { "info", no_argument, NULL, 'i' },
             { "detail", no_argument, NULL, 'd' },
             { "verbose", no_argument, NULL, 'v' },
+            { "policy", optional_argument, NULL, 'p' },
             { NULL, 0, NULL, 0 },
         };
 
-        c = getopt_long(argc, argv, "hidv", long_options, &option_index);
+        c = getopt_long(argc, argv, "hidvp::", long_options, &option_index);
 
         if ( c == -1 )
             break;
@@ -329,6 +346,28 @@ int main(int argc, char **argv)
 
         case 'i':
             mode = MODE_INFO;
+            break;
+
+        case 'p':
+            mode = MODE_POLICY;
+
+            tmp_optarg = optarg;
+
+            /* Make "--policy $DOMID" and "-p $DOMID" work. */
+            if ( !optarg && optind < argc &&
+                 argv[optind] != NULL && argv[optind][0] != '\0' &&
+                 argv[optind][0] != '-' )
+                tmp_optarg = argv[optind++];
+
+            if ( tmp_optarg )
+            {
+                char *endptr;
+
+                errno = 0;
+                domid = strtol(tmp_optarg, &endptr, 0);
+                if ( errno || endptr == tmp_optarg )
+                    err(1, "strtol(%s,,)", tmp_optarg);
+            }
             break;
 
         case 'd':
@@ -361,7 +400,74 @@ int main(int argc, char **argv)
             mode = MODE_INTERPRET;
     }
 
-    if ( mode == MODE_INFO || mode == MODE_DETAIL )
+    if ( mode == MODE_POLICY )
+    {
+        static const char *const sys_policies[] = {
+            [ XEN_SYSCTL_cpu_policy_raw ]          = "Raw",
+            [ XEN_SYSCTL_cpu_policy_host ]         = "Host",
+            [ XEN_SYSCTL_cpu_policy_pv_max ]       = "PV Max",
+            [ XEN_SYSCTL_cpu_policy_hvm_max ]      = "HVM Max",
+            [ XEN_SYSCTL_cpu_policy_pv_default ]   = "PV Default",
+            [ XEN_SYSCTL_cpu_policy_hvm_default ]  = "HVM Default",
+        };
+        xen_cpuid_leaf_t *leaves;
+        xen_msr_entry_t *msrs;
+        uint32_t i, max_leaves, max_msrs;
+
+        xc_interface *xch = xc_interface_open(0, 0, 0);
+
+        if ( !xch )
+            err(1, "xc_interface_open");
+
+        if ( xc_get_cpu_policy_size(xch, &max_leaves, &max_msrs) )
+            err(1, "xc_get_cpu_policy_size(...)");
+        if ( domid == -1 )
+            printf("Xen reports there are maximum %u leaves and %u MSRs\n",
+                   max_leaves, max_msrs);
+
+        leaves = calloc(max_leaves, sizeof(xen_cpuid_leaf_t));
+        if ( !leaves )
+            err(1, "calloc(max_leaves)");
+        msrs = calloc(max_msrs, sizeof(xen_msr_entry_t));
+        if ( !msrs )
+            err(1, "calloc(max_msrs)");
+
+        if ( domid != -1 )
+        {
+            char name[20];
+            uint32_t nr_leaves = max_leaves;
+            uint32_t nr_msrs = max_msrs;
+
+            if ( xc_get_domain_cpu_policy(xch, domid, &nr_leaves, leaves,
+                                          &nr_msrs, msrs) )
+                err(1, "xc_get_domain_cpu_policy(, %d, %d,, %d,)",
+                    domid, nr_leaves, nr_msrs);
+
+            snprintf(name, sizeof(name), "Domain %d", domid);
+            print_policy(name, leaves, nr_leaves, msrs, nr_msrs);
+        }
+        else
+        {
+            /* Get system policies */
+            for ( i = 0; i < ARRAY_SIZE(sys_policies); ++i )
+            {
+                uint32_t nr_leaves = max_leaves;
+                uint32_t nr_msrs = max_msrs;
+
+                if ( xc_get_system_cpu_policy(xch, i, &nr_leaves, leaves,
+                                              &nr_msrs, msrs) )
+                    err(1, "xc_get_system_cpu_policy(, %s,,)", sys_policies[i]);
+
+                print_policy(sys_policies[i], leaves, nr_leaves,
+                             msrs, nr_msrs);
+            }
+        }
+
+        free(leaves);
+        free(msrs);
+        xc_interface_close(xch);
+    }
+    else if ( mode == MODE_INFO || mode == MODE_DETAIL )
     {
         xc_interface *xch = xc_interface_open(0, 0, 0);
 

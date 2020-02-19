@@ -5,10 +5,8 @@
 #include <xen/radix-tree.h>
 #include <xen/rwlock.h>
 #include <xen/mem_access.h>
-#include <public/vm_event.h> /* for vm_event_response_t */
-#include <public/memory.h>
-#include <xen/p2m-common.h>
-#include <public/memory.h>
+
+#include <asm/current.h>
 
 #define paddr_bits PADDR_BITS
 
@@ -23,10 +21,6 @@ extern void memory_type_changed(struct domain *);
 struct p2m_domain {
     /*
      * Lock that protects updates to the p2m.
-     *
-     * Please note that we use this lock in a nested way by calling
-     * access_guest_memory_by_ipa in guest_walk_(sd|ld). This must be
-     * considered in the future implementation.
      */
     rwlock_t lock;
 
@@ -121,7 +115,8 @@ typedef enum {
     p2m_mmio_direct_dev,/* Read/write mapping of genuine Device MMIO area */
     p2m_mmio_direct_nc, /* Read/write mapping of genuine MMIO area non-cacheable */
     p2m_mmio_direct_c,  /* Read/write mapping of genuine MMIO area cacheable */
-    p2m_map_foreign,    /* Ram pages from foreign domain */
+    p2m_map_foreign_rw, /* Read/write RAM pages from foreign domain */
+    p2m_map_foreign_ro, /* Read-only RAM pages from foreign domain */
     p2m_grant_map_rw,   /* Read/write grant mapping */
     p2m_grant_map_ro,   /* Read-only grant mapping */
     /* The types below are only used to decide the page attribute in the P2M */
@@ -141,12 +136,22 @@ typedef enum {
 #define P2M_GRANT_TYPES (p2m_to_mask(p2m_grant_map_rw) |  \
                          p2m_to_mask(p2m_grant_map_ro))
 
+/* Foreign mappings types */
+#define P2M_FOREIGN_TYPES (p2m_to_mask(p2m_map_foreign_rw) | \
+                           p2m_to_mask(p2m_map_foreign_ro))
+
 /* Useful predicates */
 #define p2m_is_ram(_t) (p2m_to_mask(_t) & P2M_RAM_TYPES)
-#define p2m_is_foreign(_t) (p2m_to_mask(_t) & p2m_to_mask(p2m_map_foreign))
+#define p2m_is_foreign(_t) (p2m_to_mask(_t) & P2M_FOREIGN_TYPES)
 #define p2m_is_any_ram(_t) (p2m_to_mask(_t) &                   \
                             (P2M_RAM_TYPES | P2M_GRANT_TYPES |  \
-                             p2m_to_mask(p2m_map_foreign)))
+                             P2M_FOREIGN_TYPES))
+
+/* All common type definitions should live ahead of this inclusion. */
+#ifdef _XEN_P2M_COMMON_H
+# error "xen/p2m-common.h should not be included directly"
+#endif
+#include <xen/p2m-common.h>
 
 static inline
 void p2m_altp2m_check(struct vcpu *v, uint16_t idx)
@@ -204,6 +209,8 @@ static inline int p2m_is_write_locked(struct p2m_domain *p2m)
     return rw_is_write_locked(&p2m->lock);
 }
 
+void p2m_tlb_flush_sync(struct p2m_domain *p2m);
+
 /* Look up the MFN corresponding to a domain's GFN. */
 mfn_t p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t);
 
@@ -213,7 +220,8 @@ mfn_t p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t);
  */
 mfn_t p2m_get_entry(struct p2m_domain *p2m, gfn_t gfn,
                     p2m_type_t *t, p2m_access_t *a,
-                    unsigned int *page_order);
+                    unsigned int *page_order,
+                    bool *valid);
 
 /*
  * Direct set a p2m entry: only for use by the P2M code.
@@ -226,8 +234,23 @@ int p2m_set_entry(struct p2m_domain *p2m,
                   p2m_type_t t,
                   p2m_access_t a);
 
-/* Clean & invalidate caches corresponding to a region of guest address space */
-int p2m_cache_flush(struct domain *d, gfn_t start, unsigned long nr);
+bool p2m_resolve_translation_fault(struct domain *d, gfn_t gfn);
+
+void p2m_invalidate_root(struct p2m_domain *p2m);
+
+/*
+ * Clean & invalidate caches corresponding to a region [start,end) of guest
+ * address space.
+ *
+ * start will get updated if the function is preempted.
+ */
+int p2m_cache_flush_range(struct domain *d, gfn_t *pstart, gfn_t end);
+
+void p2m_set_way_flush(struct vcpu *v);
+
+void p2m_toggle_cache(struct vcpu *v, bool was_enabled);
+
+void p2m_flush_vm(struct vcpu *v);
 
 /*
  * Map a region in the guest p2m with a specific p2m type.
@@ -271,37 +294,43 @@ typedef unsigned int p2m_query_t;
 #define P2M_ALLOC    (1u<<0)   /* Populate PoD and paged-out entries */
 #define P2M_UNSHARE  (1u<<1)   /* Break CoW sharing */
 
+struct page_info *p2m_get_page_from_gfn(struct domain *d, gfn_t gfn,
+                                        p2m_type_t *t);
+
 static inline struct page_info *get_page_from_gfn(
     struct domain *d, unsigned long gfn, p2m_type_t *t, p2m_query_t q)
 {
+    mfn_t mfn;
+    p2m_type_t _t;
     struct page_info *page;
-    p2m_type_t p2mt;
-    unsigned long mfn = mfn_x(p2m_lookup(d, _gfn(gfn), &p2mt));
-
-    if (t)
-        *t = p2mt;
-
-    if ( !p2m_is_any_ram(p2mt) )
-        return NULL;
-
-    if ( !mfn_valid(_mfn(mfn)) )
-        return NULL;
-    page = mfn_to_page(mfn);
 
     /*
-     * get_page won't work on foreign mapping because the page doesn't
-     * belong to the current domain.
+     * Special case for DOMID_XEN as it is the only domain so far that is
+     * not auto-translated.
      */
-    if ( p2m_is_foreign(p2mt) )
-    {
-        struct domain *fdom = page_get_owner_and_reference(page);
-        ASSERT(fdom != NULL);
-        ASSERT(fdom != d);
-        return page;
-    }
+    if ( likely(d != dom_xen) )
+        return p2m_get_page_from_gfn(d, _gfn(gfn), t);
 
-    if ( !get_page(page, d) )
+    if ( !t )
+        t = &_t;
+
+    *t = p2m_invalid;
+
+    /*
+     * DOMID_XEN sees 1-1 RAM. The p2m_type is based on the type of the
+     * page.
+     */
+    mfn = _mfn(gfn);
+    page = mfn_to_page(mfn);
+
+    if ( !mfn_valid(mfn) || !get_page(page, d) )
         return NULL;
+
+    if ( page->u.inuse.type_info & PGT_writable_page )
+        *t = p2m_ram_rw;
+    else
+        *t = p2m_ram_ro;
+
     return page;
 }
 
@@ -344,6 +373,28 @@ static inline gfn_t gfn_next_boundary(gfn_t gfn, unsigned int order)
     gfn = _gfn(gfn_x(gfn) & ~((1UL << order) - 1));
 
     return gfn_add(gfn, 1UL << order);
+}
+
+static inline int set_foreign_p2m_entry(struct domain *d, unsigned long gfn,
+                                        mfn_t mfn)
+{
+    /*
+     * NOTE: If this is implemented then proper reference counting of
+     *       foreign entries will need to be implemented.
+     */
+    return -EOPNOTSUPP;
+}
+
+/*
+ * A vCPU has cache enabled only when the MMU is enabled and data cache
+ * is enabled.
+ */
+static inline bool vcpu_has_cache_enabled(struct vcpu *v)
+{
+    /* Only works with the current vCPU */
+    ASSERT(current == v);
+
+    return (READ_SYSREG32(SCTLR_EL1) & (SCTLR_C|SCTLR_M)) == (SCTLR_C|SCTLR_M);
 }
 
 #endif /* _XEN_P2M_H */

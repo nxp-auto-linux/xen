@@ -14,26 +14,14 @@
 
 #include "libxl_internal.h"
 
+#include <xen/io/displif.h>
+
 static int libxl__device_vdispl_setdefault(libxl__gc *gc, uint32_t domid,
                                            libxl_device_vdispl *vdispl,
                                            bool hotplug)
 {
     return libxl__resolve_domid(gc, vdispl->backend_domname,
                                 &vdispl->backend_domid);
-}
-
-static int libxl__device_from_vdispl(libxl__gc *gc, uint32_t domid,
-                                     libxl_device_vdispl *vdispl,
-                                     libxl__device *device)
-{
-   device->backend_devid   = vdispl->devid;
-   device->backend_domid   = vdispl->backend_domid;
-   device->backend_kind    = LIBXL__DEVICE_KIND_VDISPL;
-   device->devid           = vdispl->devid;
-   device->domid           = domid;
-   device->kind            = LIBXL__DEVICE_KIND_VDISPL;
-
-   return 0;
 }
 
 static int libxl__vdispl_from_xenstore(libxl__gc *gc, const char *libxl_path,
@@ -80,15 +68,15 @@ static int libxl__set_xenstore_vdispl(libxl__gc *gc, uint32_t domid,
 {
     int i;
 
-    flexarray_append_pair(ro_front, "be-alloc",
+    flexarray_append_pair(ro_front, XENDISPL_FIELD_BE_ALLOC,
                           GCSPRINTF("%d", vdispl->be_alloc));
 
     for (i = 0; i < vdispl->num_connectors; i++) {
-        flexarray_append_pair(ro_front, GCSPRINTF("%d/resolution", i),
-                              GCSPRINTF("%dx%d", vdispl->connectors[i].width,
+        flexarray_append_pair(ro_front, GCSPRINTF("%d/"XENDISPL_FIELD_RESOLUTION, i),
+                              GCSPRINTF("%d"XENDISPL_RESOLUTION_SEPARATOR"%d", vdispl->connectors[i].width,
                                                  vdispl->connectors[i].height));
-        flexarray_append_pair(ro_front, GCSPRINTF("%d/id", i),
-                              vdispl->connectors[i].id);
+        flexarray_append_pair(ro_front, GCSPRINTF("%d/"XENDISPL_FIELD_UNIQUE_ID, i),
+                              vdispl->connectors[i].unique_id);
     }
 
     return 0;
@@ -120,15 +108,15 @@ static int libxl__device_vdispl_getconnectors(libxl_ctx *ctx,
         char *value;
         char *value_path;
 
-        value_path = GCSPRINTF("%s/%d/id", path, i);
-        info->connectors[i].id = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
-        if (info->connectors[i].id == NULL) { rc = ERROR_FAIL; goto out; }
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_UNIQUE_ID, path, i);
+        info->connectors[i].unique_id = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
+        if (info->connectors[i].unique_id == NULL) { rc = ERROR_FAIL; goto out; }
 
-        value_path = GCSPRINTF("%s/%d/resolution", path, i);
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_RESOLUTION, path, i);
         value = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
         if (value == NULL) { rc = ERROR_FAIL; goto out; }
 
-        rc = sscanf(value, "%ux%u", &info->connectors[i].width,
+        rc = sscanf(value, "%u"XENDISPL_RESOLUTION_SEPARATOR"%u", &info->connectors[i].width,
                     &info->connectors[i].height);
         free(value);
 
@@ -136,22 +124,22 @@ static int libxl__device_vdispl_getconnectors(libxl_ctx *ctx,
             rc = ERROR_FAIL; goto out;
         }
 
-        value_path = GCSPRINTF("%s/%d/req-ring-ref", path, i);
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_REQ_RING_REF, path, i);
         value = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
         info->connectors[i].req_rref = value ? strtoul(value, NULL, 10) : -1;
         free(value);
 
-        value_path = GCSPRINTF("%s/%d/req-event-channel", path, i);
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_REQ_CHANNEL, path, i);
         value = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
         info->connectors[i].req_evtch = value ? strtoul(value, NULL, 10) : -1;
         free(value);
 
-        value_path = GCSPRINTF("%s/%d/evt-ring-ref", path, i);
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_EVT_RING_REF, path, i);
         value = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
         info->connectors[i].evt_rref = value ? strtoul(value, NULL, 10) : -1;
         free(value);
 
-        value_path = GCSPRINTF("%s/%d/evt-event-channel", path, i);
+        value_path = GCSPRINTF("%s/%d/"XENDISPL_FIELD_EVT_CHANNEL, path, i);
         value = xs_read(ctx->xsh, XBT_NULL, value_path, NULL);
         info->connectors[i].evt_evtch = value ? strtoul(value, NULL, 10) : -1;
         free(value);
@@ -168,18 +156,18 @@ int libxl_device_vdispl_getinfo(libxl_ctx *ctx, uint32_t domid,
                                 libxl_vdisplinfo *info)
 {
     GC_INIT(ctx);
-    char *libxl_path, *dompath, *devpath;
+    char *libxl_path, *devpath;
     char *val;
     int rc;
 
     libxl_vdisplinfo_init(info);
-    dompath = libxl__xs_get_dompath(gc, domid);
     info->devid = vdispl->devid;
 
-    devpath = GCSPRINTF("%s/device/vdispl/%d", dompath, info->devid);
-    libxl_path = GCSPRINTF("%s/device/vdispl/%d",
-                           libxl__xs_libxl_path(gc, domid),
-                           info->devid);
+    devpath = libxl__domain_device_frontend_path(gc, domid, info->devid,
+                                                 LIBXL__DEVICE_KIND_VDISPL);
+    libxl_path = libxl__domain_device_libxl_path(gc, domid, info->devid,
+                                                 LIBXL__DEVICE_KIND_VDISPL);
+
     info->backend = xs_read(ctx->xsh, XBT_NULL,
                             GCSPRINTF("%s/backend", libxl_path),
                             NULL);
@@ -196,7 +184,7 @@ int libxl_device_vdispl_getinfo(libxl_ctx *ctx, uint32_t domid,
                              NULL);
     info->frontend_id = domid;
 
-    val = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("%s/be-alloc", devpath));
+    val = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("%s/"XENDISPL_FIELD_BE_ALLOC, devpath));
     info->be_alloc = val ? strtoul(val, NULL, 10) : 0;
 
     rc = libxl__device_vdispl_getconnectors(ctx, devpath, info);
@@ -209,47 +197,16 @@ out:
      return rc;
 }
 
-int libxl_devid_to_device_vdispl(libxl_ctx *ctx, uint32_t domid,
-                                 int devid, libxl_device_vdispl *vdispl)
-{
-    GC_INIT(ctx);
-
-    libxl_device_vdispl *vdispls = NULL;
-    int n, i;
-    int rc;
-
-    libxl_device_vdispl_init(vdispl);
-
-    vdispls = libxl__device_list(gc, &libxl__vdispl_devtype, domid, &n);
-
-    if (!vdispls) { rc = ERROR_NOTFOUND; goto out; }
-
-    for (i = 0; i < n; ++i) {
-        if (devid == vdispls[i].devid) {
-            libxl_device_vdispl_copy(ctx, vdispl, &vdispls[i]);
-            rc = 0;
-            goto out;
-        }
-    }
-
-    rc = ERROR_NOTFOUND;
-
-out:
-
-    if (vdispls)
-        libxl__device_list_free(&libxl__vdispl_devtype, vdispls, n);
-
-    GC_FREE;
-    return rc;
-}
-
-LIBXL_DEFINE_DEVICE_ADD(vdispl)
+static LIBXL_DEFINE_DEVICE_FROM_TYPE(vdispl)
+static LIBXL_DEFINE_UPDATE_DEVID(vdispl)
 static LIBXL_DEFINE_DEVICES_ADD(vdispl)
+
+LIBXL_DEFINE_DEVID_TO_DEVICE(vdispl)
+LIBXL_DEFINE_DEVICE_ADD(vdispl)
 LIBXL_DEFINE_DEVICE_REMOVE(vdispl)
-static LIBXL_DEFINE_UPDATE_DEVID(vdispl, "vdispl")
 LIBXL_DEFINE_DEVICE_LIST(vdispl)
 
-DEFINE_DEVICE_TYPE_STRUCT(vdispl,
+DEFINE_DEVICE_TYPE_STRUCT(vdispl, VDISPL,
     .update_config = (device_update_config_fn_t)libxl__update_config_vdispl,
     .from_xenstore = (device_from_xenstore_fn_t)libxl__vdispl_from_xenstore,
     .set_xenstore_config = (device_set_xenstore_config_fn_t)

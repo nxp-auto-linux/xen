@@ -20,6 +20,13 @@
 #ifndef __X86_SPEC_CTRL_H__
 #define __X86_SPEC_CTRL_H__
 
+/* Encoding of cpuinfo.spec_ctrl_flags */
+#define SCF_use_shadow (1 << 0)
+#define SCF_ist_wrmsr  (1 << 1)
+#define SCF_ist_rsb    (1 << 2)
+
+#ifndef __ASSEMBLY__
+
 #include <asm/alternative.h>
 #include <asm/current.h>
 #include <asm/msr-index.h>
@@ -27,14 +34,32 @@
 void init_speculation_mitigations(void);
 
 extern bool opt_ibpb;
-extern uint8_t default_bti_ist_info;
+extern bool opt_ssbd;
+extern int8_t opt_eager_fpu;
+extern int8_t opt_l1d_flush;
+
+extern bool bsp_delay_spec_ctrl;
+extern uint8_t default_xen_spec_ctrl;
+extern uint8_t default_spec_ctrl_flags;
+
+extern int8_t opt_xpti_hwdom, opt_xpti_domu;
+
+extern int8_t opt_pv_l1tf_hwdom, opt_pv_l1tf_domu;
+
+/*
+ * The L1D address mask, which might be wider than reported in CPUID, and the
+ * system physical address above which there are believed to be no cacheable
+ * memory regions, thus unable to leak data via the L1TF vulnerability.
+ */
+extern paddr_t l1tf_addr_mask, l1tf_safe_maddr;
 
 static inline void init_shadow_spec_ctrl_state(void)
 {
     struct cpu_info *info = get_cpu_info();
 
-    info->shadow_spec_ctrl = info->use_shadow_spec_ctrl = 0;
-    info->bti_ist_info = default_bti_ist_info;
+    info->shadow_spec_ctrl = 0;
+    info->xen_spec_ctrl = default_xen_spec_ctrl;
+    info->spec_ctrl_flags = default_spec_ctrl_flags;
 }
 
 /* WARNING! `ret`, `call *`, `jmp *` not safe after this call. */
@@ -48,27 +73,28 @@ static always_inline void spec_ctrl_enter_idle(struct cpu_info *info)
      */
     info->shadow_spec_ctrl = val;
     barrier();
-    info->use_shadow_spec_ctrl = true;
+    info->spec_ctrl_flags |= SCF_use_shadow;
     barrier();
-    asm volatile ( ALTERNATIVE(ASM_NOP3, "wrmsr", X86_FEATURE_XEN_IBRS_SET)
+    asm volatile ( ALTERNATIVE("", "wrmsr", X86_FEATURE_SC_MSR_IDLE)
                    :: "a" (val), "c" (MSR_SPEC_CTRL), "d" (0) : "memory" );
 }
 
 /* WARNING! `ret`, `call *`, `jmp *` not safe before this call. */
 static always_inline void spec_ctrl_exit_idle(struct cpu_info *info)
 {
-    uint32_t val = SPEC_CTRL_IBRS;
+    uint32_t val = info->xen_spec_ctrl;
 
     /*
      * Disable shadowing before updating the MSR.  There are no SMP issues
      * here; only local processor ordering concerns.
      */
-    info->use_shadow_spec_ctrl = false;
+    info->spec_ctrl_flags &= ~SCF_use_shadow;
     barrier();
-    asm volatile ( ALTERNATIVE(ASM_NOP3, "wrmsr", X86_FEATURE_XEN_IBRS_SET)
+    asm volatile ( ALTERNATIVE("", "wrmsr", X86_FEATURE_SC_MSR_IDLE)
                    :: "a" (val), "c" (MSR_SPEC_CTRL), "d" (0) : "memory" );
 }
 
+#endif /* __ASSEMBLY__ */
 #endif /* !__X86_SPEC_CTRL_H__ */
 
 /*

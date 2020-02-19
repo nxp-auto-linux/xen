@@ -74,6 +74,14 @@ xencall_handle *xencall_open(struct xentoollog_logger *logger,
 int xencall_close(xencall_handle *xcall);
 
 /*
+ * Return the fd used internally by xencall.  selecting on it is not
+ * useful.  But it could be useful for unusual use cases; perhaps,
+ * passing to other programs, calling ioctls on directly, or maybe
+ * calling fcntl.
+ */
+int xencall_fd(xencall_handle *xcall);
+
+/*
  * Call hypercalls with varying numbers of arguments.
  *
  * On success the return value of the hypercall is the return value of
@@ -114,6 +122,13 @@ void xencall_free_buffer_pages(xencall_handle *xcall, void *p, size_t nr_pages);
 
 void *xencall_alloc_buffer(xencall_handle *xcall, size_t size);
 void xencall_free_buffer(xencall_handle *xcall, void *p);
+
+/*
+ * Are allocated hypercall buffers safe to be accessed by the hypervisor all
+ * the time?
+ * Returns 0 if EFAULT might be possible.
+ */
+int xencall_buffers_never_fault(xencall_handle *xcall);
 
 #endif
 

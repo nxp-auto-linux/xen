@@ -113,7 +113,7 @@ static int calculate_tbuf_size(unsigned int pages, uint16_t t_info_first_offset)
     struct t_info dummy_pages;
     typeof(dummy_pages.tbuf_size) max_pages;
     typeof(dummy_pages.mfn_offset[0]) max_mfn_offset;
-    unsigned int max_cpus = num_online_cpus();
+    unsigned int max_cpus = nr_cpu_ids;
     unsigned int t_info_words;
 
     /* force maximum value for an unsigned type */
@@ -149,13 +149,13 @@ static int calculate_tbuf_size(unsigned int pages, uint16_t t_info_first_offset)
 
     /* 
      * NB this calculation is correct, because t_info_first_offset is
-     * in words, not bytes, not bytes
+     * in words, not bytes
      */
-    t_info_words = num_online_cpus() * pages + t_info_first_offset;
+    t_info_words = nr_cpu_ids * pages + t_info_first_offset;
     t_info_pages = PFN_UP(t_info_words * sizeof(uint32_t));
     printk(XENLOG_INFO "xentrace: requesting %u t_info pages "
            "for %u trace pages on %u cpus\n",
-           t_info_pages, pages, num_online_cpus());
+           t_info_pages, pages, nr_cpu_ids);
     return pages;
 }
 
@@ -227,7 +227,6 @@ static int alloc_trace_bufs(unsigned int pages)
     for_each_online_cpu(cpu)
     {
         struct t_buf *buf;
-        struct page_info *pg;
 
         spin_lock_init(&per_cpu(t_lock, cpu));
 
@@ -242,16 +241,14 @@ static int alloc_trace_bufs(unsigned int pages)
 
         /* Now share the trace pages */
         for ( i = 0; i < pages; i++ )
-        {
-            pg = mfn_to_page(t_info_mfn_list[offset + i]);
-            share_xen_page_with_privileged_guests(pg, XENSHARE_writable);
-        }
+            share_xen_page_with_privileged_guests(
+                mfn_to_page(_mfn(t_info_mfn_list[offset + i])), SHARE_rw);
     }
 
     /* Finally, share the t_info page */
     for(i = 0; i < t_info_pages; i++)
         share_xen_page_with_privileged_guests(
-            virt_to_page(t_info) + i, XENSHARE_readonly);
+            virt_to_page(t_info) + i, SHARE_ro);
 
     data_size  = (pages * PAGE_SIZE - sizeof(struct t_buf));
     t_buf_highwater = data_size >> 1; /* 50% high water */
@@ -274,7 +271,7 @@ out_dealloc:
             uint32_t mfn = t_info_mfn_list[offset + i];
             if ( !mfn )
                 break;
-            ASSERT(!(mfn_to_page(mfn)->count_info & PGC_allocated));
+            ASSERT(!(mfn_to_page(_mfn(mfn))->count_info & PGC_allocated));
             free_xenheap_pages(mfn_to_virt(mfn), 0);
         }
     }

@@ -35,6 +35,8 @@ int libxl__domain_create_info_setdefault(libxl__gc *gc,
         return ERROR_INVAL;
     }
 
+    libxl__arch_domain_create_info_setdefault(gc, c_info);
+
     if (c_info->type != LIBXL_DOMAIN_TYPE_PV) {
         libxl_defbool_setdefault(&c_info->hap, true);
         libxl_defbool_setdefault(&c_info->oos, true);
@@ -215,7 +217,7 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
     if (!b_info->event_channels)
         b_info->event_channels = 1023;
 
-    libxl__arch_domain_build_info_acpi_setdefault(b_info);
+    libxl__arch_domain_build_info_setdefault(gc, b_info);
     libxl_defbool_setdefault(&b_info->dm_restrict, false);
 
     switch (b_info->type) {
@@ -368,25 +370,6 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
             b_info->shadow_memkb = 0;
         if (b_info->u.pv.slack_memkb == LIBXL_MEMKB_DEFAULT)
             b_info->u.pv.slack_memkb = 0;
-
-        /* For compatibility, fill in b_info->kernel|ramdisk|cmdline
-         * with the value in u.pv, later processing will use
-         * b_info->kernel|ramdisk|cmdline only.
-         * User with old APIs that passes u.pv.kernel|ramdisk|cmdline
-         * is not affected.
-         */
-        if (!b_info->kernel && b_info->u.pv.kernel) {
-            b_info->kernel = b_info->u.pv.kernel;
-            b_info->u.pv.kernel = NULL;
-        }
-        if (!b_info->ramdisk && b_info->u.pv.ramdisk) {
-            b_info->ramdisk = b_info->u.pv.ramdisk;
-            b_info->u.pv.ramdisk = NULL;
-        }
-        if (!b_info->cmdline && b_info->u.pv.cmdline) {
-            b_info->cmdline = b_info->u.pv.cmdline;
-            b_info->u.pv.cmdline = NULL;
-        }
         break;
     case LIBXL_DOMAIN_TYPE_PVH:
         libxl_defbool_setdefault(&b_info->u.pvh.pvshim, false);
@@ -488,7 +471,7 @@ int libxl__domain_build(libxl__gc *gc,
 
         break;
     case LIBXL_DOMAIN_TYPE_PV:
-        ret = libxl__build_pv(gc, domid, info, state);
+        ret = libxl__build_pv(gc, domid, d_config, state);
         if (ret)
             goto out;
 
@@ -538,10 +521,11 @@ out:
 }
 
 int libxl__domain_make(libxl__gc *gc, libxl_domain_config *d_config,
-                       uint32_t *domid, xc_domain_configuration_t *xc_config)
+                       libxl__domain_build_state *state,
+                       uint32_t *domid)
 {
     libxl_ctx *ctx = libxl__gc_owner(gc);
-    int flags, ret, rc, nb_vm;
+    int ret, rc, nb_vm;
     const char *dom_type;
     char *uuid_string;
     char *dom_path, *vm_path, *libxl_path;
@@ -549,11 +533,11 @@ int libxl__domain_make(libxl__gc *gc, libxl_domain_config *d_config,
     struct xs_permissions rwperm[1];
     struct xs_permissions noperm[1];
     xs_transaction_t t = 0;
-    xen_domain_handle_t handle;
     libxl_vminfo *vm_list;
 
     /* convenience aliases */
     libxl_domain_create_info *info = &d_config->c_info;
+    libxl_domain_build_info *b_info = &d_config->b_info;
 
     uuid_string = libxl__uuid2string(gc, info->uuid);
     if (!uuid_string) {
@@ -561,37 +545,45 @@ int libxl__domain_make(libxl__gc *gc, libxl_domain_config *d_config,
         goto out;
     }
 
-    flags = 0;
-    if (info->type != LIBXL_DOMAIN_TYPE_PV) {
-        flags |= XEN_DOMCTL_CDF_hvm_guest;
-        flags |= libxl_defbool_val(info->hap) ? XEN_DOMCTL_CDF_hap : 0;
-        flags |= libxl_defbool_val(info->oos) ? 0 : XEN_DOMCTL_CDF_oos_off;
-    }
-
-    /* Ultimately, handle is an array of 16 uint8_t, same as uuid */
-    libxl_uuid_copy(ctx, (libxl_uuid *)handle, &info->uuid);
-
-    ret = libxl__arch_domain_prepare_config(gc, d_config, xc_config);
-    if (ret < 0) {
-        LOGED(ERROR, *domid, "fail to get domain config");
-        rc = ERROR_FAIL;
-        goto out;
-    }
-
     /* Valid domid here means we're soft resetting. */
     if (!libxl_domid_valid_guest(*domid)) {
-        ret = xc_domain_create(ctx->xch, info->ssidref, handle, flags, domid,
-                               xc_config);
+        struct xen_domctl_createdomain create = {
+            .ssidref = info->ssidref,
+            .max_vcpus = b_info->max_vcpus,
+            .max_evtchn_port = b_info->event_channels,
+            .max_grant_frames = b_info->max_grant_frames,
+            .max_maptrack_frames = b_info->max_maptrack_frames,
+        };
+
+        if (info->type != LIBXL_DOMAIN_TYPE_PV) {
+            create.flags |= XEN_DOMCTL_CDF_hvm_guest;
+            create.flags |=
+                libxl_defbool_val(info->hap) ? XEN_DOMCTL_CDF_hap : 0;
+            create.flags |=
+                libxl_defbool_val(info->oos) ? 0 : XEN_DOMCTL_CDF_oos_off;
+        }
+
+        /* Ultimately, handle is an array of 16 uint8_t, same as uuid */
+        libxl_uuid_copy(ctx, (libxl_uuid *)&create.handle, &info->uuid);
+
+        ret = libxl__arch_domain_prepare_config(gc, d_config, &create);
+        if (ret < 0) {
+            LOGED(ERROR, *domid, "fail to get domain config");
+            rc = ERROR_FAIL;
+            goto out;
+        }
+
+        ret = xc_domain_create(ctx->xch, domid, &create);
         if (ret < 0) {
             LOGED(ERROR, *domid, "domain creation fail");
             rc = ERROR_FAIL;
             goto out;
         }
-    }
 
-    rc = libxl__arch_domain_save_config(gc, d_config, xc_config);
-    if (rc < 0)
-        goto out;
+        rc = libxl__arch_domain_save_config(gc, d_config, state, &create);
+        if (rc < 0)
+            goto out;
+    }
 
     ret = xc_cpupool_movedomain(ctx->xch, info->poolid, *domid);
     if (ret < 0) {
@@ -687,6 +679,9 @@ retry_transaction:
                         rwperm, ARRAY_SIZE(rwperm));
     }
     libxl__xs_mknod(gc, t,
+                    GCSPRINTF("%s/control/sysrq", dom_path),
+                    rwperm, ARRAY_SIZE(rwperm));
+    libxl__xs_mknod(gc, t,
                     GCSPRINTF("%s/device/suspend/event-channel", dom_path),
                     rwperm, ARRAY_SIZE(rwperm));
     libxl__xs_mknod(gc, t,
@@ -766,6 +761,21 @@ static int store_libxl_entry(libxl__gc *gc, uint32_t domid,
                             libxl_device_model_version_to_string(b_info->device_model_version));
 }
 
+void libxl__domain_build_state_init(libxl__domain_build_state *state)
+{
+    state->dm_monitor_fd = -1;
+}
+
+void libxl__domain_build_state_dispose(libxl__domain_build_state *state)
+{
+    libxl__file_reference_unmap(&state->pv_kernel);
+    libxl__file_reference_unmap(&state->pv_ramdisk);
+    if (state->dm_monitor_fd >= 0) {
+        close(state->dm_monitor_fd);
+        state->dm_monitor_fd = -1;
+    }
+}
+
 /*----- main domain creation -----*/
 
 /* We have a linear control flow; only one event callback is
@@ -776,28 +786,31 @@ static int store_libxl_entry(libxl__gc *gc, uint32_t domid,
  */
 
 /* Event callbacks, in this order: */
-static void domcreate_devmodel_started(libxl__egc *egc,
-                                       libxl__dm_spawn_state *dmss,
-                                       int rc);
 static void domcreate_bootloader_console_available(libxl__egc *egc,
                                                    libxl__bootloader_state *bl);
-static void domcreate_bootloader_done(libxl__egc *egc,
-                                      libxl__bootloader_state *bl,
-                                      int rc);
-
-static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *aodevs,
-                                int ret);
-
 static void domcreate_console_available(libxl__egc *egc,
                                         libxl__domain_create_state *dcs);
 
+static void domcreate_bootloader_done(libxl__egc *egc,
+                                      libxl__bootloader_state *bl,
+                                      int rc);
+static void libxl__colo_restore_setup_done(libxl__egc *egc,
+                                           libxl__colo_restore_state *crs,
+                                           int rc);
 static void domcreate_stream_done(libxl__egc *egc,
                                   libxl__stream_read_state *srs,
                                   int ret);
-
 static void domcreate_rebuild_done(libxl__egc *egc,
                                    libxl__domain_create_state *dcs,
                                    int ret);
+static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *aodevs,
+                                int ret);
+static void domcreate_devmodel_started(libxl__egc *egc,
+                                       libxl__dm_spawn_state *dmss,
+                                       int rc);
+static void domcreate_attach_devices(libxl__egc *egc,
+                                     libxl__multidev *multidev,
+                                     int ret);
 
 /* Our own function to clean up and call the user's callback.
  * The final call in the sequence. */
@@ -822,10 +835,10 @@ static void initiate_domain_create(libxl__egc *egc,
 
     /* convenience aliases */
     libxl_domain_config *const d_config = dcs->guest_config;
-    libxl__domain_build_state *const state = &dcs->build_state;
     const int restore_fd = dcs->restore_fd;
 
     domid = dcs->domid_soft_reset;
+    libxl__domain_build_state_init(&dcs->build_state);
 
     if (d_config->c_info.ssid_label) {
         char *s = d_config->c_info.ssid_label;
@@ -939,7 +952,7 @@ static void initiate_domain_create(libxl__egc *egc,
 
     if (d_config->c_info.type != LIBXL_DOMAIN_TYPE_PV &&
         (libxl_defbool_val(d_config->b_info.nested_hvm) &&
-        ((d_config->c_info.type != LIBXL_DOMAIN_TYPE_HVM &&
+        ((d_config->c_info.type == LIBXL_DOMAIN_TYPE_HVM &&
           libxl_defbool_val(d_config->b_info.u.hvm.altp2m)) ||
         (d_config->b_info.altp2m != LIBXL_ALTP2M_MODE_DISABLED)))) {
         ret = ERROR_INVAL;
@@ -957,7 +970,7 @@ static void initiate_domain_create(libxl__egc *egc,
         goto error_out;
     }
 
-    ret = libxl__domain_make(gc, d_config, &domid, &state->config);
+    ret = libxl__domain_make(gc, d_config, &dcs->build_state, &domid);
     if (ret) {
         LOGD(ERROR, domid, "cannot make domain: %d", ret);
         dcs->guest_domid = domid;
@@ -1035,23 +1048,6 @@ static void domcreate_console_available(libxl__egc *egc,
                               NEW_EVENT(egc, DOMAIN_CREATE_CONSOLE_AVAILABLE,
                                         dcs->guest_domid,
                                         dcs->aop_console_how.for_event));
-}
-
-static void libxl__colo_restore_setup_done(libxl__egc *egc,
-                                           libxl__colo_restore_state *crs,
-                                           int rc)
-{
-    libxl__domain_create_state *dcs = CONTAINER_OF(crs, *dcs, crs);
-
-    EGC_GC;
-
-    if (rc) {
-        LOGD(ERROR, dcs->guest_domid, "colo restore setup fails: %d", rc);
-        domcreate_stream_done(egc, &dcs->srs, rc);
-        return;
-    }
-
-    libxl__stream_read_start(egc, &dcs->srs);
 }
 
 static void domcreate_bootloader_done(libxl__egc *egc,
@@ -1151,6 +1147,23 @@ static void domcreate_bootloader_done(libxl__egc *egc,
     domcreate_stream_done(egc, &dcs->srs, rc);
 }
 
+static void libxl__colo_restore_setup_done(libxl__egc *egc,
+                                           libxl__colo_restore_state *crs,
+                                           int rc)
+{
+    libxl__domain_create_state *dcs = CONTAINER_OF(crs, *dcs, crs);
+
+    EGC_GC;
+
+    if (rc) {
+        LOGD(ERROR, dcs->guest_domid, "colo restore setup fails: %d", rc);
+        domcreate_stream_done(egc, &dcs->srs, rc);
+        return;
+    }
+
+    libxl__stream_read_start(egc, &dcs->srs);
+}
+
 void libxl__srm_callout_callback_restore_results(xen_pfn_t store_mfn,
           xen_pfn_t console_mfn, void *user)
 {
@@ -1226,6 +1239,15 @@ static void domcreate_stream_done(libxl__egc *egc,
         ret = ERROR_INVAL;
         goto out;
     }
+
+    /*
+     * The scheduler on the sending domain may be different than the
+     * scheduler running here.  Setting the scheduler to UNKNOWN will
+     * cause the code to take to take whatever parameters are
+     * available in that scheduler, while discarding the rest.
+     */
+    info->sched_params.sched = LIBXL_SCHEDULER_UNKNOWN;
+
     ret = libxl__build_post(gc, domid, info, state, vments, localents);
     if (ret)
         goto out;
@@ -1374,6 +1396,10 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
     for (i = 0; i < d_config->num_p9s; i++)
         libxl__device_add(gc, domid, &libxl__p9_devtype, &d_config->p9s[i]);
 
+    for (i = 0; i < d_config->num_pvcallsifs; i++)
+        libxl__device_add(gc, domid, &libxl__pvcallsif_devtype,
+                          &d_config->pvcallsifs[i]);
+
     switch (d_config->c_info.type) {
     case LIBXL_DOMAIN_TYPE_HVM:
     {
@@ -1415,6 +1441,9 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
         for (i = 0; i < d_config->num_vfbs; i++) {
             libxl__device_add(gc, domid, &libxl__vfb_devtype,
                               &d_config->vfbs[i]);
+        }
+
+        for (i = 0; i < d_config->num_vkbs; i++) {
             libxl__device_add(gc, domid, &libxl__vkb_devtype,
                               &d_config->vkbs[i]);
         }
@@ -1484,7 +1513,7 @@ out:
 #define libxl__device_from_dtdev NULL
 #define libxl__device_dtdev_setdefault NULL
 #define libxl__device_dtdev_update_devid NULL
-static DEFINE_DEVICE_TYPE_STRUCT(dtdev);
+static DEFINE_DEVICE_TYPE_STRUCT(dtdev, NONE);
 
 const struct libxl_device_type *device_type_tbl[] = {
     &libxl__disk_devtype,
@@ -1495,51 +1524,9 @@ const struct libxl_device_type *device_type_tbl[] = {
     &libxl__pcidev_devtype,
     &libxl__dtdev_devtype,
     &libxl__vdispl_devtype,
+    &libxl__vsnd_devtype,
     NULL
 };
-
-static void domcreate_attach_devices(libxl__egc *egc,
-                                     libxl__multidev *multidev,
-                                     int ret)
-{
-    libxl__domain_create_state *dcs = CONTAINER_OF(multidev, *dcs, multidev);
-    STATE_AO_GC(dcs->ao);
-    int domid = dcs->guest_domid;
-    libxl_domain_config *const d_config = dcs->guest_config;
-    const struct libxl_device_type *dt;
-
-    if (ret) {
-        LOGD(ERROR, domid, "unable to add %s devices",
-             device_type_tbl[dcs->device_type_idx]->type);
-        goto error_out;
-    }
-
-    dcs->device_type_idx++;
-    dt = device_type_tbl[dcs->device_type_idx];
-    if (dt) {
-        if (*libxl__device_type_get_num(dt, d_config) > 0 && !dt->skip_attach) {
-            /* Attach devices */
-            libxl__multidev_begin(ao, &dcs->multidev);
-            dcs->multidev.callback = domcreate_attach_devices;
-            dt->add(egc, ao, domid, d_config, &dcs->multidev);
-            libxl__multidev_prepared(egc, &dcs->multidev, 0);
-            return;
-        }
-
-        domcreate_attach_devices(egc, &dcs->multidev, 0);
-        return;
-    }
-
-    domcreate_console_available(egc, dcs);
-
-    domcreate_complete(egc, dcs, 0);
-
-    return;
-
-error_out:
-    assert(ret);
-    domcreate_complete(egc, dcs, ret);
-}
 
 static void domcreate_devmodel_started(libxl__egc *egc,
                                        libxl__dm_spawn_state *dmss,
@@ -1573,6 +1560,49 @@ error_out:
     domcreate_complete(egc, dcs, ret);
 }
 
+static void domcreate_attach_devices(libxl__egc *egc,
+                                     libxl__multidev *multidev,
+                                     int ret)
+{
+    libxl__domain_create_state *dcs = CONTAINER_OF(multidev, *dcs, multidev);
+    STATE_AO_GC(dcs->ao);
+    int domid = dcs->guest_domid;
+    libxl_domain_config *const d_config = dcs->guest_config;
+    const struct libxl_device_type *dt;
+
+    if (ret) {
+        LOGD(ERROR, domid, "unable to add %s devices",
+             libxl__device_kind_to_string(device_type_tbl[dcs->device_type_idx]->type));
+        goto error_out;
+    }
+
+    dcs->device_type_idx++;
+    dt = device_type_tbl[dcs->device_type_idx];
+    if (dt) {
+        if (*libxl__device_type_get_num(dt, d_config) > 0 && !dt->skip_attach) {
+            /* Attach devices */
+            libxl__multidev_begin(ao, &dcs->multidev);
+            dcs->multidev.callback = domcreate_attach_devices;
+            dt->add(egc, ao, domid, d_config, &dcs->multidev);
+            libxl__multidev_prepared(egc, &dcs->multidev, 0);
+            return;
+        }
+
+        domcreate_attach_devices(egc, &dcs->multidev, 0);
+        return;
+    }
+
+    domcreate_console_available(egc, dcs);
+
+    domcreate_complete(egc, dcs, 0);
+
+    return;
+
+error_out:
+    assert(ret);
+    domcreate_complete(egc, dcs, ret);
+}
+
 static void domcreate_complete(libxl__egc *egc,
                                libxl__domain_create_state *dcs,
                                int rc)
@@ -1581,8 +1611,7 @@ static void domcreate_complete(libxl__egc *egc,
     libxl_domain_config *const d_config = dcs->guest_config;
     libxl_domain_config *d_config_saved = &dcs->guest_config_saved;
 
-    libxl__file_reference_unmap(&dcs->build_state.pv_kernel);
-    libxl__file_reference_unmap(&dcs->build_state.pv_ramdisk);
+    libxl__domain_build_state_dispose(&dcs->build_state);
 
     if (!rc && d_config->b_info.exec_ssidref)
         rc = xc_flask_relabel_domain(CTX->xch, dcs->guest_domid, d_config->b_info.exec_ssidref);
@@ -1745,6 +1774,9 @@ error:
     domcreate_complete(egc, &cdcs->dcs, rc);
 }
 
+static void soft_reset_dm_suspended(libxl__egc *egc,
+                                    libxl__domain_suspend_state *dsps,
+                                    int rc);
 static int do_domain_soft_reset(libxl_ctx *ctx,
                                 libxl_domain_config *d_config,
                                 uint32_t domid_soft_reset,
@@ -1827,11 +1859,24 @@ static int do_domain_soft_reset(libxl_ctx *ctx,
         goto out;
     }
 
-    rc = libxl__domain_suspend_device_model(gc, &dss->dsps);
-    if (rc) {
-        LOGD(ERROR, domid_soft_reset, "failed to suspend device model.");
-        goto out;
-    }
+    dss->dsps.ao = ao;
+    dss->dsps.callback_device_model_done = soft_reset_dm_suspended;
+    libxl__domain_suspend_device_model(egc, &dss->dsps); /* must be last */
+
+    return AO_INPROGRESS;
+
+ out:
+    return AO_CREATE_FAIL(rc);
+}
+
+static void soft_reset_dm_suspended(libxl__egc *egc,
+                                    libxl__domain_suspend_state *dsps,
+                                    int rc)
+{
+    STATE_AO_GC(dsps->ao);
+    libxl__domain_soft_reset_state *srs =
+        CONTAINER_OF(dsps, *srs, dss.dsps);
+    libxl__app_domain_create_state *cdcs = &srs->cdcs;
 
     /*
      * Ask all backends to disconnect by removing the domain from
@@ -1839,18 +1884,13 @@ static int do_domain_soft_reset(libxl_ctx *ctx,
      * xenstore again with probably different store/console/...
      * channels.
      */
-    xs_release_domain(ctx->xsh, cdcs->dcs.domid_soft_reset);
+    xs_release_domain(CTX->xsh, cdcs->dcs.domid_soft_reset);
 
     srs->dds.ao = ao;
-    srs->dds.domid = domid_soft_reset;
+    srs->dds.domid = cdcs->dcs.domid_soft_reset;
     srs->dds.callback = domain_soft_reset_cb;
     srs->dds.soft_reset = true;
     libxl__domain_destroy(egc, &srs->dds);
-
-    return AO_INPROGRESS;
-
- out:
-    return AO_CREATE_FAIL(rc);
 }
 
 static void domain_create_cb(libxl__egc *egc,
