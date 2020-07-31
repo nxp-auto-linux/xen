@@ -2451,7 +2451,11 @@ static int __init construct_domU(struct domain *d,
     /* type must be set before allocate memory */
     d->arch.type = kinfo.type;
 #endif
-    allocate_memory(d, &kinfo);
+
+    if ( !is_domain_direct_mapped(d) )
+        allocate_memory(d, &kinfo);
+    else
+        allocate_memory_11(d, &kinfo);
 
     rc = prepare_dtb_domU(d, &kinfo);
     if ( rc < 0 )
@@ -2471,7 +2475,8 @@ void __init create_domUs(void)
 {
     struct dt_device_node *node;
     const struct dt_device_node *chosen = dt_find_node_by_path("/chosen");
-
+    u32 direct_map = 0;
+    
     BUG_ON(chosen == NULL);
     dt_for_each_child_node(chosen, node)
     {
@@ -2491,8 +2496,15 @@ void __init create_domUs(void)
             panic("Missing property 'cpus' for domain %s\n",
                   dt_node_name(node));
 
+        direct_map = dt_property_read_bool(node, "direct-map");
         if ( dt_find_compatible_node(node, NULL, "multiboot,device-tree") )
-            d_cfg.flags |= XEN_DOMCTL_CDF_iommu;
+        {
+            if ( iommu_enabled )
+                d_cfg.flags |= XEN_DOMCTL_CDF_iommu;
+            else if ( !direct_map )
+                panic("Assign a device but IOMMU is disabled and direct-map is disabled\n");
+        }
+        d_cfg.flags |= direct_map != 0 ? XEN_DOMCTL_INTERNAL_directmap : 0;
 
         if ( !dt_property_read_u32(node, "nr_spis", &d_cfg.arch.nr_spis) )
         {
