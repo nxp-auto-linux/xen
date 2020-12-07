@@ -10,7 +10,7 @@ XEN_CONFIGS += xlexample.pvlinux
 XEN_CONFIGS += xlexample.pvhlinux
 XEN_CONFIGS += xl.conf
 XEN_CONFIGS += cpupool
-XEN_CONFIGS += domU1.cfg domU2.cfg domU_mmc.cfg
+XEN_CONFIGS += domU1.cfg domU2.cfg domU1_mmc.cfg domU2_mmc.cfg
 
 .PHONY: all
 all:
