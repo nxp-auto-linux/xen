@@ -163,7 +163,7 @@ efi_head:
          */
         add     x13, x18, #0x16
         b       real_start           /* branch to kernel start */
-        .quad   0                    /* Image load offset from start of RAM */
+        .quad   XEN_VIRT_START       /* Image load offset from start of RAM */
         .quad   _end - start         /* Effective size of kernel image, little-endian */
         .quad   __HEAD_FLAGS         /* Informative flags, little-endian */
         .quad   0                    /* reserved */
