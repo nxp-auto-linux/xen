@@ -96,6 +96,19 @@ choice
 			This option is preferred over the platform specific
 			options; the platform specific options are deprecated
 			and will soon be removed.
+	config EARLY_UART_CHOICE_S32
+		select EARLY_UART_S32
+		bool "Early printk via S32 LinFlex UART"
+		help
+			Say Y here if you wish the early printk to direct their
+			output to a S32 LinFlex UART. You can use this option to
+			provide the parameters for the S32 LinFlex UART rather than
+			selecting one of the platform specific options below if
+			you know the parameters for the port.
+
+			This option is preferred over the platform specific
+			options; the platform specific options are deprecated
+			and will soon be removed.
 	config EARLY_UART_CHOICE_PL011
 		select EARLY_UART_PL011
 		bool "Early printk via PL011 UART"
@@ -158,6 +171,12 @@ choice
 	config EARLY_PRINTK_RCAR3
 		bool "Early printk with SCIF2 on Renesas R-Car Gen3 processors"
 		select EARLY_UART_SCIF
+	config EARLY_PRINTK_S32GEN1
+		bool "Early printk with S32 LinFlex on NXP S32-Gen1 processors"
+		select EARLY_UART_S32
+	config EARLY_PRINTK_S32V2XX
+		bool "Early printk with S32 LinFlex on NXP S32V2xx processors"
+		select EARLY_UART_S32
 	config EARLY_PRINTK_SEATTLE
 		bool "Early printk with pl011 for AMD Seattle processor"
 		select EARLY_UART_PL011
@@ -208,6 +227,9 @@ config EARLY_UART_MVEBU
 config EARLY_UART_PL011
 	select EARLY_PRINTK
 	bool
+config EARLY_UART_S32
+	select EARLY_PRINTK
+	bool
 config EARLY_UART_SCIF
 	select EARLY_PRINTK
 	bool
@@ -230,6 +252,8 @@ config EARLY_UART_BASE_ADDRESS
 	default 0xd0012000 if EARLY_PRINTK_MVEBU
 	default 0x48020000 if EARLY_PRINTK_OMAP5432
 	default 0xe6e88000 if EARLY_PRINTK_RCAR3
+	default 0x401c8000 if EARLY_PRINTK_S32GEN1
+	default 0x40053000 if EARLY_PRINTK_S32V2XX
 	default 0xe1010000 if EARLY_PRINTK_SEATTLE
 	default 0x01c28000 if EARLY_PRINTK_SUN6I
 	default 0x01c28000 if EARLY_PRINTK_SUN7I
@@ -300,4 +324,5 @@ config EARLY_PRINTK_INC
 	default "debug-meson.inc" if EARLY_UART_MESON
 	default "debug-mvebu.inc" if EARLY_UART_MVEBU
 	default "debug-pl011.inc" if EARLY_UART_PL011
+	default "debug-s32.inc" if EARLY_UART_S32
 	default "debug-scif.inc" if EARLY_UART_SCIF
