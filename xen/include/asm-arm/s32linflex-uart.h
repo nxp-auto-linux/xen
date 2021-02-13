@@ -84,6 +84,7 @@
 #define UARTCR_RXEN         (1 << 5)
 #define UARTCR_PC1          (1 << 6)
 #define UARTCR_TFBM         (1 << 8)
+#define UARTCR_RFBM         (1 << 9)
 #define UARTCR_TDFL         (0x0000E000)
 #define UARTCR_ROSE         (1 << 23)
 #define UARTSR_DTF          (1 << 1)
