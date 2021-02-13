@@ -82,6 +82,11 @@ static void __init s32linflex_uart_init_preirq(struct serial_port *port)
 		while (s32linflex_uart_readl(uart, UARTCR) & UARTCR_TDFL)
 			;
 
+	/* Disable RX/TX before init mode */
+	ctrl = s32linflex_uart_readl(uart, UARTCR);
+	ctrl &= ~(UARTCR_RXEN | UARTCR_TXEN);
+	s32linflex_uart_writel(uart, UARTCR, ctrl);
+
 	/* init mode */
 	ctrl = LINCR1_INIT;
 	s32linflex_uart_writel(uart, LINCR1, ctrl);
@@ -114,15 +119,20 @@ static void __init s32linflex_uart_init_preirq(struct serial_port *port)
 	/* Set preset timeout register value */
 	s32linflex_uart_writel(uart, UARTPTO, 0xF);
 
-	/* 8 bit data, no parity, Tx and Rx enabled, UART mode */
-	s32linflex_uart_writel(uart, UARTCR, UARTCR_PC1 | UARTCR_RXEN |
-		UARTCR_TXEN | UARTCR_PC0 | UARTCR_WL0 | UARTCR_UART);
+	/* 8 bit data, no parity, UART mode, Buffer mode */
+	s32linflex_uart_writel(uart, UARTCR, UARTCR_PC1 |
+		UARTCR_PC0 | UARTCR_WL0 | UARTCR_UART);
 
 	ctrl = s32linflex_uart_readl(uart, LINCR1);
 	ctrl &= ~LINCR1_INIT;
 
 	/* end init mode */
 	s32linflex_uart_writel(uart, LINCR1, ctrl);
+
+	/* Enable RX/TX after exiting init mode */
+	ctrl = s32linflex_uart_readl(uart, UARTCR);
+	ctrl |= UARTCR_RXEN | UARTCR_TXEN;
+	s32linflex_uart_writel(uart, UARTCR, ctrl);
 }
 
 static void s32linflex_uart_interrupt(int irq, void *data,
