@@ -4,7 +4,7 @@
  * Freescale linflexuart serial port driver constants
  *
  * Peter van der Perk <peter.vander.perk@nxp.com>
- * Copyright 2018 NXP
+ * Copyright 2018, 2021 NXP
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -83,9 +83,15 @@
 #define UARTCR_TXEN         (1 << 4)
 #define UARTCR_RXEN         (1 << 5)
 #define UARTCR_PC1          (1 << 6)
+#define UARTCR_ROSE         (1 << 23)
 #define UARTSR_DTF          (1 << 1)
 #define UARTSR_DRF          (1 << 2)
 #define UARTSR_RMB          (1 << 9)
+
+#define LINFLEX_LDIV_MULTIPLIER (16)
+#define UARTCR_OSR_MASK     (0xF << 24)
+#define UARTCR_OSR_GET(uartcr)  (((uartcr) & UARTCR_OSR_MASK) >> 24)
+#define UARTCR_OSR(val)     ((val << 24) & UARTCR_OSR_MASK)
 
 #endif /* __ASM_ARM_S32LINFLEX_UART_H */
 
