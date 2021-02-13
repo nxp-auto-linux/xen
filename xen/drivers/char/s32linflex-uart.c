@@ -160,9 +160,18 @@ static void __init s32linflex_uart_init_postirq(struct serial_port *port)
 	uart->irqaction.name = "s32linflex_uart";
 	uart->irqaction.dev_id = port;
 
+	if (setup_irq(uart->irq, 0, &uart->irqaction) != 0) {
+		dprintk(XENLOG_ERR,
+			"Failed to allocate s32linflex_uart IRQ %d\n",
+			uart->irq);
+		return;
+	}
+
 	temp = s32linflex_uart_readl(uart, LINIER);
 	temp |= (LINIER_DRIE | LINIER_DTIE);
 	s32linflex_uart_writel(uart, LINIER, temp);
+	dprintk(XENLOG_INFO, "IRQ %d enabled\n",
+			uart->irq);
 }
 
 static void s32linflex_uart_suspend(struct serial_port *port)
