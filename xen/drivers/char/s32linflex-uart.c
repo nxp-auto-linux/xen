@@ -44,6 +44,7 @@
 #define LIN_DATABITS	(8)		/* LINFlex UART Data Bits  */
 #define LIN_STOPBITS	(1)		/* LINFlex UART Stop Bits  */
 #define LIN_PARITYNONE	('n')		/* LINFlex UART Parity None */
+#define LIN_TXBUF_SIZE	(4)		/* Tx Buffer Size */
 
 static struct s32linflex_uart {
 	unsigned int baud, clock_hz, data_bits, parity, stop_bits, fifo_size;
@@ -188,38 +189,67 @@ static void s32linflex_uart_resume(struct serial_port *port)
 static int s32linflex_uart_tx_ready(struct serial_port *port)
 {
 	struct s32linflex_uart *uart = port->uart;
+	u32 fifo_mode;
 
-	return (s32linflex_uart_readb(uart, UARTSR) & UARTSR_DTF) ? 1 : 0;
+	fifo_mode = s32linflex_uart_readl(uart, UARTCR) & UARTCR_TFBM;
+
+	if (fifo_mode)
+		return ((s32linflex_uart_readl(uart, UARTSR) &
+				UARTSR_DTF) == 0) ? 1 : 0;
+
+	/*
+	 * Buffer Mode => TX is waited to be ready after sending a char,
+	 * so we can assume it is always ready before.
+	 */
+	return LIN_TXBUF_SIZE;
 }
 
 static void s32linflex_uart_putc(struct serial_port *port, char c)
 {
 	struct s32linflex_uart *uart = port->uart;
+	u32 fifo_mode, status;
+
+	if (c == '\n')
+		s32linflex_uart_putc(port, '\r');
+
+	fifo_mode = s32linflex_uart_readl(uart, UARTCR) & UARTCR_TFBM;
 
 	s32linflex_uart_writeb(uart, BDRL, c);
 
-	s32linflex_uart_writeb(uart, UARTSR,
-		(s32linflex_uart_readb(uart, UARTSR) | UARTSR_DTF));
+	/* Buffer Mode */
+	if (!fifo_mode) {
+		while ((s32linflex_uart_readl(uart, UARTSR) & UARTSR_DTF) == 0)
+			;
+
+		status = s32linflex_uart_readl(uart, UARTSR) | (UARTSR_DTF);
+		s32linflex_uart_writel(uart, UARTSR, status);
+	}
 }
 
 static int s32linflex_uart_getc(struct serial_port *port, char *pc)
 {
 	struct s32linflex_uart *uart = port->uart;
-	int ch;
+	u32 ch, status, fifo_mode;
 
-	if (!(s32linflex_uart_readb(uart, UARTSR) & UARTSR_DRF))
-		return 0;
+	fifo_mode = s32linflex_uart_readl(uart, UARTCR) & UARTCR_RFBM;
 
-	if (!(s32linflex_uart_readl(uart, UARTSR) & UARTSR_RMB))
-		return 0;
+	if (fifo_mode) {
+		while ((s32linflex_uart_readl(uart, UARTSR) & UARTSR_DRF)
+			== UARTSR_DRF)
+			;
+	} else {
+		while ((s32linflex_uart_readl(uart, UARTSR) & UARTSR_DRF)
+			!= UARTSR_DRF)
+			;
+	}
 
 	ch = s32linflex_uart_readl(uart, BDRM);
 	*pc = ch & 0xff;
 
-	s32linflex_uart_writeb(uart, UARTSR,
-		(s32linflex_uart_readb(uart, UARTSR) |
-			(UARTSR_DRF | UARTSR_RMB)));
-
+	if (!fifo_mode) {
+		status = s32linflex_uart_readl(uart, UARTSR) | UARTSR_DRF;
+		s32linflex_uart_writel(uart, UARTSR, status);
+	}
 
 	return 1;
 }
