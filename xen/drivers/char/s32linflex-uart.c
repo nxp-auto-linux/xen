@@ -69,9 +69,18 @@ static u32 s32linflex_uart_ldiv_multiplier(struct s32linflex_uart *uart)
 static void __init s32linflex_uart_init_preirq(struct serial_port *port)
 {
 	struct s32linflex_uart *uart = port->uart;
-	u32 ctrl;
+	u32 ctrl, tx_fifo_mode;
 	u32 clk, baud_rate;
 	u32 ibr, fbr, divisr, dividr;
+
+	/*
+	 * Smoothen the transition from early_printk by waiting
+	 * for all pending characters to transmit
+	 */
+	tx_fifo_mode = s32linflex_uart_readl(uart, UARTCR) & UARTCR_TFBM;
+	if (tx_fifo_mode)
+		while (s32linflex_uart_readl(uart, UARTCR) & UARTCR_TDFL)
+			;
 
 	/* init mode */
 	ctrl = LINCR1_INIT;
