@@ -4,7 +4,7 @@
  * Driver for NXP Linflex UART.
  *
  * Peter van der Perk <peter.vander.perk@nxp.com>
- * Copyright 2018 NXP
+ * Copyright 2018, 2021 NXP
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms and conditions of the GNU General Public
@@ -39,11 +39,11 @@
 #define s32linflex_uart_writeb(uart, off, val) \
 			writeb((val), (uart)->regs + (off))
 
-#define LIN_CLK_FREQ	(66666667)	/* LIN_CLK freq taken from Linux */
+#define LIN_CLK_FREQ	(125000000)	/* LIN_CLK freq taken from Linux */
 #define LIN_BAUDRATE	(115200)	/* LINFlex UART Baud Rate  */
 #define LIN_DATABITS	(8)		/* LINFlex UART Data Bits  */
 #define LIN_STOPBITS	(1)		/* LINFlex UART Stop Bits  */
-#define LIN_PARITYNONE	(0)		/* LINFlex UART Parity None */
+#define LIN_PARITYNONE	('n')		/* LINFlex UART Parity None */
 
 static struct s32linflex_uart {
 	unsigned int baud, clock_hz, data_bits, parity, stop_bits, fifo_size;
@@ -53,21 +53,28 @@ static struct s32linflex_uart {
 	struct vuart_info vuart;
 } s32_com = {0};
 
+static u32 s32linflex_uart_ldiv_multiplier(struct s32linflex_uart *uart)
+{
+	u32 mul = LINFLEX_LDIV_MULTIPLIER;
+	u32 cr;
+
+	cr = s32linflex_uart_readl(uart, UARTCR);
+
+	if (cr & UARTCR_ROSE)
+		mul = UARTCR_OSR_GET(cr);
+
+	return mul;
+}
 
 static void __init s32linflex_uart_init_preirq(struct serial_port *port)
 {
 	struct s32linflex_uart *uart = port->uart;
 	u32 ctrl;
-
-	u32 clk;
-	u32 ibr, fbr;
-
-	/* set the Linflex in master mode amd activate by-pass filter */
-	ctrl = LINCR1_BF | LINCR1_MME;
-	s32linflex_uart_writel(uart, LINCR1, ctrl);
+	u32 clk, baud_rate;
+	u32 ibr, fbr, divisr, dividr;
 
 	/* init mode */
-	ctrl |= LINCR1_INIT;
+	ctrl = LINCR1_INIT;
 	s32linflex_uart_writel(uart, LINCR1, ctrl);
 
 	/* waiting for init mode entry */
@@ -75,17 +82,28 @@ static void __init s32linflex_uart_init_preirq(struct serial_port *port)
 		LINSR_LINS_INITMODE)
 		;
 
+	/* set Master Mode */
+	ctrl |= LINCR1_MME;
+	s32linflex_uart_writel(uart, LINCR1, ctrl);
+
 	/* set UART bit to allow writing other bits */
 	s32linflex_uart_writel(uart, UARTCR, UARTCR_UART);
 
 	/* provide data bits, parity, stop bit, etc */
 	clk = uart->clock_hz;
+	baud_rate = uart->baud;
 
-	ibr = (u32) (clk / (16 * (uart)->baud));
-	fbr = (u32) (clk % (16 * (uart)->baud)) / (uart->baud);
+	divisr = clk;
+	dividr = (u32)(baud_rate * s32linflex_uart_ldiv_multiplier(uart));
+
+	ibr = (u32)(divisr / dividr);
+	fbr = (u32)((divisr % dividr) * 16 / dividr) & 0xF;
 
 	s32linflex_uart_writel(uart, LINIBRR, ibr);
 	s32linflex_uart_writel(uart, LINFBRR, fbr);
+
+	/* Set preset timeout register value */
+	s32linflex_uart_writel(uart, UARTPTO, 0xF);
 
 	/* 8 bit data, no parity, Tx and Rx enabled, UART mode */
 	s32linflex_uart_writel(uart, UARTCR, UARTCR_PC1 | UARTCR_RXEN |
