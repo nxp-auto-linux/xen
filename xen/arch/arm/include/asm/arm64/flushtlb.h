@@ -1,6 +1,14 @@
 #ifndef __ASM_ARM_ARM64_FLUSHTLB_H__
 #define __ASM_ARM_ARM64_FLUSHTLB_H__
 
+#if CONFIG_NXP_S32CC_ERRATUM_ERR050481
+/*
+ * ERRATUM_ERR050481 workaround should be applied if VA bits 41 thru 48 are
+ * not all zero.
+ */
+#define S32CC_IS_ERR050481_ADDR(va) ((va) & GENMASK_ULL(48, 41))
+#endif
+
 /*
  * Every invalidation operation use the following patterns:
  *
@@ -85,7 +93,26 @@ TLB_HELPER(flush_xen_tlb_local, alle2, nsh)
 TLB_HELPER_VA(__flush_xen_tlb_one_local, vae2)
 
 /* Flush TLB of all processors in the inner-shareable domain for address va. */
+#if CONFIG_NXP_S32CC_ERRATUM_ERR050481
+static inline void __flush_xen_tlb_one(vaddr_t va)
+{
+    if (S32CC_IS_ERR050481_ADDR(va)) {
+        asm volatile("tlbi alle2is;" : : : "memory");
+    } else {
+        asm volatile(                                \
+            "tlbi vae2is, %0;"                       \
+            ALTERNATIVE(                             \
+                "nop; nop;",                         \
+                "dsb  ish;"                          \
+                "tlbi vae2is, %0;",                  \
+                ARM64_WORKAROUND_REPEAT_TLBI,        \
+                CONFIG_ARM64_WORKAROUND_REPEAT_TLBI) \
+            : : "r" (va >> PAGE_SHIFT) : "memory");  \
+    }
+}
+#else
 TLB_HELPER_VA(__flush_xen_tlb_one, vae2is)
+#endif
 
 #undef TLB_HELPER
 #undef TLB_HELPER_VA
