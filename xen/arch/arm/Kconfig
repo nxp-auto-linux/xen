@@ -320,6 +320,17 @@ config ARM64_ERRATUM_1286807
 
 endmenu
 
+config NXP_S32GEN1_ERRATUM_ERR050481
+	bool "Enable workaround for the NXP ERR050481 erratum"
+	default n
+	help
+	   Force broader TLB invalidate instructions to avoid an
+	   inter-cluster TLB coherency issue described in the
+	   NXP errata docs.
+	   This may come at a performance penalty, although the
+	   affected VA addresses are only from a limitted set where
+	   bits 41-48 are not all zeros.
+
 config ARM64_HARDEN_BRANCH_PREDICTOR
     def_bool y if ARM_64 && HARDEN_BRANCH_PREDICTOR
 
