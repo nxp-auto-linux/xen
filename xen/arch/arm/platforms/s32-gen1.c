@@ -21,6 +21,8 @@
 #include <xen/vmap.h>
 #include <asm/platform.h>
 #include <asm/io.h>
+#include <asm/regs.h>
+#include <asm/smccc.h>
 
 #define S32GEN1_MC_ME_CTL_KEY               0x0
 #define S32GEN1_MC_ME_CTL_KEY_KEY           0x00005AF0
@@ -33,6 +35,12 @@
 #define S32GEN1_MC_ME_MODE_UPD_UPD          BIT(0, UL)
 
 #define S32GEN1_MC_RGM_DRET                 0x1C
+
+#define S32GEN1_SMC_SCMI_FN                 0xFE
+#define S32GEN1_SMCCC_FID(fn) ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, \
+                                                 ARM_SMCCC_CONV_64,   \
+                                                 ARM_SMCCC_OWNER_SIP, \
+                                                 fn)
 
 static void __iomem *s32gen1_map_device(const char *compatible)
 {
@@ -97,6 +105,48 @@ static void s32gen1_reset(void)
     panic("Chip Destructive Reset\n");
 }
 
+static bool s32gen1_smc(struct cpu_user_regs *regs)
+{
+    struct arm_smccc_res res;
+    uint32_t fid = get_user_reg(regs, 0);
+
+    /* Check for SMCCC 1.1 availability */
+    if ( !cpus_have_const_cap(ARM_SMCCC_1_1) )
+    {
+        printk_once(XENLOG_WARNING
+                    "S32-Gen1: No SMCCC 1.1 support, disabling fw calls.");
+        return false;
+    }
+
+    switch (fid)
+    {
+    /* SCMI */
+    case S32GEN1_SMCCC_FID(S32GEN1_SMC_SCMI_FN):
+        goto forward_to_fw;
+
+    default:
+        gprintk(XENLOG_WARNING, "S32-Gen1: Unhandled SMC call: %u\n", fid);
+        return false;
+    }
+
+forward_to_fw:
+    arm_smccc_1_1_smc(get_user_reg(regs, 0),
+                      get_user_reg(regs, 1),
+                      get_user_reg(regs, 2),
+                      get_user_reg(regs, 3),
+                      get_user_reg(regs, 4),
+                      get_user_reg(regs, 5),
+                      get_user_reg(regs, 6),
+                      get_user_reg(regs, 7),
+                      &res);
+
+    set_user_reg(regs, 0, res.a0);
+    set_user_reg(regs, 1, res.a1);
+    set_user_reg(regs, 2, res.a2);
+    set_user_reg(regs, 3, res.a3);
+    return true;
+}
+
 static const char * const s32gen1_dt_compat[] __initconst =
 {
     "fsl,s32g274",
@@ -106,6 +156,7 @@ static const char * const s32gen1_dt_compat[] __initconst =
 
 PLATFORM_START(s32gen1, "NXP S32-Gen1")
     .compatible = s32gen1_dt_compat,
+    .smc = s32gen1_smc,
     .reset = s32gen1_reset,
 PLATFORM_END
 
