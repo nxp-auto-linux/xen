@@ -57,6 +57,8 @@
 #define ICH_AP1R2_EL2             __AP1Rx_EL2(2)
 #define ICH_AP1R3_EL2             __AP1Rx_EL2(3)
 
+#define L2CTLR_EL1                S3_1_C11_C0_2
+
 /* Access to system registers */
 
 #define READ_SYSREG32(name) ((uint32_t)READ_SYSREG64(name))
