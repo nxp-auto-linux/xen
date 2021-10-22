@@ -356,6 +356,18 @@ void do_sysreg(struct cpu_user_regs *regs,
      *
      * And all other unknown registers.
      */
+    case HSR_SYSREG_L2CTLR_EL1:
+        /*
+         * Accessible from EL1, if EL0 trap happens handle as undef.
+         * If it is a read, permit EL1 or below to access the reg value.
+         * Writes to this register are ignored.
+         */
+        if ( regs_mode_is_user(regs) )
+            return inject_undef_exception(regs, hsr);
+        if ( hsr.sysreg.read )
+            set_user_reg(regs, regidx, READ_SYSREG(L2CTLR_EL1));
+        break;
+
     default:
         {
             const struct hsr_sysreg sysreg = hsr.sysreg;
