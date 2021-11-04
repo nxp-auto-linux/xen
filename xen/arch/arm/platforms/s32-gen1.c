@@ -150,6 +150,7 @@ forward_to_fw:
 static const char * const s32gen1_dt_compat[] __initconst =
 {
     "fsl,s32g274",
+    "fsl,s32g399",
     "fsl,s32r45",
     NULL
 };
