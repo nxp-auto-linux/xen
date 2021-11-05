@@ -96,7 +96,8 @@ TLB_HELPER_VA(__flush_xen_tlb_one_local, vae2)
 #if CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
 static inline void __flush_xen_tlb_one(vaddr_t va)
 {
-    if (S32_IS_ERR050481_ADDR(va)) {
+    if (cpus_have_const_cap(ARM64_WORKAROUND_NXP_ERR050481) &&
+        S32_IS_ERR050481_ADDR(va)) {
         asm volatile("tlbi alle2is;" : : : "memory");
     } else {
         asm volatile(                                \
