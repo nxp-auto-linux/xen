@@ -388,6 +388,31 @@ is_affected_midr_range(const struct arm_cpu_capabilities *entry)
                                    entry->midr_range_max);
 }
 
+#ifdef CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
+#define L2CTLR_NCORES_SHIFT 24
+#define L2CTLR_NCORES_MASK  (0x3 << L2CTLR_NCORES_SHIFT)
+#define L2CTLR_2CORES       0x1
+
+static bool
+has_nxp_s32gen1_erratum_err050481(const struct arm_cpu_capabilities *entry)
+{
+    static bool already_called = false;
+    static int ncores;
+    int l2ctlr;
+
+    if (already_called)
+        return (ncores == L2CTLR_2CORES);
+
+    l2ctlr = READ_SYSREG(L2CTLR_EL1);
+
+    ncores = (l2ctlr & L2CTLR_NCORES_MASK);
+    ncores >>= L2CTLR_NCORES_SHIFT;
+
+    already_called = true;
+    return (ncores == L2CTLR_2CORES);
+}
+#endif
+
 static const struct arm_cpu_capabilities arm_errata[] = {
     {
         /* Cortex-A15 r0p4 */
@@ -497,6 +522,13 @@ static const struct arm_cpu_capabilities arm_errata[] = {
         .capability = ARM64_WORKAROUND_AT_SPECULATE,
         MIDR_ALL_VERSIONS(MIDR_CORTEX_A53),
     },
+#ifdef CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
+    {
+        .desc = "NXP ERRATUM ERR050481 (TLBI handled incorrectly)",
+        .capability = ARM64_WORKAROUND_NXP_ERR050481,
+        .matches = has_nxp_s32gen1_erratum_err050481,
+    },
+#endif
     {},
 };
 

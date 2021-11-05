@@ -60,7 +60,8 @@ static inline void  __flush_xen_tlb_one_local(vaddr_t va)
 static inline void __flush_xen_tlb_one(vaddr_t va)
 {
 #if CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
-    if (S32_IS_ERR050481_ADDR(va)) {
+    if (cpus_have_const_cap(ARM64_WORKAROUND_NXP_ERR050481) &&
+        S32_IS_ERR050481_ADDR(va)) {
         asm volatile("tlbi alle2is;" : : : "memory");
     } else
 #endif
