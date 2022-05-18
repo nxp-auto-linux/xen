@@ -4,7 +4,7 @@
  * Driver for NXP Linflex UART.
  *
  * Peter van der Perk <peter.vander.perk@nxp.com>
- * Copyright 2018, 2021 NXP
+ * Copyright 2018, 2021-2022 NXP
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms and conditions of the GNU General Public
@@ -358,7 +358,7 @@ static int __init s32linflex_uart_init(struct dt_device_node *dev,
 }
 
 static const struct dt_device_match s32linflex_uart_dt_compat[] __initconst = {
-	DT_MATCH_COMPATIBLE("fsl,s32-linflexuart"),
+	DT_MATCH_COMPATIBLE("nxp,s32cc-linflexuart"),
 	{},
 };
 
