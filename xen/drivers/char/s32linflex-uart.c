@@ -359,6 +359,7 @@ static int __init s32linflex_uart_init(struct dt_device_node *dev,
 
 static const struct dt_device_match s32linflex_uart_dt_compat[] __initconst = {
 	DT_MATCH_COMPATIBLE("nxp,s32cc-linflexuart"),
+	DT_MATCH_COMPATIBLE("fsl,s32-linflexuart"),
 	{},
 };
 
