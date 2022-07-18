@@ -152,6 +152,9 @@ static const char * const s32gen1_dt_compat[] __initconst =
     "nxp,s32g2",
     "nxp,s32g3",
     "nxp,s32r45",
+    "fsl,s32g274",
+    "fsl,s32g399",
+    "fsl,s32r45",
     NULL
 };
 
