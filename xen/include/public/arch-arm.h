@@ -438,10 +438,10 @@ typedef uint64_t xen_callback_t;
  * 16MB == 4096 pages reserved for guest to use as a region to map its
  * grant table in.
  */
-#define GUEST_GNTTAB_BASE xen_mk_ullong(0x38000000)
+#define GUEST_GNTTAB_BASE xen_mk_ullong(0x98000000)
 #define GUEST_GNTTAB_SIZE xen_mk_ullong(0x01000000)
 
-#define GUEST_MAGIC_BASE  xen_mk_ullong(0x39000000)
+#define GUEST_MAGIC_BASE  xen_mk_ullong(0x99000000)
 #define GUEST_MAGIC_SIZE  xen_mk_ullong(0x01000000)
 
 #define GUEST_RAM_BANKS   2
@@ -451,16 +451,16 @@ typedef uint64_t xen_callback_t;
  * address space) relies on the fact that the regions reserved for the RAM
  * below are big enough to also accommodate such regions.
  */
-#define GUEST_RAM0_BASE   xen_mk_ullong(0x40000000) /* 3GB of low RAM @ 1GB */
-#define GUEST_RAM0_SIZE   xen_mk_ullong(0xc0000000)
+#define GUEST_RAM0_BASE   xen_mk_ullong(0x80000000) /* 2GB of low RAM @ 2GB */
+#define GUEST_RAM0_SIZE   xen_mk_ullong(0x80000000)
 
 /* 4GB @ 4GB Prefetch Memory for VPCI */
 #define GUEST_VPCI_ADDR_TYPE_PREFETCH_MEM   xen_mk_ullong(0x42000000)
 #define GUEST_VPCI_PREFETCH_MEM_ADDR        xen_mk_ullong(0x100000000)
 #define GUEST_VPCI_PREFETCH_MEM_SIZE        xen_mk_ullong(0x100000000)
 
-#define GUEST_RAM1_BASE   xen_mk_ullong(0x0200000000) /* 1016GB of RAM @ 8GB */
-#define GUEST_RAM1_SIZE   xen_mk_ullong(0xfe00000000)
+#define GUEST_RAM1_BASE   xen_mk_ullong(0x0880000000) /* 1.5GB of RAM @ 34GB */
+#define GUEST_RAM1_SIZE   xen_mk_ullong(0x0060000000)
 
 #define GUEST_RAM_BASE    GUEST_RAM0_BASE /* Lowest RAM address */
 /* Largest amount of actual RAM, not including holes */
