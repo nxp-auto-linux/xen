@@ -256,6 +256,9 @@ automatically determine the most suitable backend.
 
 "tap" needs blktap's tapback to be running.
 
+For PVH machines, "qdisk" with specification "virtio" is supported. It creates
+appropriate configuration for emulation and a virtio-blk device is passed to the
+guest.
 
 =item B<script>=I<SCRIPT>
 

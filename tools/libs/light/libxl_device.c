@@ -311,12 +311,6 @@ static int disk_try_backend(disk_try_backend_args *a,
     /* returns 0 (ie, DISK_BACKEND_UNKNOWN) on failure, or
      * backend on success */
 
-    if ((specification == LIBXL_DISK_SPECIFICATION_VIRTIO &&
-         backend != LIBXL_DISK_BACKEND_STANDALONE) ||
-        (specification != LIBXL_DISK_SPECIFICATION_VIRTIO &&
-         backend == LIBXL_DISK_BACKEND_STANDALONE))
-        goto bad_specification;
-
     switch (backend) {
     case LIBXL_DISK_BACKEND_PHY:
         if (libxl_defbool_val(a->disk->colo_enable))
@@ -411,7 +405,6 @@ static int disk_try_backend(disk_try_backend_args *a,
         a->disk->vdev, libxl_disk_backend_to_string(backend));
     return 0;
 
- bad_specification:
     LOG(DEBUG, "Disk vdev=%s, backend %s not compatible with specification %s",
         a->disk->vdev, libxl_disk_backend_to_string(backend),
         libxl_disk_specification_to_string(specification));
