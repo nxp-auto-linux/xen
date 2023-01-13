@@ -174,9 +174,6 @@ choice
 	config EARLY_PRINTK_S32GEN1
 		bool "Early printk with S32 LinFlex on NXP S32-Gen1 processors"
 		select EARLY_UART_S32
-	config EARLY_PRINTK_S32V2XX
-		bool "Early printk with S32 LinFlex on NXP S32V2xx processors"
-		select EARLY_UART_S32
 	config EARLY_PRINTK_SEATTLE
 		bool "Early printk with pl011 for AMD Seattle processor"
 		select EARLY_UART_PL011
@@ -253,7 +250,6 @@ config EARLY_UART_BASE_ADDRESS
 	default 0x48020000 if EARLY_PRINTK_OMAP5432
 	default 0xe6e88000 if EARLY_PRINTK_RCAR3
 	default 0x401c8000 if EARLY_PRINTK_S32GEN1
-	default 0x40053000 if EARLY_PRINTK_S32V2XX
 	default 0xe1010000 if EARLY_PRINTK_SEATTLE
 	default 0x01c28000 if EARLY_PRINTK_SUN6I
 	default 0x01c28000 if EARLY_PRINTK_SUN7I
