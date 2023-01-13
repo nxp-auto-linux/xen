@@ -4,7 +4,7 @@
  * NXP S32-Gen1 Platform-specific settings
  *
  * Andrei Cherechesu <andrei.cherechesu@nxp.com>
- * Copyright 2021-2022 NXP
+ * Copyright 2021-2023 NXP
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -152,9 +152,6 @@ static const char * const s32gen1_dt_compat[] __initconst =
     "nxp,s32g2",
     "nxp,s32g3",
     "nxp,s32r45",
-    "fsl,s32g274",
-    "fsl,s32g399",
-    "fsl,s32r45",
     NULL
 };
 
