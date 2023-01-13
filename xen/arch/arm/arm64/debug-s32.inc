@@ -1,12 +1,12 @@
 /*
  * xen/arch/arm/arm64/debug-s32.inc
  *
- * S32V UART specific debug code
+ * S32 UART specific debug code
  *
  * Driver for NXP Linflex UART.
  *
  * Peter van der Perk <peter.vander.perk@nxp.com>
- * Copyright 2018, 2021 NXP
+ * Copyright 2018, 2021, 2023 NXP
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
