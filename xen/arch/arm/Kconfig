@@ -383,7 +383,7 @@ config ARM64_ERRATUM_1508412
 
 	  If unsure, say Y.
 
-config NXP_S32GEN1_ERRATUM_ERR050481
+config NXP_S32CC_ERRATUM_ERR050481
 	bool "Enable workaround for the NXP ERR050481 erratum"
 	default n
 	help

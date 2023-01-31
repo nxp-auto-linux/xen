@@ -1,7 +1,7 @@
 #ifndef __ASM_ARM_ARM64_FLUSHTLB_H__
 #define __ASM_ARM_ARM64_FLUSHTLB_H__
 
-#if CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
+#if CONFIG_NXP_S32CC_ERRATUM_ERR050481
 /*
  * ERRATUM_ERR050481 workaround should be applied if VA bits 41 thru 48 are
  * not all zero.
@@ -93,7 +93,7 @@ TLB_HELPER(flush_xen_tlb_local, alle2, nsh)
 TLB_HELPER_VA(__flush_xen_tlb_one_local, vae2)
 
 /* Flush TLB of all processors in the inner-shareable domain for address va. */
-#if CONFIG_NXP_S32GEN1_ERRATUM_ERR050481
+#if CONFIG_NXP_S32CC_ERRATUM_ERR050481
 static inline void __flush_xen_tlb_one(vaddr_t va)
 {
     if (cpus_have_const_cap(ARM64_WORKAROUND_NXP_ERR050481) &&
