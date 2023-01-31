@@ -1,7 +1,7 @@
 /*
- * xen/arch/arm/platforms/s32-gen1.c
+ * xen/arch/arm/platforms/s32cc.c
  *
- * NXP S32-Gen1 Platform-specific settings
+ * NXP S32CC Platform-specific settings
  *
  * Andrei Cherechesu <andrei.cherechesu@nxp.com>
  * Copyright 2021-2023 NXP
@@ -21,13 +21,13 @@
 #include <asm/regs.h>
 #include <asm/smccc.h>
 
-#define S32GEN1_SMC_SCMI_FN                 0xFE
-#define S32GEN1_SMCCC_FID(fn) ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, \
-                                                 ARM_SMCCC_CONV_64,   \
-                                                 ARM_SMCCC_OWNER_SIP, \
-                                                 fn)
+#define S32CC_SMC_SCMI_FN                 0xFE
+#define S32CC_SMCCC_FID(fn) ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, \
+                                               ARM_SMCCC_CONV_64,   \
+                                               ARM_SMCCC_OWNER_SIP, \
+                                               fn)
 
-static bool s32gen1_smc(struct cpu_user_regs *regs)
+static bool s32cc_smc(struct cpu_user_regs *regs)
 {
     struct arm_smccc_res res;
     uint32_t fid = get_user_reg(regs, 0);
@@ -36,18 +36,18 @@ static bool s32gen1_smc(struct cpu_user_regs *regs)
     if ( !cpus_have_const_cap(ARM_SMCCC_1_1) )
     {
         printk_once(XENLOG_WARNING
-                    "S32-Gen1: No SMCCC 1.1 support, disabling fw calls.");
+                    "S32CC: No SMCCC 1.1 support, disabling fw calls.");
         return false;
     }
 
     switch (fid)
     {
     /* SCMI */
-    case S32GEN1_SMCCC_FID(S32GEN1_SMC_SCMI_FN):
+    case S32CC_SMCCC_FID(S32CC_SMC_SCMI_FN):
         goto forward_to_fw;
 
     default:
-        gprintk(XENLOG_WARNING, "S32-Gen1: Unhandled SMC call: %u\n", fid);
+        gprintk(XENLOG_WARNING, "S32CC: Unhandled SMC call: %u\n", fid);
         return false;
     }
 
@@ -69,7 +69,7 @@ forward_to_fw:
     return true;
 }
 
-static const char * const s32gen1_dt_compat[] __initconst =
+static const char * const s32cc_dt_compat[] __initconst =
 {
     "nxp,s32g2",
     "nxp,s32g3",
@@ -77,9 +77,9 @@ static const char * const s32gen1_dt_compat[] __initconst =
     NULL
 };
 
-PLATFORM_START(s32gen1, "NXP S32-Gen1")
-    .compatible = s32gen1_dt_compat,
-    .smc = s32gen1_smc,
+PLATFORM_START(s32cc, "NXP S32CC")
+    .compatible = s32cc_dt_compat,
+    .smc = s32cc_smc,
 PLATFORM_END
 
 /*

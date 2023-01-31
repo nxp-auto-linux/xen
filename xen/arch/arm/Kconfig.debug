@@ -171,8 +171,8 @@ choice
 	config EARLY_PRINTK_RCAR3
 		bool "Early printk with SCIF2 on Renesas R-Car Gen3 processors"
 		select EARLY_UART_SCIF
-	config EARLY_PRINTK_S32GEN1
-		bool "Early printk with S32 LinFlex on NXP S32-Gen1 processors"
+	config EARLY_PRINTK_S32CC
+		bool "Early printk with S32 LinFlex on NXP S32CC processors"
 		select EARLY_UART_S32
 	config EARLY_PRINTK_SEATTLE
 		bool "Early printk with pl011 for AMD Seattle processor"
@@ -249,7 +249,7 @@ config EARLY_UART_BASE_ADDRESS
 	default 0xd0012000 if EARLY_PRINTK_MVEBU
 	default 0x48020000 if EARLY_PRINTK_OMAP5432
 	default 0xe6e88000 if EARLY_PRINTK_RCAR3
-	default 0x401c8000 if EARLY_PRINTK_S32GEN1
+	default 0x401c8000 if EARLY_PRINTK_S32CC
 	default 0xe1010000 if EARLY_PRINTK_SEATTLE
 	default 0x01c28000 if EARLY_PRINTK_SUN6I
 	default 0x01c28000 if EARLY_PRINTK_SUN7I
