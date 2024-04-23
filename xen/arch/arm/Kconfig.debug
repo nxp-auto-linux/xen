@@ -96,8 +96,8 @@ choice
 			This option is preferred over the platform specific
 			options; the platform specific options are deprecated
 			and will soon be removed.
-	config EARLY_UART_CHOICE_S32
-		select EARLY_UART_S32
+	config EARLY_UART_CHOICE_S32_LINFLEX
+		select EARLY_UART_S32_LINFLEX
 		bool "Early printk via S32 LinFlex UART"
 		help
 			Say Y here if you wish the early printk to direct their
@@ -172,8 +172,8 @@ choice
 		bool "Early printk with SCIF2 on Renesas R-Car Gen3 processors"
 		select EARLY_UART_SCIF
 	config EARLY_PRINTK_S32CC
-		bool "Early printk with S32 LinFlex on NXP S32CC processors"
-		select EARLY_UART_S32
+		bool "Early printk with S32 LinFlex UART on NXP S32CC processors"
+		select EARLY_UART_S32_LINFLEX
 	config EARLY_PRINTK_SEATTLE
 		bool "Early printk with pl011 for AMD Seattle processor"
 		select EARLY_UART_PL011
@@ -224,7 +224,7 @@ config EARLY_UART_MVEBU
 config EARLY_UART_PL011
 	select EARLY_PRINTK
 	bool
-config EARLY_UART_S32
+config EARLY_UART_S32_LINFLEX
 	select EARLY_PRINTK
 	bool
 config EARLY_UART_SCIF
@@ -327,5 +327,5 @@ config EARLY_PRINTK_INC
 	default "debug-meson.inc" if EARLY_UART_MESON
 	default "debug-mvebu.inc" if EARLY_UART_MVEBU
 	default "debug-pl011.inc" if EARLY_UART_PL011
-	default "debug-s32.inc" if EARLY_UART_S32
+	default "debug-s32.inc" if EARLY_UART_S32_LINFLEX
 	default "debug-scif.inc" if EARLY_UART_SCIF
