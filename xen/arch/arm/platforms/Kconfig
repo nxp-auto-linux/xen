@@ -64,7 +64,7 @@ config MPSOC_PLATFORM
 	bool
 	default (ALL64_PLAT || MPSOC)
 
-config S32CC_PLATFORM
+config S32_PLATFORM
 	bool
 	default (ALL64_PLAT || S32CC)
 
