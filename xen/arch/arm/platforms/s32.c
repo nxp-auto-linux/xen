@@ -74,6 +74,7 @@ static const char * const s32_dt_compat[] __initconst =
     "nxp,s32g2",
     "nxp,s32g3",
     "nxp,s32r45",
+    "nxp,s32n79",
     NULL
 };
 

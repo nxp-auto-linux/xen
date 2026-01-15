@@ -45,6 +45,15 @@ config S32CC
 	---help---
 	Enable all the required drivers for NXP S32CC platforms
 
+config S32N7
+	bool "NXP S32N7 platforms support"
+	depends on ARM_64
+	select HAS_PL011
+	select EXPERT
+	select ARM_SMMU_V3
+	---help---
+	Enable all the required drivers for NXP S32N7 platforms
+
 config NO_PLAT
 	bool "No Platforms"
 	---help---
@@ -66,5 +75,5 @@ config MPSOC_PLATFORM
 
 config S32_PLATFORM
 	bool
-	default (ALL64_PLAT || S32CC)
+	default (ALL64_PLAT || S32CC || S32N7)
 
