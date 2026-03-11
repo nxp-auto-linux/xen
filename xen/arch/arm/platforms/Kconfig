@@ -58,6 +58,16 @@ config S32CC
 	  Enable all the required drivers for NXP S32CC Processors Family
 	  (S32G2, S32G3, S32R45)
 
+config S32N79
+	bool "NXP S32N79 Processor support"
+	depends on ARM_64
+	select ARM_SMMU_V3
+	select HAS_LINFLEX
+	select HAS_PL011
+	select SCMI_SMC
+	help
+	  Enable all the required drivers for NXP S32N79 Processor
+
 config NO_PLAT
 	bool "No Platforms"
 	help
