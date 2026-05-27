@@ -218,6 +218,19 @@ bool __init check_reserved_regions_overlap(paddr_t region_start,
     return false;
 }
 
+/*
+ * Given an input physical address range, check if this range is overlapping
+ * with the existing /memory banks already added to bootinfo.
+ * Return true if the input physical address range is overlapping with any
+ * existing /memory bank, otherwise false.
+ */
+bool __init check_memory_regions_overlap(paddr_t region_start,
+                                         paddr_t region_size)
+{
+    return meminfo_overlap_check(bootinfo_get_mem(), region_start,
+                                 region_size, false);
+}
+
 struct boot_module __init *add_boot_module(boot_module_kind kind,
                                            paddr_t start, paddr_t size,
                                            bool domU)

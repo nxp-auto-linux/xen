@@ -152,6 +152,16 @@ static int __init device_tree_get_meminfo(const void *fdt, int node,
         if ( mem == bootinfo_get_reserved_mem() &&
              check_reserved_regions_overlap(start, size, true) )
             return -EINVAL;
+
+        /*
+         * Drop overlapping /memory banks: init_boot_pages() requires the
+         * free MFN ranges it receives to be non-overlapping, and would
+         * panic otherwise.
+         */
+        if ( mem == bootinfo_get_mem() &&
+             check_memory_regions_overlap(start, size) )
+            continue;
+
         /* Some DT may describe empty bank, ignore them */
         if ( !size )
             continue;

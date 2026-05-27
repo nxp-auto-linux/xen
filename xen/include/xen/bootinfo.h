@@ -149,6 +149,9 @@ bool check_reserved_regions_overlap(paddr_t region_start,
                                     paddr_t region_size,
                                     bool allow_memreserve_overlap);
 
+bool check_memory_regions_overlap(paddr_t region_start,
+                                  paddr_t region_size);
+
 struct boot_module *add_boot_module(boot_module_kind kind,
                                     paddr_t start, paddr_t size, bool domU);
 struct boot_module *boot_module_find_by_kind(boot_module_kind kind);
